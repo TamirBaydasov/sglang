@@ -1002,6 +1002,7 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 else:
                     """FIA will support multi-bs in the later version of CANN"""
+                    print(f"in fia prefill branch")
                     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     attn_output = torch.empty(
                         (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
@@ -1037,6 +1038,7 @@ class AscendAttnBackend(AttentionBackend):
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
+                    torch.save(attn_output, "/home/tbaydasov/original_prefill_dump.pt")
 
             else:
                 causal = True

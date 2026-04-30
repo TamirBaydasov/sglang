@@ -474,23 +474,31 @@ class ModelSlimKVCacheMethod(BaseKVCacheMethod):
         v_cache = v_cache.view(old_shape)
         return k_cache_anti_quant, v_cache_anti_quant
 
+    def apply(self, k_cache, v_cache, layer):
+        print(f"k_cache shape:{k_cache.shape}")
+        print(f"k quant scale shape: {layer.k_quant_scale.shape}")
+        old_shape = k_cache.shape
+        k_cache = k_cache.view(*k_cache.shape[:-2], 1, -1)
+        print(f"new k_cache shape: {k_cache.shape}")
+        v_cache = v_cache.view(*v_cache.shape[:-2], 1, -1)
 
-    def apply(self, k_cache, v_cache):
         key_int8 = torch_npu.npu_quantize(
-                    key,
-                    layer.k_quant_scale,
-                    layer.k_quant_offset if layer.k_quant_offset else None,
+                    k_cache,
+                    layer.k_quant_scale.squeeze(),
+                    layer.k_quant_offset.squeeze() if hasattr(layer,"k_quant_offset") else None,
                     torch.qint8,
                     -1,
                     False)
+
         value_int8 = torch_npu.npu_quantize(
-                    key,
-                    layer.k_quant_scale,
-                    layer.k_quant_offset if layer.k_quant_offset else None,
+                    v_cache,
+                    layer.v_quant_scale.squeeze(),
+                    layer.v_quant_offset.squeeze() if hasattr(layer,"v_quant_offset") else None,
                     torch.qint8,
                     -1,
                     False)
-        
+        key_int8 = key_int8.view(old_shape)
+        value_int8 = value_int8.view(old_shape)
         return key_int8, value_int8
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
