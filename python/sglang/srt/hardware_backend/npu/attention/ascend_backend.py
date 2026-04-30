@@ -848,6 +848,50 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_out
 
+    def _forward_extend_fia_paged_kv(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        layer: "RadixAttention",
+    ) -> torch.Tensor:
+        """Run FIA extend attention against paged KV cache."""
+        query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+        if self.forward_metadata.seq_lens_cpu_int is None:
+            actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
+        else:
+            actual_seq_lengths_kv = (
+                self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+            )
+
+        if self.forward_metadata.extend_seq_lens_cpu_int is None:
+            actual_seq_lengths = self.forward_metadata.seq_lens_list_cumsum
+        else:
+            actual_seq_lengths = (
+                torch.cumsum(self.forward_metadata.extend_seq_lens_cpu_int, dim=0)
+                .int()
+                .tolist()
+            )
+
+        attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            query,
+            k_cache.view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim),
+            v_cache.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim),
+            block_table=self.forward_metadata.block_tables,
+            block_size=self.page_size,
+            num_heads=layer.tp_q_head_num,
+            num_key_value_heads=layer.tp_k_head_num,
+            input_layout="TND",
+            atten_mask=self.fia_mask,
+            sparse_mode=3,
+            scale=layer.scaling,
+            actual_seq_lengths=actual_seq_lengths,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            next_tokens=0,
+        )
+        return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_extend(
         self,
         q,
@@ -918,6 +962,13 @@ class AscendAttnBackend(AttentionBackend):
 
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            if (k_cache.dtype != k.dtype) and (k_cache.dtype == torch.int8):
+                #dequant cache back to model type for prefill
+                k_cache_bf16, v_cache_bf16 = layer.quant_method.anti_quant_int8(k_cache, v_cache, layer)
+            #k, k_scale = torch.ops.npu.npu_dynamic_quant(k)
+            #v, v_scale = torch.ops.npu.npu_dynamic_quant(v)
+            # print(f"k dtype: {k.dtype}")
+            # print(f"v dtype: {v.dtype}")
 
             if sinks is not None:
                 # Use SWA block tables if hybrid SWA is enabled for this layer
@@ -941,33 +992,51 @@ class AscendAttnBackend(AttentionBackend):
                 return attn_out
 
             if self.use_fia:
-                """FIA will support multi-bs in the later version of CANN"""
-                q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                attn_output = torch.empty(
-                    (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
-                    device=q.device,
-                    dtype=q.dtype,
+                has_prefix = (
+                    forward_batch.extend_prefix_lens_cpu is not None
+                    and sum(forward_batch.extend_prefix_lens_cpu) > 0
                 )
-                q_len_offset = 0
-                for q_len in forward_batch.extend_seq_lens_cpu:
-                    attn_output[q_len_offset : q_len_offset + q_len] = (
-                        torch.ops.npu.npu_fused_infer_attention_score(
-                            q[None, q_len_offset : q_len_offset + q_len],
-                            k[None, q_len_offset : q_len_offset + q_len],
-                            v[None, q_len_offset : q_len_offset + q_len],
-                            num_heads=layer.tp_q_head_num,
-                            num_key_value_heads=layer.tp_k_head_num,
-                            input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                            atten_mask=self.fia_mask.unsqueeze(0),
-                            sparse_mode=3 if q_len != 1 else 0,
-                            scale=layer.scaling,
-                            next_tokens=0,
-                        )[0]
+                if has_prefix:
+                    attn_output = self._forward_extend_fia_paged_kv(
+                        q, k_cache_bf16, v_cache_bf16, layer
                     )
-                    q_len_offset += q_len
-                attn_output = attn_output.view(
-                    -1, layer.tp_q_head_num * layer.v_head_dim
-                )
+                else:
+                    """FIA will support multi-bs in the later version of CANN"""
+                    q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                    attn_output = torch.empty(
+                        (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
+                        device=q.device,
+                        dtype=q.dtype,
+                    )
+                    q_len_offset = 0
+                    for q_len in forward_batch.extend_seq_lens_cpu:
+                        attn_output[q_len_offset : q_len_offset + q_len] = (
+                            torch.ops.npu.npu_fused_infer_attention_score(
+                                q[None, q_len_offset : q_len_offset + q_len],
+                                k[None, q_len_offset : q_len_offset + q_len],
+                                v[None, q_len_offset : q_len_offset + q_len],
+                                num_heads=layer.tp_q_head_num,
+                                num_key_value_heads=layer.tp_k_head_num,
+                                input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                                atten_mask=self.fia_mask.unsqueeze(0),
+                                sparse_mode=3 if q_len != 1 else 0,
+                                scale=layer.scaling,
+                                next_tokens=0,
+                                #antiquant_mode=0,
+                                #key_antiquant_mode=0,
+                                #value_antiquant_mode=0,
+                                #key_antiquant_scale=torch.ones(512, device=torch.device("npu"), dtype=torch.bfloat16),
+                                #value_antiquant_scale=torch.ones(512, device=torch.device("npu"), dtype=torch.bfloat16),
+                                #key_antiquant_scale=layer.k_quant_scale,
+                                #key_antiquant_offset=layer.k_quant_offset,
+                                #value_antiquant_scale=layer.v_quant_scale,
+                                #value_antiquant_offset=layer.v_quant_offset,
+                            )[0]
+                        )
+                        q_len_offset += q_len
+                    attn_output = attn_output.view(
+                        -1, layer.tp_q_head_num * layer.v_head_dim
+                    )
 
             else:
                 causal = True
@@ -1651,6 +1720,10 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
+                key_antiquant_scale=layer.k_quant_scale,
+                key_antiquant_offset=layer.k_quant_offset,
+                value_antiquant_scale=layer.v_quant_scale,
+                value_antiquant_offset=layer.v_quant_offset,
             )
             output = torch.empty(
                 (num_tokens, 1, layer.tp_q_head_num * layer.v_head_dim),
@@ -1669,6 +1742,11 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
+                #antiquant_mode=0,
+                key_antiquant_scale=layer.k_quant_scale,
+                key_antiquant_offset=layer.k_quant_offset,
+                value_antiquant_scale=layer.v_quant_scale,
+                value_antiquant_offset=layer.v_quant_offset,
                 workspace=workspace,
                 out=[output, softmax_lse],
             )
@@ -1731,8 +1809,8 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSND",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
-                antiquant_mode=0,
-                antiquant_scale=None,
+                # antiquant_mode=0,
+                # antiquant_scale=None,
                 sparse_mode=0,
             )
             output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
@@ -1751,8 +1829,8 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSND",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
-                antiquant_mode=0,
-                antiquant_scale=None,
+                # antiquant_mode=0,
+                # antiquant_scale=None,
                 sparse_mode=0,
                 workspace=workspace,
                 out=[output, softmax_lse],
@@ -1867,6 +1945,12 @@ class AscendAttnBackend(AttentionBackend):
                     block_table=self.forward_metadata.block_tables,
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
+                    # antiquant_mode=0,
+                    # antiquant_scale=None,
+                    key_antiquant_scale=layer.k_quant_scale,
+                    key_antiquant_offset=layer.k_quant_offset,
+                    value_antiquant_scale=layer.v_quant_scale,
+                    value_antiquant_offset=layer.v_quant_offset,
                 )
             # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
             # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues

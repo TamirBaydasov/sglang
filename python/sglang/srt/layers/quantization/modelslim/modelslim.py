@@ -5,6 +5,8 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
+import torch_npu
+import numpy as np
 
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _NPULinearMethodBase,
@@ -20,6 +22,14 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
 )
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.parameter import ChannelQuantScaleParameter, _ColumnvLLMParameter
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
 
@@ -139,7 +149,7 @@ class ModelSlimConfig(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
+        print(f"Layer type: {type(layer).__name__}")
         if isinstance(layer, LinearBase):
             # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
             key = "model"
@@ -166,6 +176,9 @@ class ModelSlimConfig(QuantizationConfig):
         elif isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return ModelSlimFusedMoEMethod(self)
+        elif isinstance(layer, RadixAttention):
+            print(f"In radix attention quant method")
+            return ModelSlimKVCacheMethod(self)
         return None
 
     def get_linear_scheme(
@@ -380,3 +393,112 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             group_list,
             output_dtype,
         )
+
+
+class ModelSlimKVCacheMethod(BaseKVCacheMethod):
+    def __init__(self, config):
+        super().__init__(config)
+    
+    def create_weights(
+        self,
+        layer: nn.Module,
+        head_size: int,
+        num_kv_heads: int,
+        tp_rank: int,
+        **extra_weight_attrs,
+    ):
+        del layer.k_scale
+        del layer.v_scale
+        #print(f"Layer prefix: {layer.prefix}")
+        self.kv_size = num_kv_heads * head_size
+        #self.num_kv_heads_replicas = num_kv_heads_replicas
+        self.tp_rank = tp_rank
+
+        k_scale = ChannelQuantScaleParameter(
+            data=torch.full([self.kv_size], fill_value=-1, dtype=torch.float32),
+            output_dim=0,
+            weight_loader=self.weight_loader,
+        )
+        layer.register_parameter("k_scale", k_scale)
+        v_scale = ChannelQuantScaleParameter(
+            data=torch.full([self.kv_size], fill_value=-1, dtype=torch.float32),
+            output_dim=0,
+            weight_loader=self.weight_loader,
+        )
+        layer.register_parameter("v_scale", v_scale)
+        k_offset = ChannelQuantScaleParameter(
+            data=torch.full([self.kv_size], fill_value=-1, dtype=torch.float32),
+            output_dim=0,
+            weight_loader=self.weight_loader,
+        )
+        layer.register_parameter("k_offset", k_offset)
+        v_offset = ChannelQuantScaleParameter(
+            data=torch.full([self.kv_size], fill_value=-1, dtype=torch.float32),
+            output_dim=0,
+            weight_loader=self.weight_loader,
+        )
+        layer.register_parameter("v_offset", v_offset)
+    
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        device = layer.k_scale.device
+        dtype = torch.bfloat16
+
+        k_offset = torch.from_numpy(np.frombuffer(layer.k_offset.to(torch.float32).cpu().numpy().tobytes(), dtype=np.int32
+        ).copy()).to(device)
+        v_offset = torch.from_numpy(np.frombuffer(layer.v_offset.to(torch.float32).cpu().numpy().tobytes(), dtype=np.int32
+        ).copy()).to(device)
+
+        layer.k_quant_offset = torch.nn.Parameter(k_offset.to(dtype), requires_grad=False).unsqueeze(0)
+        layer.v_quant_offset = torch.nn.Parameter(v_offset.to(dtype), requires_grad=False).unsqueeze(0)
+        layer.k_quant_scale = torch.nn.Parameter(layer.k_scale.reciprocal().to(dtype), requires_grad=False).unsqueeze(0)
+        layer.v_quant_scale = torch.nn.Parameter(layer.v_scale.reciprocal().to(dtype), requires_grad=False).unsqueeze(0)
+    
+    def anti_quant_int8(self, k_cache, v_cache, layer):
+        old_shape = k_cache.shape
+        #print(f"k cache shape: {k_cache.shape}")
+        #print(f"k scale shape: {layer.k_scale.shape}")
+        k_cache = k_cache.view(*k_cache.shape[:-2], 1, -1)
+        v_cache = v_cache.view(*v_cache.shape[:-2], 1, -1)
+        #print(f"new k cache shape: {k_cache.shape}")
+        k_cache_anti_quant = torch_npu.npu_anti_quant(
+            x=k_cache,
+            scale=layer.k_scale,
+            dst_dtype=torch.bfloat16
+        )
+        v_cache_anti_quant= torch_npu.npu_anti_quant(
+            x=v_cache,
+            scale=layer.v_scale,
+            dst_dtype=torch.bfloat16
+        )
+        k_cache = k_cache.view(old_shape)
+        v_cache = v_cache.view(old_shape)
+        return k_cache_anti_quant, v_cache_anti_quant
+
+
+    def apply(self, k_cache, v_cache):
+        key_int8 = torch_npu.npu_quantize(
+                    key,
+                    layer.k_quant_scale,
+                    layer.k_quant_offset if layer.k_quant_offset else None,
+                    torch.qint8,
+                    -1,
+                    False)
+        value_int8 = torch_npu.npu_quantize(
+                    key,
+                    layer.k_quant_scale,
+                    layer.k_quant_offset if layer.k_quant_offset else None,
+                    torch.qint8,
+                    -1,
+                    False)
+        
+        return key_int8, value_int8
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if isinstance(param, _ColumnvLLMParameter):
+            print(f"Loading kv cache scales...")
+            param.load_column_parallel_weight(
+                loaded_weight,
+                tp_rank=self.tp_rank,
+                use_presharded_weights=False,
+            )
+        
