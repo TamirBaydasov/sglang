@@ -974,13 +974,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
-        # Calculate first full attention layer ID based on config
-        # Calculate once for each pp group
-        if (self.attn.layer_id + 1) % self.config.full_attention_interval == 0:
-            if self.pp_group.rank_in_group not in calculated_pp_groups:
-                self.rotary_emb.get_cos_sin_with_position(positions)
-                self.calculated_pp_groups.append(self.pp_group.rank_in_group)
-
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
             qkv,
             self.rotary_emb.position_sin,
@@ -1241,7 +1234,25 @@ class Qwen3_5ForCausalLM(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
-
+        
+        # Create shared rotary_emb for NPU position transfer across PP stages.  
+        # get_rope is cached, so this returns the same object as full-attention  
+        # layers on this stage (if any), ensuring position_cos/sin propagate correctly.  
+        rope_theta, rope_scaling = get_rope_config(config)  
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)  
+        if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):  
+            rope_scaling = None  
+        head_dim = config.head_dim or (config.hidden_size // config.num_attention_heads)  
+        self._full_attn_rotary_emb = get_rope(  
+            head_size=head_dim,  
+            rotary_dim=head_dim,  
+            max_position=getattr(config, "max_position_embeddings", 8192),  
+            rope_scaling=rope_scaling,  
+            base=rope_theta,  
+            partial_rotary_factor=partial_rotary_factor,  
+            is_neox_style=True,  
+            dtype=torch.get_default_dtype(),  
+        )
         # Final normalization
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1287,6 +1298,13 @@ class Qwen3_5ForCausalLM(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+        
+        if _is_npu:  
+            if self.pp_group.is_first_rank:  
+                self._full_attn_rotary_emb.get_cos_sin_with_position(positions)  
+            else:  
+                self._full_attn_rotary_emb.position_cos = pp_proxy_tensors["position_cos"]  
+                self._full_attn_rotary_emb.position_sin = pp_proxy_tensors["position_sin"]
 
         aux_hidden_states = []
         # Pass through decoder layers
@@ -1320,12 +1338,11 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy_tensors = {"hidden_states": hidden_states, "residual": residual}  
+            if _is_npu:    
+               proxy_tensors["position_cos"] = self._full_attn_rotary_emb.position_cos  
+               proxy_tensors["position_sin"] = self._full_attn_rotary_emb.position_sin  
+            return PPProxyTensors(proxy_tensors)
 
         # Apply final normalization
         if hidden_states.shape[0] != 0:
