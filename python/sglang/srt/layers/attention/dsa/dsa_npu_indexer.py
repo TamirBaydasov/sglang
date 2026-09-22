@@ -588,7 +588,15 @@ class DSANPUIndexerMixin:
                 # the lengths are device tensors, so the tiling cannot check
                 # them against the query shape, and the kernel reports the
                 # out-of-bounds read as an AICore trap from inside
-                # quant_lightning_indexer.
+                # quant_lightning_indexer. It is a write too: v2's infershape
+                # sizes sparse_indices from queryShape.GetDim(0), not from
+                # cu_seqlens_q.
+                #
+                # That same rule is what lets shard.gather() work here: the
+                # output has one row per row of `query`, so a sharded call
+                # returns shard.rows rows and the all-gather widths line up.
+                # Rows past cu_seqlens_q[-1] are untouched, and gather() slices
+                # them off.
                 _fm = get_attn_backend().forward_metadata
                 if shard is None:
                     cu_seqlens_q = getattr(_fm, "quant_indexer_cu_seqlens_q", None)
