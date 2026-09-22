@@ -19,6 +19,10 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
 
 if is_npu():
+    # Registers the CANN ops-transformer kernels under
+    # torch.ops.cann_ops_transformer; without this import the
+    # torch.ops namespace is empty and op calls raise AttributeError.
+    import cann_ops_transformer  # noqa: F401
     import torch_npu
 
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
@@ -44,17 +48,41 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
 
 
 def _quantize_npu_indexer_activation(x, hadamard, dst_type):
+    # Hadamard-rotate x and MX-quantize its 128-dim vectors.
+    # Returns (quantized, scale): quantized has x's shape in dst_type (fp8)
+    # and scale holds one E8M0 byte per 32-element block, shaped
+    # x.shape[:-1] + (d/64, 2) == x.shape[:-1] + (2, 2) — the descale layout
+    # quant_lightning_indexer (v2) expects for quant_mode 3 (MXFP8).
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
     if x.numel() == 0:
         return (
             torch.empty_like(x, dtype=dst_type),
-            torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device),
+            torch.zeros(x.shape[:-1] + (2, 2), dtype=torch.uint8, device=x.device).view(
+                torch.float8_e8m0fnu
+            ),
         )
     rotated = x @ hadamard
-    quantized, scale = torch_npu.npu_dynamic_quant(
-        rotated.reshape(-1, 128), dst_type=dst_type
+    quantized, scale = torch.ops.npu.npu_dynamic_mx_quant(
+        rotated.reshape(-1, 128), dst_type=dst_type, axis=-1
     )
-    return quantized.reshape(x.shape), scale.to(torch.float32).reshape(x.shape[:-1])
+    # npu_dynamic_mx_quant may return the block scales as [N, 4] or [N, 2, 2];
+    # normalize to the kernel's (d/64, 2) == (2, 2) layout.
+    scale = scale.reshape(x.shape[:-1] + (4,)).view(x.shape[:-1] + (2, 2))
+    if scale.dtype != torch.float8_e8m0fnu:
+        scale = scale.view(torch.float8_e8m0fnu)
+
+    return quantized.reshape(x.shape), scale
+
+
+def _check_quant_lightning_indexer_constraints(pool) -> None:
+    # quant_lightning_indexer (v2) PA_BBND layout: block_size == pool
+    # page_size must lie in [16, 1024] and be a multiple of 16.
+    page_size = pool.page_size
+    assert 16 <= page_size <= 1024 and page_size % 16 == 0, (
+        "quant_lightning_indexer (v2) PA_BBND layout requires the index-k "
+        f"pool page_size in [16, 1024] and a multiple of 16, got {page_size}. "
+        "Relaunch with page_size=64 (engine kwarg / --page-size 64)."
+    )
 
 
 def plan_indexer_query_shard(
@@ -102,6 +130,12 @@ class _IndexerQueryShard:
     tp_size: int
     actual_seq_lengths_q: torch.Tensor
     actual_seq_lengths_kv: torch.Tensor
+    # ``(cu_seqlens_q, seqused_k, metadata)`` for the quantized indexer, or
+    # None until this forward's first indexer layer plans it. The backend's
+    # per-batch pre-plan cannot be used on a sharded call -- see the quant
+    # branch of ``forward_npu`` -- and these lengths are the same for all 78
+    # layers of one forward, so the plan is cached here rather than redone.
+    quant_indexer_plan: Optional[tuple] = None
 
     def take(self, x: torch.Tensor) -> torch.Tensor:
         if self.num_real == self.rows:
@@ -212,6 +246,41 @@ def _get_indexer_query_shard(
 
 
 class DSANPUIndexerMixin:
+    def _plan_quant_lightning_indexer(
+        self,
+        cum_query_lens: torch.Tensor,
+        key_lens: torch.Tensor,
+        device,
+    ):
+        """``(cu_seqlens_q, seqused_k, metadata)`` for one quant indexer call.
+
+        ``cum_query_lens`` is per-request *cumulative* query rows, as the v1
+        operator's ``actual_seq_lengths_query`` was; the v2 operator instead
+        wants it prefixed with a 0, and its last value is how many rows of
+        ``query`` the kernel will read. ``key_lens`` is per-request and not
+        cumulative. Both must describe the tensors this call actually passes.
+        """
+        cum_q = cum_query_lens.to(device=device, dtype=torch.int32)
+        cu_seqlens_q = torch.cat([cum_q.new_zeros(1), cum_q])
+        seqused_k = key_lens.to(device=device, dtype=torch.int32)
+        metadata = torch.ops.cann_ops_transformer.quant_lightning_indexer_metadata(
+            self.n_heads,
+            1,
+            self.head_dim,
+            self.index_topk,
+            3,  # QUANT_MODE_MXFP8 (5 == QUANT_MODE_MXFP4)
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            batch_size=int(cum_q.numel()),
+            max_seqlen_q=-1,
+            max_seqlen_k=-1,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            mask_mode=3,
+            cmp_ratio=1,
+        )
+        return cu_seqlens_q, seqused_k, metadata
+
     def forward_npu(
         self,
         x: torch.Tensor,
@@ -373,6 +442,7 @@ class DSANPUIndexerMixin:
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer:
+            _check_quant_lightning_indexer_constraints(pool)
             k, k_scale = _quantize_npu_indexer_activation(
                 k, pool.indexer_hadamard_128, pool.dtype
             )
@@ -496,24 +566,72 @@ class DSANPUIndexerMixin:
                     pool.indexer_hadamard_128,
                     pool.dtype,
                 )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
-                    query=query,
-                    key=past_key_states,
-                    weights=weights,
-                    query_dequant_scale=query_scale,
-                    key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
-                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(
-                        device=k.device, dtype=torch.int32
-                    ),
-                    block_table=block_table,
-                    layout_query="TND",
-                    layout_key="PA_BSND",
-                    sparse_count=self.index_topk,
-                    sparse_mode=3,
-                    query_quant_mode=0,
-                    key_quant_mode=0,
-                ).squeeze(1)
+                # quant_lightning_indexer (v2) contract, quant_mode 3 (MXFP8):
+                #  - layout_q TND: q (q_t, q_n, d) fp8, cu_seqlens_q (b+1,) int32
+                #    required (first value 0, last value q_t)
+                #  - layout_k PA_BBND: k (block_num, block_size, k_n, d) fp8 with
+                #    block_table (b, max_blocks) and seqused_k (b,) both required
+                #  - descales are E8M0: q (q_t, q_n, d/64, 2),
+                #    k (block_num, block_size, k_n, d/64, 2)
+                #  - w is float32 (q_t, q_n)
+                # The metadata op (task list / load balancing) is pre-planned
+                # once per batch by AscendAttnBackend.init_forward_metadata;
+                # fall back to computing it inline when the backend did not
+                # pre-plan it (cuda-graph capture, other backends, CP, spec
+                # draft model), and ALWAYS re-plan when this call was sharded.
+                #
+                # The pre-plan describes the whole batch. A sharded call was
+                # handed 1/attn_tp_size of the query rows, so the batch-wide
+                # cu_seqlens_q ends at the batch's token total and the operator
+                # would walk attn_tp_size times past the end of `query`,
+                # `weights` and `query_scale`. Nothing on the host catches it:
+                # the lengths are device tensors, so the tiling cannot check
+                # them against the query shape, and the kernel reports the
+                # out-of-bounds read as an AICore trap from inside
+                # quant_lightning_indexer.
+                _fm = get_attn_backend().forward_metadata
+                if shard is None:
+                    cu_seqlens_q = getattr(_fm, "quant_indexer_cu_seqlens_q", None)
+                    seqused_k = getattr(_fm, "quant_indexer_seqused_k", None)
+                    metadata = getattr(_fm, "quant_indexer_metadata", None)
+                    if metadata is None:
+                        cu_seqlens_q, seqused_k, metadata = (
+                            self._plan_quant_lightning_indexer(
+                                actual_seq_lengths_q, actual_seq_lengths_kv, k.device
+                            )
+                        )
+                else:
+                    # Planned on this forward's first indexer layer and reused
+                    # by the rest, which is what the backend's pre-plan buys.
+                    if shard.quant_indexer_plan is None:
+                        shard.quant_indexer_plan = self._plan_quant_lightning_indexer(
+                            shard.actual_seq_lengths_q,
+                            shard.actual_seq_lengths_kv,
+                            k.device,
+                        )
+                    cu_seqlens_q, seqused_k, metadata = shard.quant_indexer_plan
+                block_table = block_table.to(torch.int32)
+                topk_indices, _ = (
+                    torch.ops.cann_ops_transformer.quant_lightning_indexer(
+                        query,
+                        past_key_states,
+                        weights.to(torch.float32),
+                        query_scale,
+                        pool.get_index_k_scale_buffer(layer_id),
+                        self.index_topk,
+                        3,  # QUANT_MODE_MXFP8   5, # QUANT_MODE_MXFP4,
+                        cu_seqlens_q=cu_seqlens_q,
+                        seqused_k=seqused_k,
+                        block_table=block_table,
+                        metadata=metadata,
+                        max_seqlen_q=-1,
+                        layout_q="TND",
+                        layout_k="PA_BBND",
+                        mask_mode=3,
+                        cmp_ratio=1,
+                    )
+                )
+                topk_indices = topk_indices.squeeze(1)
             else:
                 topk_indices = torch_npu.npu_lightning_indexer(
                     query=query,
