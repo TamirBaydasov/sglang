@@ -1066,6 +1066,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
+            # The packed FP8 record is latent KV, so it is sharded under DCP
+            # exactly like the bf16 form: filter to this rank's rows and
+            # collapse the widened loc BEFORE packing. Without this the scatter
+            # writes at the virtual loc, which runs up to dcp_size times past
+            # the end of k_buffer -- and nothing catches it, because this
+            # branch returns before the bounds check in _resolve_dcp_write and
+            # the sparse path's FP8-plus-DCP assert only guards the read.
+            loc, cache_k, cache_v = self._resolve_dcp_write(loc, cache_k, cache_v)
+            if loc.numel() == 0:
+                return
             packed = self._pack_dsa_fp8_kv_cache(cache_k, cache_v)
             torch_npu.npu_scatter_nd_update_(
                 self.k_buffer[layer_id - self.start_layer].view(
