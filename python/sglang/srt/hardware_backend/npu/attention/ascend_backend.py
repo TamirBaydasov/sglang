@@ -1469,15 +1469,37 @@ class AscendAttnBackend(AttentionBackend):
 
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
             if self.kv_cache_dtype == torch.float8_e4m3fn:
-                # DCP does not compose with an FP8 KV cache: this branch does not
-                # read the gathered buffer and the LSE port has no quant form.
-                assert not (dcp_decode or dcp_extend), (
-                    "FP8 KV cache with decode context parallelism is not "
-                    "supported: the DCP gathered/LSE paths are bf16-only."
+                # DCP decode still has no quant form: its merge is LSE-weighted
+                # and the operator P3b vendored for it is bf16-only. Extend has
+                # no merge, so it composes -- see below.
+                assert not dcp_decode, (
+                    "FP8 KV cache with DCP decode is not supported: the merge "
+                    "needs a softmax LSE and npu_sparse_flash_attention_lse is "
+                    "bf16-only."
                 )
                 assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-                packed = k_nope.view(torch.float8_e4m3fn)
-                attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
+                if dcp_extend:
+                    # The gathered buffer holds the packed record verbatim, and
+                    # KV_D == kv_cache_dim == 656 is exactly the layout this
+                    # operator documents for layout_kv TND:
+                    # nope + rope*2 + dequant_scale*4 = 512 + 64*2 + 4*4. So the
+                    # FP8 cache is read as gathered, with no dequantize pass and
+                    # 656 rather than 1152 bytes per token on the wire.
+                    #
+                    # Under TND, actual_seq_lengths_kv is a PREFIX SUM, which is
+                    # what dcp_kv_indptr[1:] already is -- the same vector the
+                    # bf16 gathered path passes.
+                    packed = key_nope.view(torch.float8_e4m3fn)
+                    quant_kv_layout, quant_block_table = "TND", None
+                    quant_seq_lengths_kv = seq_lengths_kv
+                    quant_sparse_mode = sparse_mode
+                else:
+                    packed = k_nope.view(torch.float8_e4m3fn)
+                    quant_kv_layout = "PA_BSND"
+                    quant_block_table = self.forward_metadata.block_tables
+                    quant_seq_lengths_kv = actual_seq_lengths_kv
+                    quant_sparse_mode = 3
+                quant_call = dict(
                     query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
                     key=packed,
                     value=packed,
@@ -1490,19 +1512,23 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_query=actual_seq_qlen.to(
                         device=q_nope.device, dtype=torch.int32
                     ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
+                    actual_seq_lengths_kv=quant_seq_lengths_kv.to(
                         device=q_nope.device, dtype=torch.int32
                     ),
-                    block_table=self.forward_metadata.block_tables,
                     sparse_block_size=1,
                     layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
+                    layout_kv=quant_kv_layout,
+                    sparse_mode=quant_sparse_mode,
                     attention_mode=2,
                     quant_scale_repo_mode=1,
                     tile_size=128,
                     rope_head_dim=self.qk_rope_head_dim,
                 )
+                # Omitted rather than passed as None, as the bf16 call does:
+                # to a tiling function the two are not always the same thing.
+                if quant_block_table is not None:
+                    quant_call["block_table"] = quant_block_table
+                attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(**quant_call)
             else:
                 call = dict(
                     query=q_nope,

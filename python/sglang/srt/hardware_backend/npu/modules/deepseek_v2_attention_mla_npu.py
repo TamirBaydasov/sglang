@@ -653,17 +653,35 @@ def _dcp_gather_extend_kv_npu(
                 sum(forward_batch.extend_seq_lens_cpu),
             )
 
+    pool = get_token_to_kv_pool()
+    # Under an FP8 DSA cache the pool stores ONE packed record per token --
+    # nope, rope and the dequant scales in a single 656-byte row -- so there is
+    # no second tensor to move. Pack this chunk's own bf16 KV into the same
+    # record and the gather is byte-for-byte the shape the sparse operator
+    # reads at layout_kv TND. It is also 43% less wire than the bf16 form,
+    # which matters because this gather is the port's largest single cost.
+    packed_kv = getattr(pool, "dsa_kv_cache_store_fp8", False)
+    if packed_kv:
+        # (rows, 1, kv_cache_dim), matching what get_mla_kv_buffer returns for
+        # the prefix, so send and own rows concatenate without a reshape.
+        k_nope = pool._pack_dsa_fp8_kv_cache(k_nope, k_pe).unsqueeze(1)
+        k_pe = None
+
     total_rows = plan.pieces[-1].out_end if plan.pieces else 0
     out_nope = dcp_extend_gather_buffer("latent", k_nope, total_rows)
-    out_rope = dcp_extend_gather_buffer("rope", k_pe, total_rows)
+    out_rope = None if packed_kv else dcp_extend_gather_buffer("rope", k_pe, total_rows)
 
     # One scratch per key, sized for the widest piece and sliced per piece.
     scratch_nope = dcp_extend_gather_buffer("latent_scratch", k_nope, plan.scratch_rows)
-    scratch_rope = dcp_extend_gather_buffer("rope_scratch", k_pe, plan.scratch_rows)
+    scratch_rope = (
+        None
+        if packed_kv
+        else dcp_extend_gather_buffer("rope_scratch", k_pe, plan.scratch_rows)
+    )
 
     send_nope = send_rope = None
     if plan.send_rows:
-        send_nope, send_rope = get_token_to_kv_pool().get_mla_kv_buffer(
+        send_nope, send_rope = pool.get_mla_kv_buffer(
             m.attn_mqa,
             md.dcp_local_prefix_kv_indices,
         )
@@ -671,17 +689,18 @@ def _dcp_gather_extend_kv_npu(
             # Served prefixes are dcp_size-aligned (the widened allocator page)
             # and need no padding; this is the general case.
             send_nope = _pad_dcp_extend_send(send_nope, plan)
-            send_rope = _pad_dcp_extend_send(send_rope, plan)
+            if send_rope is not None:
+                send_rope = _pad_dcp_extend_send(send_rope, plan)
 
     # Every rank plans the same pieces, so every rank runs -- or, for a piece
     # with no prefix rows, skips -- the same collectives in the same order.
+    keys = [(out_nope, scratch_nope, send_nope, k_nope)]
+    if not packed_kv:
+        keys.append((out_rope, scratch_rope, send_rope, k_pe))
     for piece in plan.pieces:
         gathered = (piece.send_end - piece.send_start) * parallel.dcp_size
         rows = gathered + piece.extend_end - piece.extend_start
-        for out, buf, send, own in (
-            (out_nope, scratch_nope, send_nope, k_nope),
-            (out_rope, scratch_rope, send_rope, k_pe),
-        ):
+        for out, buf, send, own in keys:
             scratch = buf[:rows]
             if gathered:
                 parallel.dcp_group.all_gather_into_tensor(

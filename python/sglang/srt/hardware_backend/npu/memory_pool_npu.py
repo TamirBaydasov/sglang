@@ -830,9 +830,22 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         # ``layer_id`` overrides the layer's own id so a caller can read another
         # layer's KV; everything else about the read is identical.
         read_layer_id = layer.layer_id if layer_id is None else layer_id
+        idx = loc.to(torch.int64)
+        if self.dsa_kv_cache_store_fp8:
+            # One packed record per row -- nope, rope and the dequant scales
+            # together -- so there is no second half to return. The sparse
+            # operator reads it whole at KV_D == kv_cache_dim, and splitting it
+            # here would only force a re-pack before the gather.
+            assert dst_dtype is None or dst_dtype == self.store_dtype, (
+                "the packed FP8 KV record cannot be cast on read; asked for "
+                f"{dst_dtype}"
+            )
+            packed = self.k_buffer[read_layer_id - self.start_layer].view(
+                -1, self.kv_cache_dim
+            )
+            return packed.index_select(0, idx).unsqueeze(1), None
         k = self.get_key_buffer(read_layer_id).view(-1, self.kv_lora_rank)
         v = self.get_value_buffer(read_layer_id).view(-1, self.qk_rope_head_dim)
-        idx = loc.to(torch.int64)
         cache_k_nope = k.index_select(0, idx).unsqueeze(1)
         cache_k_rope = v.index_select(0, idx).unsqueeze(1)
         if dst_dtype is not None and dst_dtype != cache_k_nope.dtype:
