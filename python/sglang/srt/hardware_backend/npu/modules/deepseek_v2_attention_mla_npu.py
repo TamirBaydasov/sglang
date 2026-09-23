@@ -664,7 +664,14 @@ def _dcp_gather_extend_kv_npu(
     if packed_kv:
         # (rows, 1, kv_cache_dim), matching what get_mla_kv_buffer returns for
         # the prefix, so send and own rows concatenate without a reshape.
-        k_nope = pool._pack_dsa_fp8_kv_cache(k_nope, k_pe).unsqueeze(1)
+        #
+        # Carried as uint8, not float8_e4m3fn: aclnnIndexSelect has no FP8 in
+        # its dtype list and the reorder below is an index_select. The record
+        # is an opaque byte string to everything on this path -- only the
+        # sparse operator interprets it -- so the backend views it back to FP8
+        # at the call. Same width either way, so nothing else changes.
+        k_nope = pool._pack_dsa_fp8_kv_cache(k_nope, k_pe).view(torch.uint8)
+        k_nope = k_nope.unsqueeze(1)
         k_pe = None
 
     total_rows = plan.pieces[-1].out_end if plan.pieces else 0

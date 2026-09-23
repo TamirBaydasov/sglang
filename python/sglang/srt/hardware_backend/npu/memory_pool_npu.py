@@ -840,8 +840,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 "the packed FP8 KV record cannot be cast on read; asked for "
                 f"{dst_dtype}"
             )
-            packed = self.k_buffer[read_layer_id - self.start_layer].view(
-                -1, self.kv_cache_dim
+            # uint8, not the store dtype: aclnnIndexSelect has no FP8 in its
+            # dtype list. The record is opaque bytes to every consumer except
+            # the sparse operator, which the backend hands an FP8 view.
+            packed = (
+                self.k_buffer[read_layer_id - self.start_layer]
+                .view(torch.uint8)
+                .view(-1, self.kv_cache_dim)
             )
             return packed.index_select(0, idx).unsqueeze(1), None
         k = self.get_key_buffer(read_layer_id).view(-1, self.kv_lora_rank)
