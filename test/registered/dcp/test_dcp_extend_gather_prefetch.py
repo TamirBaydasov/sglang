@@ -52,9 +52,22 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 DCP_SIZES = [1, 2, 4, 8, 16]
 # The prefetch requires a single-piece plan, which is what
-# SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS <= 0 produces.
+# SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS <= 0 produces. The inline path has no
+# such restriction and the DEFAULT budget cuts a long prefix into several
+# pieces, so it is tested at both -- pieces share one scratch, and gathering
+# them all before consuming any would put real KV at the wrong positions.
 ONE_PIECE = 1 << 62
+SMALL_PIECES = 64
 LAYERS = 8
+
+# Short prefixes only for the multi-piece runs: the model is O(rows x ranks)
+# per piece, and a 32k prefix at piece_rows 64 would be hundreds of pieces.
+MULTI_PIECE_CASES = [
+    ([129], [4]),
+    ([5, 9], [3, 5]),
+    ([129, 7, 64], [9, 2, 6]),
+    ([1, 0, 33], [1, 1, 1]),
+]
 
 CASES = [
     ([0], [1]),
@@ -111,6 +124,8 @@ def run_forward(
     release_wait=True,
     ready_wait=True,
     prefetch_keys=None,
+    piece_rows=ONE_PIECE,
+    hoist=False,
 ):
     """Simulate one forward over ``LAYERS`` layers; return [[per key] per layer].
 
@@ -118,11 +133,12 @@ def run_forward(
     that drops one can be reproduced deliberately.
     """
     plans = [
-        plan_dcp_extend_gather(prefix_lens, extend_lens, dcp_size, rank, ONE_PIECE)
+        plan_dcp_extend_gather(prefix_lens, extend_lens, dcp_size, rank, piece_rows)
         for rank in range(dcp_size)
     ]
     plan = plans[0]
-    assert len(plan.pieces) <= 1, "the prefetch only runs on a single-piece plan"
+    if prefetch:
+        assert len(plan.pieces) <= 1, "the prefetch only runs on a single-piece plan"
     total = plan.pieces[-1].out_end if plan.pieces else 0
     if prefetch_keys is None:
         prefetch_keys = range(n_keys)
@@ -136,7 +152,7 @@ def run_forward(
     filled = [[False] * slots_n for _ in range(n_keys)]
     inflight = [[False] * slots_n for _ in range(n_keys)]
 
-    def gather_phase(slot, layer, on_side, keys):
+    def gather_piece(piece, slot, layer, on_side, keys):
         for key in keys:
             if on_side and unreleased[key][slot] and not release_wait:
                 raise StaleRead("side stream refilled a slot the main stream had read")
@@ -147,13 +163,12 @@ def run_forward(
                 )
                 for rk in range(dcp_size)
             ]
-            for piece in plan.pieces:
-                send_len = piece.send_end - piece.send_start
-                for rk in range(dcp_size):
-                    for j in range(send_len):
-                        slots[key][slot][rk * send_len + j] = sends[rk][
-                            piece.send_start + j
-                        ]
+            send_len = piece.send_end - piece.send_start
+            for rk in range(dcp_size):
+                for j in range(send_len):
+                    slots[key][slot][rk * send_len + j] = sends[rk][
+                        piece.send_start + j
+                    ]
             if on_side:
                 inflight[key][slot] = True
             else:
@@ -165,8 +180,7 @@ def run_forward(
                 inflight[key][slot] = False
                 filled[key][slot] = True
 
-    def consume_phase(slot, layer):
-        outs = []
+    def consume_piece(piece, slot, layer, outs):
         for key in range(n_keys):
             if not filled[key][slot]:
                 raise StaleRead(
@@ -177,39 +191,53 @@ def run_forward(
                 for r, e in enumerate(extend_lens)
                 for i in range(e)
             ]
-            out = [None] * total
+            gathered = (piece.send_end - piece.send_start) * dcp_size
+            scratch = slots[key][slot]
+            for k, j in enumerate(range(piece.extend_start, piece.extend_end)):
+                scratch[gathered + k] = extend_rows[j]
+            outs[key][piece.out_start : piece.out_end] = [
+                scratch[i] for i in piece.index
+            ]
+
+    def layer_pass(slot, layer, prefetched):
+        """One layer. Pieces share a scratch, so gather and consume interleave."""
+        if prefetched:
+            if ready_wait:
+                wait_ready(slot, range(n_keys))
+        outs = [[None] * total for _ in range(n_keys)]
+        if hoist:
+            # The bug this guards: every gather before any index_select.
             for piece in plan.pieces:
-                gathered = (piece.send_end - piece.send_start) * dcp_size
-                scratch = slots[key][slot]
-                for k, j in enumerate(range(piece.extend_start, piece.extend_end)):
-                    scratch[gathered + k] = extend_rows[j]
-                out[piece.out_start : piece.out_end] = [scratch[i] for i in piece.index]
+                gather_piece(piece, slot, layer, False, range(n_keys))
+            for piece in plan.pieces:
+                consume_piece(piece, slot, layer, outs)
+        else:
+            for piece in plan.pieces:
+                if not prefetched:
+                    gather_piece(piece, slot, layer, False, range(n_keys))
+                consume_piece(piece, slot, layer, outs)
+        for key in range(n_keys):
             filled[key][slot] = False
             unreleased[key][slot] = True
-            outs.append(out)
         return outs
 
     results, pending = [], set()
     for layer in range(LAYERS):
         slot = (layer % slots_n) if prefetch else 0
-        if prefetch and layer in pending:
-            if ready_wait:
-                wait_ready(slot, range(n_keys))
-        else:
-            gather_phase(slot, layer, on_side=False, keys=range(n_keys))
-        results.append(consume_phase(slot, layer))
+        results.append(layer_pass(slot, layer, prefetch and layer in pending))
         if prefetch and layer + 1 < LAYERS:
-            gather_phase(
-                (layer + 1) % slots_n, layer + 1, on_side=True, keys=prefetch_keys
-            )
+            for piece in plan.pieces:
+                gather_piece(
+                    piece, (layer + 1) % slots_n, layer + 1, True, prefetch_keys
+                )
             pending.add(layer + 1)
     return results
 
 
 class TestDcpExtendGatherPrefetch(CustomTestCase):
-    def _check(self, prefetch, n_keys, **kw):
+    def _check(self, prefetch, n_keys, cases=None, **kw):
         for dcp_size in DCP_SIZES:
-            for prefix_lens, extend_lens in CASES:
+            for prefix_lens, extend_lens in cases or CASES:
                 got = run_forward(
                     prefix_lens, extend_lens, dcp_size, prefetch, n_keys=n_keys, **kw
                 )
@@ -226,11 +254,35 @@ class TestDcpExtendGatherPrefetch(CustomTestCase):
         self._check(prefetch=False, n_keys=1)
         self._check(prefetch=False, n_keys=2)
 
+    def test_the_inline_path_is_right_when_the_plan_has_several_pieces(self):
+        # The default SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS cuts a long
+        # prefix into several pieces that share one scratch buffer, so the
+        # gather and the index_select have to interleave per piece.
+        self._check(
+            prefetch=False, n_keys=1, piece_rows=SMALL_PIECES, cases=MULTI_PIECE_CASES
+        )
+        self._check(
+            prefetch=False, n_keys=2, piece_rows=SMALL_PIECES, cases=MULTI_PIECE_CASES
+        )
+
     def test_prefetching_a_layer_ahead_changes_nothing(self):
         self._check(prefetch=True, n_keys=1)
 
     def test_a_bf16_cache_carries_both_keys_through_the_prefetch(self):
         self._check(prefetch=True, n_keys=2)
+
+    def test_hoisting_every_gather_ahead_of_every_consume_corrupts_pieces(self):
+        # The control for the interleaving above. Pieces share one scratch, so
+        # gathering them all first means piece n+1 overwrites piece n before it
+        # is read, and the output carries real KV at the wrong positions --
+        # fluent and wrong, with nothing raised. A single-piece plan is exempt,
+        # which is why the prefetch is allowed to hoist.
+        case = ([129, 7, 64], [9, 2, 6])
+        got = run_forward(*case, 8, False, piece_rows=SMALL_PIECES, hoist=True)
+        self.assertNotEqual(got[0][0], reference(*case, 0, 0))
+        # ... and a single-piece plan is exempt, which is why the prefetch may.
+        same = run_forward(*case, 8, False, hoist=True)
+        self.assertEqual(same[0][0], reference(*case, 0, 0))
 
     def test_dropping_a_key_from_the_prefetch_is_caught(self):
         # The FP8-only gate this replaced would have left the rope half holding

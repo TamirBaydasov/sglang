@@ -869,24 +869,32 @@ def _dcp_gather_extend_kv_npu(
     # with no prefix rows, skips -- the same collectives in the same order.
     # That holds under the prefetch too: the layer order is identical on every
     # rank, so the side stream issues the same sequence everywhere.
+    #
+    # The gather and the index_select stay INTERLEAVED per piece. Pieces share
+    # one scratch, so hoisting every gather ahead of every index_select would
+    # have piece n+1 overwrite piece n before it is read -- silently, with real
+    # KV at the wrong positions. The prefetch is exempt only because it
+    # requires a single-piece plan, where the two orders are the same thing.
     done = state.pending.pop(layer_id, None) if prefetching else None
+    sends = None
     if done is not None:
         _, ready, _ = done
         torch.npu.current_stream().wait_event(ready)
     else:
         sends = _dcp_extend_send_rows(pool, m.attn_mqa, md, plan, layer_id, packed_kv)
-        pairs = [(scratch, send) for (scratch, _), send in zip(scratches, sends)]
-        for piece in plan.pieces:
-            _dcp_extend_all_gather(parallel, plan, piece, pairs)
 
-    keys = [
-        (out_nope if i == 0 else out_rope, scratch, own)
-        for i, (scratch, own) in enumerate(scratches)
-    ]
+    outs = [out_nope] if packed_kv else [out_nope, out_rope]
     for piece in plan.pieces:
         gathered = (piece.send_end - piece.send_start) * parallel.dcp_size
         rows = gathered + piece.extend_end - piece.extend_start
-        for out, buf, own in keys:
+        if sends is not None:
+            _dcp_extend_all_gather(
+                parallel,
+                plan,
+                piece,
+                [(buf, send) for (buf, _), send in zip(scratches, sends)],
+            )
+        for out, (buf, own) in zip(outs, scratches):
             scratch = buf[:rows]
             scratch[gathered:] = own[piece.extend_start : piece.extend_end]
             torch.index_select(
