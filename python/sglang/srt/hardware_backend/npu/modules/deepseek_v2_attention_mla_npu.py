@@ -666,6 +666,39 @@ class _DcpGatherPrefetch:
         return (layer_id - start_layer) & 1
 
 
+_logged_dcp_gather_prefetch = False
+
+
+def _log_dcp_gather_prefetch_once(prefetching: bool, plan, packed_kv: bool) -> None:
+    """Say once, on the first DCP extend, whether the prefetch is actually on.
+
+    Without this the fallback is silent, and a run that changed nothing cannot
+    be told apart from a run where the prefetch never engaged -- which is a
+    different problem with a different fix.
+    """
+    global _logged_dcp_gather_prefetch
+    if _logged_dcp_gather_prefetch:
+        return
+    _logged_dcp_gather_prefetch = True
+    if prefetching:
+        logger.info(
+            "DCP extend gather prefetch is ACTIVE: %d piece, %d scratch rows per "
+            "slot, %d keys, 2 slots",
+            len(plan.pieces),
+            plan.scratch_rows,
+            1 if packed_kv else 2,
+        )
+    elif _prefetch_dcp_extend_gather:
+        logger.info(
+            "DCP extend gather prefetch was REQUESTED but is OFF: the plan has "
+            "%d pieces and the prefetch needs exactly 1. Set "
+            "SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS=0.",
+            len(plan.pieces),
+        )
+    else:
+        logger.info("DCP extend gather prefetch is off (inline gathers)")
+
+
 def _dcp_extend_gather_scratch(name: str, slot: int, ref: torch.Tensor, rows: int):
     """Scratch for one gathered key. Slot 1 exists only under the prefetch.
 
@@ -814,6 +847,7 @@ def _dcp_gather_extend_kv_npu(
     # nothing on its own -- measured, the piece count does not move the clock.
     layer_id = m.attn_mqa.layer_id
     prefetching = _prefetch_dcp_extend_gather and len(plan.pieces) == 1
+    _log_dcp_gather_prefetch_once(prefetching, plan, packed_kv)
     slot = 0
     state = None
     if prefetching:
