@@ -666,21 +666,36 @@ class _DcpGatherPrefetch:
         return (layer_id - start_layer) & 1
 
 
-def _dcp_extend_gather_scratch(slot: int, ref: torch.Tensor, rows: int):
-    """Scratch for one gather. Slot 1 exists only under the prefetch."""
-    return dcp_extend_gather_buffer(
-        "latent_scratch" if slot == 0 else "latent_scratch_b", ref, rows
-    )
+def _dcp_extend_gather_scratch(name: str, slot: int, ref: torch.Tensor, rows: int):
+    """Scratch for one gathered key. Slot 1 exists only under the prefetch.
+
+    Slot 0 keeps the historical name so the non-prefetched path reserves the
+    same buffers it always did, and a bf16 cache -- two keys, so two scratches
+    -- gets a second slot for each.
+    """
+    return dcp_extend_gather_buffer(name if slot == 0 else name + "_b", ref, rows)
 
 
-def _dcp_extend_send_rows(pool, layer, md, plan, layer_id: int):
+def _dcp_extend_gather_scratches(slot: int, k_nope, k_pe, rows: int, packed_kv: bool):
+    """``[(scratch, own), ...]``: one entry under FP8, two under bf16."""
+    keys = [(_dcp_extend_gather_scratch("latent_scratch", slot, k_nope, rows), k_nope)]
+    if not packed_kv:
+        keys.append(
+            (_dcp_extend_gather_scratch("rope_scratch", slot, k_pe, rows), k_pe)
+        )
+    return keys
+
+
+def _dcp_extend_send_rows(pool, layer, md, plan, layer_id: int, packed_kv: bool):
     """This rank's padded prefix shard for ``layer_id`` -- the gather's input.
 
-    Prefix rows only, so this reads nothing the current forward wrote. That is
-    what lets ``_DcpGatherPrefetch`` call it a layer early.
+    Returns one send per gathered key, in the same order as
+    ``_dcp_extend_gather_scratches``: [nope] under an FP8 cache, [nope, rope]
+    under bf16. Prefix rows only, so this reads nothing the current forward
+    wrote -- which is what lets ``_DcpGatherPrefetch`` call it a layer early.
     """
     if not plan.send_rows:
-        return None, None
+        return [None] if packed_kv else [None, None]
     send_nope, send_rope = pool.get_mla_kv_buffer(
         layer, md.dcp_local_prefix_kv_indices, layer_id=layer_id
     )
@@ -690,7 +705,7 @@ def _dcp_extend_send_rows(pool, layer, md, plan, layer_id: int):
         send_nope = _pad_dcp_extend_send(send_nope, plan)
         if send_rope is not None:
             send_rope = _pad_dcp_extend_send(send_rope, plan)
-    return send_nope, send_rope
+    return [send_nope] if packed_kv else [send_nope, send_rope]
 
 
 def _dcp_extend_all_gather(parallel, plan, piece, pairs) -> None:
@@ -798,7 +813,7 @@ def _dcp_gather_extend_kv_npu(
     # SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS <= 0 produces, and it costs
     # nothing on its own -- measured, the piece count does not move the clock.
     layer_id = m.attn_mqa.layer_id
-    prefetching = _prefetch_dcp_extend_gather and packed_kv and len(plan.pieces) == 1
+    prefetching = _prefetch_dcp_extend_gather and len(plan.pieces) == 1
     slot = 0
     state = None
     if prefetching:
@@ -809,11 +824,11 @@ def _dcp_gather_extend_kv_npu(
         slot = state.slot_of(layer_id, pool.start_layer)
 
     # One scratch per key, sized for the widest piece and sliced per piece.
-    scratch_nope = _dcp_extend_gather_scratch(slot, k_nope, plan.scratch_rows)
-    scratch_rope = (
-        None
-        if packed_kv
-        else dcp_extend_gather_buffer("rope_scratch", k_pe, plan.scratch_rows)
+    # An FP8 cache packs the record into one key, bf16 keeps nope and rope
+    # apart; the prefetch has to carry whichever set this cache uses, or the
+    # key it dropped would be read as whatever the previous layer left there.
+    scratches = _dcp_extend_gather_scratches(
+        slot, k_nope, k_pe, plan.scratch_rows, packed_kv
     )
 
     # Every rank plans the same pieces, so every rank runs -- or, for a piece
@@ -825,18 +840,15 @@ def _dcp_gather_extend_kv_npu(
         _, ready, _ = done
         torch.npu.current_stream().wait_event(ready)
     else:
-        send_nope, send_rope = _dcp_extend_send_rows(
-            pool, m.attn_mqa, md, plan, layer_id
-        )
-        pairs = [(scratch_nope, send_nope)]
-        if not packed_kv:
-            pairs.append((scratch_rope, send_rope))
+        sends = _dcp_extend_send_rows(pool, m.attn_mqa, md, plan, layer_id, packed_kv)
+        pairs = [(scratch, send) for (scratch, _), send in zip(scratches, sends)]
         for piece in plan.pieces:
             _dcp_extend_all_gather(parallel, plan, piece, pairs)
 
-    keys = [(out_nope, scratch_nope, k_nope)]
-    if not packed_kv:
-        keys.append((out_rope, scratch_rope, k_pe))
+    keys = [
+        (out_nope if i == 0 else out_rope, scratch, own)
+        for i, (scratch, own) in enumerate(scratches)
+    ]
     for piece in plan.pieces:
         gathered = (piece.send_end - piece.send_start) * parallel.dcp_size
         rows = gathered + piece.extend_end - piece.extend_start
@@ -853,7 +865,9 @@ def _dcp_gather_extend_kv_npu(
         release = torch.npu.Event()
         release.record()
         state.release[slot] = release
-        _issue_dcp_gather_prefetch(state, pool, m, md, plan, parallel, layer_id, k_nope)
+        _issue_dcp_gather_prefetch(
+            state, pool, m, md, plan, parallel, layer_id, k_nope, k_pe, packed_kv
+        )
 
     return out_nope, out_rope
 
@@ -866,30 +880,35 @@ def _issue_dcp_gather_prefetch(
     plan,
     parallel,
     layer_id: int,
-    ref: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: Optional[torch.Tensor],
+    packed_kv: bool,
 ) -> None:
-    """Start the next layer's prefix all-gather on the side stream."""
+    """Start the next layer's prefix all-gather(s) on the side stream."""
     nxt = layer_id + 1
     # start_layer + layer_num - 1 rather than end_layer: layer_num is what
     # this pool indexes its buffers by, and end_layer is derived upstream.
     if nxt > pool.start_layer + pool.layer_num - 1 or nxt in state.pending:
         return
     slot = state.slot_of(nxt, pool.start_layer)
-    rows = plan.scratch_rows
-    scratch = _dcp_extend_gather_scratch(slot, ref, rows)
+    scratches = _dcp_extend_gather_scratches(
+        slot, k_nope, k_pe, plan.scratch_rows, packed_kv
+    )
     release = state.release.get(slot)
     with torch.npu.stream(state.stream):
         if release is not None:
             state.stream.wait_event(release)
-        send_nope, _ = _dcp_extend_send_rows(pool, m.attn_mqa, md, plan, nxt)
+        sends = _dcp_extend_send_rows(pool, m.attn_mqa, md, plan, nxt, packed_kv)
+        pairs = [(scratch, send) for (scratch, _), send in zip(scratches, sends)]
         for piece in plan.pieces:
-            _dcp_extend_all_gather(parallel, plan, piece, [(scratch, send_nope)])
-        # The send buffer was allocated here but the main stream's allocator
-        # owns it; without this it can be handed out again mid-collective.
-        if send_nope is not None:
-            send_nope.record_stream(state.stream)
+            _dcp_extend_all_gather(parallel, plan, piece, pairs)
+        # The sends were allocated here but the main stream's allocator owns
+        # them; without this they can be handed out again mid-collective.
+        for send in sends:
+            if send is not None:
+                send.record_stream(state.stream)
         ready = state.stream.record_event()
-    state.pending[nxt] = (slot, ready, send_nope)
+    state.pending[nxt] = (slot, ready, sends)
 
 
 def forward_dsa_core_npu(
