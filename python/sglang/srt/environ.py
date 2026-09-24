@@ -993,6 +993,15 @@ class Envs:
     # the scratch a layer holds beside the gathered context. The default is
     # 256 MiB of latent KV; <= 0 gathers the whole prefix in one collective.
     SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
+    # DCP extend on NPU: run each layer's prefix all-gather one layer ahead, on
+    # a side stream, so it overlaps the previous layer's compute. Profiles show
+    # compute and communication never running at the same time -- the gather is
+    # issued and immediately awaited -- while the prefix it reads was written by
+    # earlier forwards and so does not depend on the current one. Costs a second
+    # context-sized scratch, and needs a single-piece plan
+    # (SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS <= 0); it silently stays off
+    # otherwise.
+    SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
