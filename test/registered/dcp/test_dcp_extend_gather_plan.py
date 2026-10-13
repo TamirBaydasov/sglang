@@ -26,6 +26,7 @@ import torch
 
 from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.layers.dcp.layout import (
+    DCP_EXTEND_QUERY_GATHER_MAX_TOKENS,
     dcp_extend_gather_buffer,
     dcp_extend_gathers_kv,
     dcp_owned_prefix_positions,
@@ -186,7 +187,8 @@ class TestDcpOwnedPrefixPositions(CustomTestCase):
 
 class TestDcpExtendGathersKv(CustomTestCase):
     """The per-forward choice between gathering the query and gathering the
-    prefix KV. GLM-5.2's dims put the byte crossover at exactly prefix / 178."""
+    prefix KV. GLM-5.2's dims put the byte crossover at exactly prefix / 178;
+    a tail past the query gather's memory cap gathers the KV regardless."""
 
     GLM52 = dict(num_heads=64, kv_lora_rank=512, qk_rope_head_dim=64, kv_elem_size=2)
 
@@ -197,6 +199,15 @@ class TestDcpExtendGathersKv(CustomTestCase):
     def test_it_sums_over_the_batch(self):
         self.assertTrue(dcp_extend_gathers_kv([89_000] * 2, [500, 500], **self.GLM52))
         self.assertFalse(dcp_extend_gathers_kv([89_000] * 2, [500, 499], **self.GLM52))
+
+    def test_a_long_tail_gathers_kv_whatever_the_bytes(self):
+        # Three long-prefix requests in one chunk favour the query by bytes, but
+        # its fp32 merge does not fit beside them.
+        prefix = [178 * (DCP_EXTEND_QUERY_GATHER_MAX_TOKENS + 1)] * 3
+        tail = [DCP_EXTEND_QUERY_GATHER_MAX_TOKENS]
+        self.assertFalse(dcp_extend_gathers_kv(prefix, tail, **self.GLM52))
+        tail = [DCP_EXTEND_QUERY_GATHER_MAX_TOKENS + 1]
+        self.assertTrue(dcp_extend_gathers_kv(prefix, tail, **self.GLM52))
 
 
 class TestDcpExtendGatherBuffer(CustomTestCase):
