@@ -252,6 +252,13 @@ def dcp_owned_prefix_positions(
     return torch.cat(parts)
 
 
+# Above this many new tokens a DSA extend gathers the KV whatever the bytes say.
+# The query gather's fp32 ``[out, lse]`` exchange grows with the new tokens and
+# is held several times over: a 16k-token batch of three 1M-prefix requests ran
+# out of memory there on A3, while 4,096-token chunks run on main.
+DCP_EXTEND_QUERY_GATHER_MAX_TOKENS = 4096
+
+
 def dcp_extend_gathers_kv(
     prefix_lens: Sequence[int],
     extend_lens: Sequence[int],
@@ -267,8 +274,14 @@ def dcp_extend_gathers_kv(
     token, whatever the head count. Both scale by ``(dcp - 1) / dcp``, so it
     cancels. For GLM-5.2 (64 heads, 512 + 64 bf16) the crossover is a tail of
     prefix / 178. Ties go to the KV gather, so an extend with no prefix -- which
-    gathers nothing -- takes it.
+    gathers nothing -- takes it. A batch counts each request's prefix, shared or
+    not, because the KV gather sends each one.
+
+    Bytes are not the only cost: past ``DCP_EXTEND_QUERY_GATHER_MAX_TOKENS``
+    the query gather's memory decides, and the KV gather is taken.
     """
+    if sum(extend_lens) > DCP_EXTEND_QUERY_GATHER_MAX_TOKENS:
+        return True
     row = (kv_lora_rank + qk_rope_head_dim) * kv_elem_size
     per_query_token = num_heads * (row + (kv_lora_rank + 1) * 4)
     return sum(prefix_lens) * row <= sum(extend_lens) * per_query_token
