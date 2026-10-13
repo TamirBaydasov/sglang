@@ -1466,6 +1466,15 @@ class AscendAttnBackend(AttentionBackend):
                 block_table = self.forward_metadata.block_tables
                 seq_lengths_kv = actual_seq_lengths_kv
                 sparse_mode = 3
+                if dsa_cp_plan is not None:
+                    import os
+
+                    if os.environ.get("SGLANG_DEBUG_NPU_DSA_CP_LOCAL_KVLEN"):
+                        # Experiment: this rank's own per-request KV lengths, so
+                        # sparse_mode=3 places each query at its true position.
+                        seq_lengths_kv = torch.tensor(
+                            dsa_cp_plan.key_lens, dtype=torch.int32
+                        )
 
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
             if self.kv_cache_dtype == torch.float8_e4m3fn:
