@@ -128,9 +128,13 @@ def prepare_decode_context_parallel_metadata(
         owned = dcp_prefix_kv_indices.view(-1, parallel.dcp_size, interleave)[
             :, parallel.dcp_rank, :
         ].reshape(-1)
-    dcp_local_prefix_kv_indices = translator.translate_full_attn_ids(
-        dcp_local_row(owned, parallel.dcp_size, interleave)
-    )
+    # Already rank-local rows, so not translate_dcp_read_ids: its `// dcp_size`
+    # is the interleave-1 rule. Only a translating pool maps them further.
+    dcp_local_prefix_kv_indices = dcp_local_row(owned, parallel.dcp_size, interleave)
+    if translator.is_translating:
+        dcp_local_prefix_kv_indices = translator._translate_full(
+            dcp_local_prefix_kv_indices
+        )
     # NPU gathers into its own reused buffers and never reads this one, which
     # is context-sized: 1.15 GB per extend forward at a 1M prefix.
     dcp_kv_buffer = (
