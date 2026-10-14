@@ -732,9 +732,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         create_npu_hadamard_128,
                     )
 
+                    # MXFP8 index-k scale cache for quant_lightning_indexer (v2),
+                    # quant_mode 3: one E8M0 byte per 32-element block, per-token
+                    # tail (k_n, d/64, 2) == (1, 2, 2). Stored as uint8 so the
+                    # scatter writer stays on a generic int dtype; consumers get
+                    # the E8M0 view via get_index_k_scale_buffer().
                     self.index_k_scale_buffer = torch.zeros(
-                        (*self.index_k_buffer.shape[:-2], 1),
-                        dtype=torch.float32,
+                        (*self.index_k_buffer.shape[:-1], self.index_head_dim // 64, 2),
+                        dtype=torch.uint8,
                         device=self.device,
                     )
                     self.indexer_hadamard_128 = create_npu_hadamard_128(
@@ -803,9 +808,27 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ``layer_id`` reads another layer's KV, for the gather prefetch.
         """
         read_layer_id = layer.layer_id if layer_id is None else layer_id
+        idx = loc.to(torch.int64)
+        if self.dsa_kv_cache_store_fp8:
+            # One packed record per row -- nope, rope and the dequant scales
+            # together -- so there is no second half to return. The sparse
+            # operator reads it whole at KV_D == kv_cache_dim, and splitting it
+            # here would only force a re-pack before the gather.
+            assert dst_dtype is None or dst_dtype == self.store_dtype, (
+                "the packed FP8 KV record cannot be cast on read; asked for "
+                f"{dst_dtype}"
+            )
+            # uint8, not the store dtype: aclnnIndexSelect has no FP8 in its
+            # dtype list. The record is opaque bytes to every consumer except
+            # the sparse operator, which the backend hands an FP8 view.
+            packed = (
+                self.k_buffer[read_layer_id - self.start_layer]
+                .view(torch.uint8)
+                .view(-1, self.kv_cache_dim)
+            )
+            return packed.index_select(0, idx).unsqueeze(1), None
         k = self.get_key_buffer(read_layer_id).view(-1, self.kv_lora_rank)
         v = self.get_value_buffer(read_layer_id).view(-1, self.qk_rope_head_dim)
-        idx = loc.to(torch.int64)
         cache_k_nope = k.index_select(0, idx).unsqueeze(1)
         cache_k_rope = v.index_select(0, idx).unsqueeze(1)
         if dst_dtype is not None and dst_dtype != cache_k_nope.dtype:
@@ -861,13 +884,25 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_index_k_scale_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
+        # E8M0 view of the raw byte storage: (block_num, block_size, k_n, d/64, 2),
+        # the k_descale layout quant_lightning_indexer (v2) expects with
+        # quant_mode 3 and layout_k PA_BBND.
+        return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(
+            torch.float8_e8m0fnu
+        )
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
+        # Scatter whole per-token scale rows (k_n, d/64, 2) so the MX block
+        # scales keep the layout quant_lightning_indexer (v2) reads back.
+        assert scale.element_size() == 1, (
+            f"index_k scale must be a 1-byte (E8M0) MX scale, got dtype {scale.dtype}"
+        )
+        buf = self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
+        tail = buf.shape[2:]
         torch_npu.npu_scatter_nd_update_(
-            self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(-1, 1),
+            buf.view(-1, *tail),
             loc.view(-1, 1),
-            scale.view(-1, 1),
+            scale.reshape(-1, *tail).view(torch.uint8),
         )
 
     def _get_disagg_buffer_entries(self):
@@ -1016,6 +1051,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
+            # The packed FP8 record is latent KV, so it is sharded under DCP
+            # exactly like the bf16 form: filter to this rank's rows and
+            # collapse the widened loc BEFORE packing. Without this the scatter
+            # writes at the virtual loc, which runs up to dcp_size times past
+            # the end of k_buffer -- and nothing catches it, because this
+            # branch returns before the bounds check in _resolve_dcp_write and
+            # the sparse path's FP8-plus-DCP assert only guards the read.
+            loc, cache_k, cache_v = self._resolve_dcp_write(loc, cache_k, cache_v)
+            if loc.numel() == 0:
+                return
             packed = self._pack_dsa_fp8_kv_cache(cache_k, cache_v)
             torch_npu.npu_scatter_nd_update_(
                 self.k_buffer[layer_id - self.start_layer].view(
