@@ -27,7 +27,12 @@ if is_npu():
     # Registers the CANN ops-transformer kernels under
     # torch.ops.cann_ops_transformer; without this import the
     # torch.ops namespace is empty and op calls raise AttributeError.
-    import cann_ops_transformer  # noqa: F401
+    # Optional: only the 950 MXFP8 quant indexer needs it, and a failed import
+    # here would drop every DSA model to the Transformers fallback on A3.
+    try:
+        import cann_ops_transformer  # noqa: F401
+    except ImportError:
+        pass
     import torch_npu
 
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
