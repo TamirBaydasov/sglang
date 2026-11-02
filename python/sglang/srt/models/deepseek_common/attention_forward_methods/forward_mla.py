@@ -153,6 +153,18 @@ def _apply_attention_output_gate(module, attn_output, gate):
     )
 
 
+# Module-level form for callers with no attention module at hand (the NPU
+# DSA path); the mixin method below additionally folds in the CUDA DSA
+# extend rule, which the NPU extend path must not take.
+def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
+    if not get_parallel().dcp_enabled:
+        return False
+    return (
+        forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_target_verify()
+    )
+
+
 class DeepseekMLAForwardMixin:
     def is_dcp_mla_decode_phase(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
