@@ -121,7 +121,7 @@ def prepare_decode_context_parallel_metadata(
     # are the [rank::dcp_size] stride and `// dcp_size` this replaced.
     # `get_mla_kv_buffer` is a read door with the caller-translates contract.
     interleave = dcp_interleave_size()
-    translator = get_attn_backend().kv_index_translator
+    runner_ids = get_attn_backend().runner_ids
     if interleave == 1:
         owned = dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
     else:
@@ -131,8 +131,8 @@ def prepare_decode_context_parallel_metadata(
     # Already rank-local rows, so not translate_dcp_read_ids: its `// dcp_size`
     # is the interleave-1 rule. Only a translating pool maps them further.
     dcp_local_prefix_kv_indices = dcp_local_row(owned, parallel.dcp_size, interleave)
-    if translator.is_translating:
-        dcp_local_prefix_kv_indices = translator._translate_full(
+    if runner_ids.is_translating:
+        dcp_local_prefix_kv_indices = runner_ids._translate_full(
             dcp_local_prefix_kv_indices
         )
     # NPU gathers into its own reused buffers and never reads this one, which
@@ -141,7 +141,10 @@ def prepare_decode_context_parallel_metadata(
         None
         if is_npu()
         else torch.empty(
-            (seq_lens_sum, *kv_buffer_shape[1:]),
+            (
+                seq_lens_sum,
+                *kv_buffer_shape[1:],
+            ),
             dtype=kv_cache_dtype,
             device=kv_cache_device,
         )
@@ -169,7 +172,7 @@ def plan_dcp_decode_metadata(
     `kv_lens` / `kv_indptr` are rewritten to the per-rank lengths, and this
     rank's ids (`loc % dcp_size == dcp_rank`) are compacted into
     `kv_indices[:total_local_len]`, still WIDENED. The returned length bounds the
-    prefix the caller hands to `KVIndexTranslator.translate_dcp_read_ids`.
+    prefix the caller hands to `RunnerIds.translate_dcp_read_ids`.
     """
     parallel = get_parallel()
     local_kv_lens = kv_lens.clone()
