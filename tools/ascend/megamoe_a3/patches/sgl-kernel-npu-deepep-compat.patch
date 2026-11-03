@@ -1,0 +1,97 @@
+diff --git a/python/deep_ep/deep_ep/strategies/fused_strategy.py b/python/deep_ep/deep_ep/strategies/fused_strategy.py
+index 7adc2ba..88c0da2 100644
+--- a/python/deep_ep/deep_ep/strategies/fused_strategy.py
++++ b/python/deep_ep/deep_ep/strategies/fused_strategy.py
+@@ -3,6 +3,9 @@ Fused MoE execution strategies.
+ All fused mode strategy implementations are in this file.
+ """
+ 
++import inspect
++from functools import wraps
++
+ from typing import Dict, List, Optional, Tuple, Union
+ 
+ import torch
+@@ -13,6 +16,44 @@ from ..ep_strategy import FusedEPCommStrategy, register_fused_strategy
+ TensorOrTensors = Union[torch.Tensor, List[torch.Tensor]]
+ 
+ 
++def _adapt_mega_moe_operator(operator):
++    signature = inspect.signature(operator)
++    parameters = signature.parameters
++    if "activation_params" in parameters or any(
++        p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
++    ):
++        return operator
++    if "activation" not in parameters:
++        raise RuntimeError("MegaMoE operator lacks activation selection")
++
++    @wraps(operator)
++    def legacy_swiglu(*args, **kwargs):
++        activation_params = kwargs.pop("activation_params", None)
++        activation = kwargs.get("activation", inspect.Parameter.empty)
++        if activation is inspect.Parameter.empty:
++            bound = signature.bind(*args, **kwargs)
++            bound.apply_defaults()
++            activation = bound.arguments["activation"]
++        if activation != "swiglu" or activation_params is not None:
++            raise ValueError(
++                "Legacy MegaMoE supports only swiglu with activation_params=None; "
++                "install a matching operator for non-default activation parameters"
++            )
++        return operator(*args, **kwargs)
++
++    # DeepEP sends this optional keyword even for ordinary, unclamped SwiGLU.
++    legacy_swiglu.__signature__ = signature.replace(
++        parameters=[
++            *parameters.values(),
++            inspect.Parameter(
++                "activation_params", inspect.Parameter.KEYWORD_ONLY, default=None
++            ),
++        ]
++    )
++    legacy_swiglu._sglang_legacy_swiglu = True
++    return legacy_swiglu
++
++
+ @register_fused_strategy("fused_deep_moe")
+ class FusedDeepMoeStrategy(FusedEPCommStrategy):
+     """Fused MoE strategy backed by aclnnFusedDeepMoe."""
+@@ -160,7 +201,7 @@ class MegaMoeStrategy(FusedEPCommStrategy):
+                 "(e.g. `pip install ninja`). Original error: "
+                 f"{e}"
+             ) from e
+-        return get_symm_buffer_for_mega_moe, mega_moe
++        return get_symm_buffer_for_mega_moe, _adapt_mega_moe_operator(mega_moe)
+ 
+     def fused_moe(
+         self,
+@@ -187,6 +228,14 @@ class MegaMoeStrategy(FusedEPCommStrategy):
+                 f"got {quant_mode}"
+             )
+ 
++        num_tokens = x.size(0)
++        if num_tokens > num_max_dispatch_tokens_per_rank:
++            raise ValueError(
++                "The number of input tokens exceeds "
++                "`num_max_dispatch_tokens_per_rank`: "
++                f"{num_tokens} > {num_max_dispatch_tokens_per_rank}."
++            )
++
+         get_symm_buffer_for_mega_moe, mega_moe = self._load_mega_moe_ops()
+         dispatch_quant_mode = 2 if quant_mode == 1 else 0
+         dispatch_quant_out_dtype = torch.int8 if dispatch_quant_mode == 2 else None
+@@ -222,13 +271,6 @@ class MegaMoeStrategy(FusedEPCommStrategy):
+             self._mega_moe_symm_buffers[cache_key] = symm_buffer
+ 
+         topk_ids = topk_idx.int()
+-        num_tokens = x.size(0)
+-        if num_tokens > num_max_dispatch_tokens_per_rank:
+-            raise ValueError(
+-                "The number of input tokens exceeds "
+-                "`num_max_dispatch_tokens_per_rank`: "
+-                f"{num_tokens} > {num_max_dispatch_tokens_per_rank}."
+-            )
+         x_active_mask = torch.zeros(
+             num_max_dispatch_tokens_per_rank,
+             dtype=torch.int8,
