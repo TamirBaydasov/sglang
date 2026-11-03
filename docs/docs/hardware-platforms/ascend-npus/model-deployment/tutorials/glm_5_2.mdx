@@ -72,6 +72,103 @@ see [Best practices](#best-practices), which may require additional cards or nod
 For the hardware specifications (memory per die and dies per card),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
+## MegaMoE on A3 with W4A8 or W8A8
+
+Use `--moe-a2a-backend ascend_fuseep --fuseep-mode 3` for the fused
+dispatch, expert GEMMs, SwiGLU, and combine path. This recipe targets Atlas A3
+(`Ascend910_93`), BF16 hidden states, and homogeneous per-channel ModelSlim
+W4A8 INT or W8A8 INT routed experts. Keep shared experts separate with
+`--disable-shared-experts-fusion`. Speculative decoding and expert load balancing
+are unsupported in this mode.
+
+Use matching CANN toolkit/operator packages and a DeepEP build exposing
+`FuseMode.MEGA_MOE` and `Buffer.fused_deep_moe(..., fuse_mode=3, activation=...,
+l1_bias=..., l2_bias=...)`. The matching `cann_ops_transformer.ops` package must
+provide `mega_moe` and `get_symm_buffer_for_mega_moe`; its JIT extension also
+requires `ninja`. A CANN version string alone does not establish compatibility
+with that Python/operator ABI. Check the imports before launching:
+
+```bash
+python3 - <<'PY'
+import inspect
+from deep_ep import Buffer
+from deep_ep.buffer import FuseMode
+from cann_ops_transformer.ops import mega_moe, get_symm_buffer_for_mega_moe
+
+assert int(FuseMode.MEGA_MOE) == 3
+assert {"fuse_mode", "activation", "l1_bias", "l2_bias"} <= set(
+    inspect.signature(Buffer.fused_deep_moe).parameters
+)
+print("MegaMoE Python API available; device validation is still required")
+PY
+```
+
+W4A8 weights must include the checkpoint's compensation biases for both expert
+projections. Groupwise scales, activation clipping, nonzero weight offsets, and
+mixed W13/W2 quantization are rejected. W8A8 uses INT8 weights without expert
+bias. Both formats use the same launch flags; choose the corresponding local
+checkpoint below. The example uses one A3 node with 16 dies and MoE EP16/TP1.
+
+```bash
+export GLM52_W4A8=/path/to/GLM-5.2-w4a8
+export GLM52_W8A8=/path/to/GLM-5.2-w8a8
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512
+export SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD=0
+
+launch_glm52_megamoe() {
+    python3 -m sglang.launch_server \
+        --model-path "$1" \
+        --trust-remote-code \
+        --device npu \
+        --attention-backend ascend \
+        --quantization modelslim \
+        --dtype bfloat16 \
+        --tp-size 16 \
+        --ep-size 16 \
+        --moe-a2a-backend ascend_fuseep \
+        --fuseep-mode 3 \
+        --disable-shared-experts-fusion \
+        --chunked-prefill-size 512 \
+        --max-running-requests 16 \
+        --context-length 8192 \
+        --mem-fraction-static 0.82 \
+        --disable-cuda-graph \
+        --host 0.0.0.0 --port 30000
+}
+
+# Run one checkpoint at a time. Stop the server before starting the other.
+launch_glm52_megamoe "$GLM52_W4A8"
+# launch_glm52_megamoe "$GLM52_W8A8"
+```
+
+These are validation commands, not measured performance recommendations. Start
+with eager execution. After checking prefill/decode correctness, replace
+`--disable-cuda-graph` with `--cuda-graph-max-bs-decode 16` and validate capture
+and repeated replay separately for each format. A3 supports EP sizes
+2, 4, 8, 16, 32, and 64; provision enough memory for the chosen checkpoint.
+
+The dispatch-token capacity must be identical on all ranks and within
+`[1, 4096]`. It bounds each rank's input tokens per call, including prefill;
+DeepEP pads unequal local batches and masks inactive tokens. The scheduler chunk
+is global, while this capacity is per rank. Verify the logged input rows before
+raising either limit; do not assume a token-sharded mapping. The older native
+operator sizes workspace from the configured capacity, even for tiny batches.
+The native workspace reuse fix was merged upstream in CANN
+[merge request !11324](https://gitcode.com/cann/ops-transformer/merge_requests/11324)
+as `c465a55ac0cd`; use a compatible native operator build containing that fix.
+No native CANN backport is bundled here. The small
+[DeepEP compatibility patch](https://github.com/TamirBaydasov/sglang/tree/A3_megamoe_support/tools/ascend/megamoe_a3)
+includes an apply script that validates the pinned source revision and file
+hashes. It does not change native workspace allocation or install packages.
+
+For a matched baseline, replace the two FuseEP flags with
+`--moe-a2a-backend deepep --deepep-mode auto`. Keep the checkpoint, topology,
+capacity, graph mode, shared-expert setting, and workload identical. Compare
+expert outputs using the existing precision criteria, then run the GLM accuracy
+harness with speculation disabled for both runs. Measure TTFT, TPOT, and peak
+memory for each format. Device correctness, graph replay, model accuracy, and
+performance for this adaptation remain pending A3 validation.
+
 ## Installation
 
 <Warning>

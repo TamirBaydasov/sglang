@@ -1,0 +1,17 @@
+{
+  "format": 1,
+  "components": [
+    {
+      "name": "sgl-kernel-npu",
+      "base_revision": "00db6cd6bd2280650281ea187292fe8913619abf",
+      "patch": "patches/sgl-kernel-npu-deepep-compat.patch",
+      "sha256": "178531d6784ed274efdd255ec296544247a5f9639e822b59de1242cdeea6b9d9",
+      "files": {
+        "python/deep_ep/deep_ep/strategies/fused_strategy.py": {
+          "before": "bdf46b4c01861265f99ba38a5e150a5fe2260ba0b0161e70cf6b2cd14f579331",
+          "after": "4c85481d98f204c499c60da979124c55784f0caa19a4b3974db70fbc758fbe0c"
+        }
+      }
+    }
+  ]
+}
