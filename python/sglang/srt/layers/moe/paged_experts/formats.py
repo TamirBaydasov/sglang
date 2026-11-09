@@ -17,7 +17,7 @@ Adding a quantization method means adding a subclass to ``FORMATS``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -179,12 +179,14 @@ def build_store(
     step: PostLoad,
     first: Optional[Dict[str, torch.Tensor]] = None,
     store: Optional[HostExpertStore] = None,
+    alloc: Optional[Callable] = None,
 ) -> HostExpertStore:
     """Every expert's paged rows, K experts at a time: ``step`` on each chunk of the loads,
     into ``store`` (a new pinned store if None); ``first`` holds chunk 0's rows if the caller
-    ran them already. Each chunk's checkpoint pages are read ahead while the chunk before
-    runs and given back once replayed; the mixing check's are kept until it ran, so that it
-    does not read them from the drive again."""
+    ran them already. ``alloc`` overrides the store's host allocator (a contract's pinned
+    allocation on its own platform). Each chunk's checkpoint pages are read ahead while the
+    chunk before runs and given back once replayed; the mixing check's are kept until it ran,
+    so that it does not read them from the drive again."""
     loads = step.loads
     num_experts, num_slots = loads.num_experts, loads.num_slots
     chunks = [
@@ -210,7 +212,7 @@ def build_store(
             else:  # run already and not replayed again: its pages go now
                 loads.page_out(e for e in experts if e not in loads.keep)
             if store is None:
-                store = HostExpertStore(step.rows_like, num_experts)
+                store = HostExpertStore(step.rows_like, num_experts, alloc)
             for name, rows in first.items():
                 store.host[name][: len(experts)].copy_(rows)
         step.check_mixing(store)
