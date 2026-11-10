@@ -337,6 +337,32 @@ class Envs:
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+    # E1 (branch E): route the blocking chat render+encode (apply_chat_template
+    # + tokenizer.encode) through a dedicated, size-bounded ThreadPoolExecutor
+    # owned by the TokenizerManager (min(8, cpu//2) workers, thread name
+    # "chat-encode") instead of the loop's default executor. The base already
+    # runs this off the asyncio loop (serving_base.handle_request ->
+    # run_in_executor(None, ...)); this flag adds the dedicated pool and
+    # engages it only for text-only models. Default ON; =0 restores the base
+    # default-executor path.
+    SGLANG_ENABLE_CHAT_ENCODE_POOL = EnvBool(True)
+    # E2a (branch E): render+encode memo for the chat ingest. Exact
+    # (template, messages, tools, kwargs) repeats skip render+encode, and a
+    # sibling of the first long prompt assembles from the encoded rendered
+    # prefix and re-encodes only its tail (verified rendered-prefix reuse;
+    # a few-token BPE-boundary skew at the cut, documented in
+    # managers/chat_encode_memo.py). Concurrent first-family requests are
+    # serialized: one full render per burst instead of one per request
+    # (removes the GIL wave that inflated 16 concurrent 1M-token ingests to
+    # a 17 s wall and starved the event loop). Engaged only with the
+    # chat-encode pool (text-only models).
+    SGLANG_CHAT_ENCODE_MEMO = EnvBool(True)
+    # E2d (branch E): encode the chat prompt through the raw Rust tokenizer
+    # (tokenizer._tokenizer.encode) instead of the HF wrapper. Default OFF:
+    # the wrapper is the reference. Requires E2a (memo) to be beneficial:
+    # without memo, raw encode holds the GIL during encoding, serializing
+    # all pool workers. With memo, only 1 full encode + 15 tail encodes.
+    SGLANG_CHAT_ENCODE_RAW = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
