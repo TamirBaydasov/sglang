@@ -380,6 +380,8 @@ class AscendAttnBackend(AttentionBackend):
             self.use_mla
             and getattr(model_runner.token_to_kv_pool, "index_k_scale_buffer", None)
             is not None
+            and getattr(model_runner.token_to_kv_pool, "index_k_store_dtype", None)
+            != torch.int8
         )
         if self.quant_indexer_enabled:
             from sglang.srt.configs.model_config import (
