@@ -278,12 +278,40 @@ def plan_dcp_owner_write(
 _dcp_extend_gather_buffers: Dict[Tuple, torch.Tensor] = {}
 
 
-def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.Tensor:
+_dcp_gather_buf_round: Optional[bool] = None
+_dcp_gather_buf_grid: Optional[int] = None
+_dcp_gather_buf_prealloc: Optional[int] = None
+
+
+def _dcp_gather_buf_params() -> Tuple[bool, int, int]:
+    # Read once: the flags are process-level and the grid feeds every reserved
+    # buffer, so a per-call env read would sit in the gather hot path.
+    global _dcp_gather_buf_round, _dcp_gather_buf_grid, _dcp_gather_buf_prealloc
+    if _dcp_gather_buf_round is None:
+        _dcp_gather_buf_round = envs.SGLANG_NPU_DCP_GATHER_BUF_ROUND.get()
+        _dcp_gather_buf_grid = max(1, envs.SGLANG_NPU_DCP_GATHER_BUF_GRID.get())
+        _dcp_gather_buf_prealloc = max(
+            0, envs.SGLANG_NPU_DCP_GATHER_BUF_PREALLOC_ROWS.get()
+        )
+    return (
+        _dcp_gather_buf_round,
+        _dcp_gather_buf_grid,
+        _dcp_gather_buf_prealloc,
+    )
+
+
+def dcp_extend_gather_buffer(
+    name: str, ref: torch.Tensor, rows: int, prealloc: bool = True
+) -> torch.Tensor:
     """A reusable ``rows``-row buffer shaped and typed like ``ref``. Grow-only.
 
     Allocated per layer, the peak moved with whatever the allocator held when a
     layer asked for another ~1.1 GiB. Two callers sharing ``name`` share the
     buffer and must not hold slices across each other's calls.
+
+    D2v4: the reservation is grid-rounded (SGLANG_NPU_DCP_GATHER_BUF_GRID) and
+    optionally pre-grown (SGLANG_NPU_DCP_GATHER_BUF_PREALLOC_ROWS), so the
+    grow-only path never orphans an intermediate size into the free list.
     """
     key = (name, ref.dtype, ref.device, tuple(ref.shape[1:]))
     buf = _dcp_extend_gather_buffers.get(key)
@@ -291,12 +319,25 @@ def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.T
         # Drop every reference first, or the peak is briefly both buffers.
         _dcp_extend_gather_buffers.pop(key, None)
         buf = None
-        buf = torch.empty((rows, *ref.shape[1:]), dtype=ref.dtype, device=ref.device)
+        round_on, grid, prealloc_rows = _dcp_gather_buf_params()
+        alloc_rows = -(-rows // grid) * grid if (round_on and grid > 1) else rows
+        if prealloc and prealloc_rows > 0:
+            # Pre-grow this context-sized buffer to its expected maximum on
+            # first use so the grow-only path never orphans an intermediate
+            # size into the free list (see PREALLOC_ROWS). Grid-rounded so the
+            # reservation stays on the grid. The per-piece scratch opts out
+            # (prealloc=False): its natural size is one piece, not the context.
+            floor = -(-prealloc_rows // grid) * grid if grid > 1 else prealloc_rows
+            alloc_rows = max(alloc_rows, floor)
+        buf = torch.empty(
+            (alloc_rows, *ref.shape[1:]), dtype=ref.dtype, device=ref.device
+        )
         _dcp_extend_gather_buffers[key] = buf
         logger.info(
-            "DCP extend gather buffer %r reserved: %d rows, %.3f GiB",
+            "DCP extend gather buffer %r reserved: %d rows (alloc %d), %.3f GiB",
             name,
             rows,
+            buf.shape[0],
             buf.numel() * buf.element_size() / (1 << 30),
         )
     return buf[:rows]

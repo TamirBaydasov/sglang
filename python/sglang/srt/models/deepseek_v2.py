@@ -1088,6 +1088,36 @@ class DeepseekV2MoE(nn.Module):
         )
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
+        # D1v3 (self-sufficient form, SGLANG_NPU_DSA_CP_TOKEN_SHARDED): the MoE
+        # input is this rank's row slice of the token-sharded residual. The
+        # TP-over-experts GEMM needs every token on every rank, so all-gather
+        # the slice back to full width in the compute dtype. Everything from
+        # here on (gate, topk, dispatch, GEMM, finalize) runs on the full tensor
+        # exactly as without the rebuild -- and the trailing reduce below
+        # becomes a reduce-scatter onto this rank's slice (layers/moe/utils.py
+        # + the layer_boundary sum_output hook), the inverse of this gather.
+        # (The int8 communication optimization on this same block lives in
+        # branch_moe; this form uses only standard collectives and is the
+        # functionally correct baseline.)
+        token_sharded = forward_batch is not None and getattr(
+            forward_batch, "npu_dsa_cp_token_sharded", False
+        )
+        # Expose the token-sharded state to the post-experts reduce helper (it
+        # runs inside MoE sub-methods that do not take the forward_batch).
+        from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+            dsa_cp_set_current_token_sharded,
+        )
+
+        dsa_cp_set_current_token_sharded(token_sharded)
+        if token_sharded:
+            group = get_parallel().attn_tp_group
+            hidden_full = hidden_states.new_empty(
+                (hidden_states.shape[0] * group.world_size,)
+                + hidden_states.shape[1:]
+            )
+            group.all_gather_into_tensor(hidden_full, hidden_states)
+            hidden_states = hidden_full
+
         num_token_non_padded = (
             forward_batch.moe_num_token_non_padded()
             if forward_batch is not None
@@ -2320,6 +2350,22 @@ class DeepseekV2AttentionMLA(
         # Full-head bf16 w_vc for project-before-merge: the V up-projection runs
         # on every group head before the DCP a2a, so the wire carries v_head_dim.
         self.w_vc_qrep = None
+        # Full W_O (o_proj) for the D1v3 token-sharded rebuild: every rank runs
+        # the complete output projection on its own token slice, so the
+        # attention output is the full [rows, hidden] result and the o_proj
+        # allReduce is skipped. Gathered once pre-capture by the model runner;
+        # None unless token sharding is on.
+        self.o_proj_qrep_weight = None
+        # D2v3: o_proj streamed (all-gathered on the fly) instead of a gathered
+        # replicated weight; set when SGLANG_NPU_STREAM_O_PROJ is on.
+        self.o_proj_stream_shard = None
+        # D2v4: the remaining token-sharded replicated weights streamed the same
+        # way -- this rank's TP shard only, all-gathered on the fly at the GEMM
+        # (the exact op that builds the static qrep, so bit-identical). Set when
+        # the matching SGLANG_NPU_STREAM_* flag is on under token sharding.
+        self.q_b_stream_shard = None
+        self.w_kc_stream_shard = None
+        self.w_vc_stream_shard = None
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -3543,6 +3589,26 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
+            if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+                # D1v3: the residual stream ended token-sharded, so the
+                # last-token rows the logits path indexes by
+                # cumsum(extend_seq_lens)-1 are split across the ranks. Gather
+                # them (a [num_requests, hidden] all-gather, not the full
+                # [N, hidden]) so the logits code below sees the shape it
+                # always did.
+                from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+                    dsa_cp_gather_last_token_rows,
+                )
+                from sglang.srt.utils.common import print_info_once
+
+                print_info_once(
+                    "D1v3: the logits tail gathers the last-token rows "
+                    "([num_requests, hidden]) so the logits code sees the shape "
+                    "it always did."
+                )
+                hidden_states = dsa_cp_gather_last_token_rows(
+                    hidden_states, forward_batch
+                )
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )

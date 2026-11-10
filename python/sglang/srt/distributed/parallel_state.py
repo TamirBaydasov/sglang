@@ -1244,6 +1244,31 @@ class GroupCoordinator:
             return
         reg_all_to_all_single(output, input, group_name=self.unique_name)
 
+    def all_to_all_single_async(
+        self, output: torch.Tensor, input: torch.Tensor
+    ) -> "Optional[torch._C._distributed_c10d.Work]":
+        """Async sibling of all_to_all_single: returns a Work handle.
+
+        The collective is enqueued on the current stream and the host does not
+        block, so the compute enqueued between this call and handle.wait() runs
+        while the communication engine moves the bytes (the overlap the DSA-CP
+        Q pre-issue uses to hide the head-redistribution all-to-all under the
+        LightningIndexer). The caller must keep the handle alive until the
+        exchanged data is consumed, then synchronise with handle.wait() before
+        any reader of ``output``. Platforms without an async path degrade to the
+        synchronous collective and return None ("already finished"); with
+        world_size 1 there is nothing to exchange.
+        """
+        if self.world_size == 1:
+            output.copy_(input)
+            return None
+        if _is_npu:
+            return torch.distributed.all_to_all_single(
+                output, input, group=self.device_group, async_op=True
+            )
+        self.all_to_all_single(output, input)
+        return None
+
     def reduce_scatter(
         self,
         output: torch.Tensor,
@@ -1396,6 +1421,31 @@ class GroupCoordinator:
             # directly causes Dynamo to rewrite it as _c10d_functional.all_gather_into_tensor
             # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
+
+    def all_gather_into_tensor_async(
+        self, output: torch.Tensor, input: torch.Tensor
+    ) -> "Optional[torch._C._distributed_c10d.Work]":
+        """Async sibling of all_gather_into_tensor: returns a Work handle.
+
+        The collective is enqueued on the current stream and the host does not
+        block, so the compute enqueued between this call and handle.wait() runs
+        while the communication engine moves the bytes (the overlap the DCP
+        extend gather uses to hide the SFA KV all-gather under the
+        LightningIndexer, the vLLM-Ascend SFA pattern). The caller must keep the
+        handle alive until the gathered data is consumed, then synchronise with
+        handle.wait() before any reader of ``output``. Platforms without an
+        async path degrade to the synchronous collective and return None; with
+        world_size 1 there is nothing to gather.
+        """
+        if self.world_size == 1:
+            output.copy_(input)
+            return None
+        if _is_npu:
+            return torch.distributed.all_gather_into_tensor(
+                output, input, group=self.device_group, async_op=True
+            )
+        self.all_gather_into_tensor(output, input)
+        return None
 
     def all_gather(
         self,
