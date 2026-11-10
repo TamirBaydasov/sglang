@@ -177,16 +177,18 @@ class PostLoad:
 
 def build_store(
     step: PostLoad,
-    first: Optional[Dict[str, torch.Tensor]] = None,
     store: Optional[HostExpertStore] = None,
+    first_done: bool = False,
     alloc: Optional[Callable] = None,
 ) -> HostExpertStore:
     """Every expert's paged rows, K experts at a time: ``step`` on each chunk of the loads,
-    into ``store`` (a new pinned store if None); ``first`` holds chunk 0's rows if the caller
-    ran them already. ``alloc`` overrides the store's host allocator (a contract's pinned
-    allocation on its own platform). Each chunk's checkpoint pages are read ahead while the
-    chunk before runs and given back once replayed; the mixing check's are kept until it ran,
-    so that it does not read them from the drive again."""
+    into ``store`` (a new pinned store if None); ``first_done``: chunk 0's rows are in
+    ``store`` already (the caller ran them); ``alloc`` overrides the store's host allocator
+    (a contract's pinned allocation on its own platform). A repacking step's rows are views
+    of the layer's whole K-slot table on the GPU, so no chunk's rows outlive their copy.
+    Each chunk's checkpoint pages are read ahead while the chunk before runs and given back
+    once replayed; the mixing check's are kept until it ran, so that it does not read them
+    from the drive again."""
     loads = step.loads
     num_experts, num_slots = loads.num_experts, loads.num_slots
     chunks = [
@@ -196,7 +198,7 @@ def build_store(
     mixing = [e for e in step.mixing_experts() if e not in loads.keep]
     loads.keep.update(mixing)
     try:
-        if first is None:
+        if not first_done:
             loads.read_ahead(chunks[0])
         for i, experts in enumerate(chunks):
             if i + 1 < len(chunks):
@@ -207,14 +209,15 @@ def build_store(
                 }
                 step.run(experts, out)
                 continue
-            if first is None:
-                first = step.run(experts)  # also gives the paged layout
-            else:  # run already and not replayed again: its pages go now
+            if first_done:  # run already and not replayed again: its pages go now
                 loads.page_out(e for e in experts if e not in loads.keep)
+                continue
+            first = step.run(experts)  # also gives the paged layout
             if store is None:
                 store = HostExpertStore(step.rows_like, num_experts, alloc)
             for name, rows in first.items():
                 store.host[name][: len(experts)].copy_(rows)
+            first = rows = None  # the next chunk's run builds another K-slot table
         step.check_mixing(store)
     finally:
         loads.keep.difference_update(mixing)

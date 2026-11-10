@@ -166,6 +166,7 @@ def _step(num_tokens, padded=False):
 
 
 _METHOD = "sglang.srt.layers.moe.paged_experts.method."
+_EXPERT_CACHE = "sglang.srt.layers.moe.paged_experts.expert_cache."
 
 
 def _create(method, layer, contract, moe_runner_config=None):
@@ -192,9 +193,22 @@ def _create(method, layer, contract, moe_runner_config=None):
         )
 
 
-def _load(method, layer):
-    """The post-load step, with the host store on the CPU."""
-    with patch.object(formats, "HostExpertStore", _CpuStore):
+def _exec(enable_disk=False):
+    return SimpleNamespace(moe=SimpleNamespace(paged_experts_enable_disk=enable_disk))
+
+
+def _load(method, layer, disk=False, router_top_k=K):
+    """The post-load step, with the host store on the CPU, the expert cache as ``disk`` says
+    and the model's router top-k ``router_top_k`` (for a layer without one)."""
+    model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(num_experts_per_tok=router_top_k)
+    )
+    with (
+        patch.object(formats, "HostExpertStore", _CpuStore),
+        patch(_EXPERT_CACHE + "HostExpertStore", _CpuStore),
+        patch(_METHOD + "get_exec", return_value=_exec(disk)),
+        patch(_METHOD + "process_model_config", return_value=model_config),
+    ):
         method.process_weights_after_loading(layer)
 
 
