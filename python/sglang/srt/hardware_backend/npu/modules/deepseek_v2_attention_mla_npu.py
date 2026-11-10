@@ -724,15 +724,26 @@ def _dcp_extend_gather_scratches(slot: int, k_nope, k_pe, rows: int, packed_kv: 
     return keys
 
 
-def _dcp_extend_send_rows(pool, layer, md, plan, layer_id: int, packed_kv: bool):
+def _dcp_extend_send_rows(
+    pool, layer, md, plan, layer_id: int, packed_kv: bool, f2: bool = False
+):
     """This rank's padded prefix shard for ``layer_id`` -- the gather's input.
 
     Prefix rows only, so it reads nothing the current forward wrote. That is
     what lets the prefetch call it a layer early. One send per gathered key,
-    in ``_dcp_extend_gather_scratches`` order.
+    in ``_dcp_extend_gather_scratches`` order. Under F2 the send is the raw 656
+    B int8 rows (one opaque uint8 key), read with the pool's raw gather instead
+    of get_mla_kv_buffer's dequant-on-read; the operator dequantises in-kernel.
     """
     if not plan.send_rows:
         return [None] if packed_kv else [None, None]
+    if f2:
+        send = pool.gather_packed_sfa_rows_raw(
+            layer_id, md.dcp_local_prefix_kv_indices
+        ).unsqueeze(1)
+        if plan.local_lens != plan.padded_lens:
+            send = _pad_dcp_extend_send(send, plan)
+        return [send]
     send_nope, send_rope = pool.get_mla_kv_buffer(
         layer, md.dcp_local_prefix_kv_indices, layer_id=layer_id
     )
@@ -809,11 +820,19 @@ def _dcp_gather_extend_kv_npu(
     pool = get_token_to_kv_pool()
     # An FP8 DSA cache stores one packed 656-byte record per token (nope, rope,
     # dequant scales), so there is one key to move, in exactly the layout the
-    # sparse operator reads at layout_kv TND, and 43% less wire than bf16.
-    packed_kv = getattr(pool, "dsa_kv_cache_store_fp8", False)
+    # sparse operator reads at layout_kv TND, and 43% less wire than bf16. F2
+    # (the int8 SFA flag + SGLANG_NPU_SFA_KV_QUANT_READ) moves the SAME raw 656
+    # B rows: the operator dequantises in-kernel, so the gather ships one opaque
+    # uint8 key instead of the F1 dequant-on-read's two bf16 halves.
+    f2 = (
+        getattr(pool, "sfa_kv_store_8bit", False)
+        and envs.SGLANG_NPU_SFA_KV_QUANT_READ.get()
+    )
+    packed_kv = getattr(pool, "dsa_kv_cache_store_fp8", False) or f2
     if packed_kv:
         # uint8, not float8_e4m3fn: aclnnIndexSelect has no FP8, and the record
-        # is opaque until the backend views it back at the operator call.
+        # is opaque until the backend views it back at the operator call. The
+        # pack is store-dtype-aware (int8 under F, f8 under the FP8 mode).
         # (rows, 1, kv_cache_dim) matches get_mla_kv_buffer's prefix rows.
         k_nope = pool._pack_dsa_fp8_kv_cache(k_nope, k_pe).view(torch.uint8)
         k_nope = k_nope.unsqueeze(1)
@@ -849,7 +868,9 @@ def _dcp_gather_extend_kv_npu(
     if done is not None:
         torch.npu.current_stream().wait_event(done[1])
     else:
-        sends = _dcp_extend_send_rows(pool, m.attn_mqa, md, plan, layer_id, packed_kv)
+        sends = _dcp_extend_send_rows(
+            pool, m.attn_mqa, md, plan, layer_id, packed_kv, f2
+        )
 
     outs = [out_nope] if packed_kv else [out_nope, out_rope]
     for piece in plan.pieces:
@@ -888,6 +909,7 @@ def _issue_dcp_gather_prefetch(
     k_nope: torch.Tensor,
     k_pe: Optional[torch.Tensor],
     packed_kv: bool,
+    f2: bool = False,
 ) -> None:
     """Start the next layer's prefix all-gather(s) on the side stream."""
     nxt = layer_id + 1
@@ -901,7 +923,9 @@ def _issue_dcp_gather_prefetch(
     with torch.npu.stream(state.stream):
         if release is not None:
             state.stream.wait_event(release)
-        sends = _dcp_extend_send_rows(pool, m.attn_mqa, md, plan, nxt, packed_kv)
+        sends = _dcp_extend_send_rows(
+            pool, m.attn_mqa, md, plan, nxt, packed_kv, f2
+        )
         pairs = [(scratch, s) for (scratch, _), s in zip(scratches, sends)]
         for piece in plan.pieces:
             _dcp_extend_all_gather(parallel, piece, pairs)
