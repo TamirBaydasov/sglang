@@ -37,9 +37,14 @@ Every per-case env is recorded in `results.json`.
    `--ais-env` is the conda env file (default `/home/tbaydasov/set_env.sh`).
 3. The container (`sglang-a3`) is running with host networking.
 4. Port 30000 free — the runner refuses to start otherwise.
-5. GitHub reachability: the runner applies the same `ghfast.top` insteadOf
-   rewrite your manual box commands use (`--git-proxy`, on by default).
-   Pass `--git-proxy ''` on networks with direct GitHub access.
+5. The runner launches servers with `docker exec -d`, `PYTHONPATH=<repo>/python`
+   prepended and the pid captured for clean group stops — nothing to set up
+   by hand. If a case fails during startup, the full server log lands in
+   `<case>/server.log` and its last lines are echoed to the runner log.
+6. GitHub reachability: the runner applies the same `ghfast.top` insteadOf
+   rewrite your manual box commands use (`--git-proxy`, on by default; fetch
+   retries once on failure). Pass `--git-proxy ''` on networks with direct
+   GitHub access.
 
 ### The `07-combined` branch is local-only
 
@@ -102,13 +107,14 @@ python3 run_pr_tests.py --dry-run
   (`--startup-timeout`, default 1800 s), one greedy generation, stop the
   server (SIGTERM to the process group, SIGKILL fallback, survival halts the
   run like the nightly does).
-- **accuracy** — 5 fixed short greedy prompts + one long prompt
-  (`--accuracy-long-tokens`, default 32 k tokens) sent twice (cold + cached
-  prefix). SHA-256 of each output is compared per position against case
-  `00-baseline`: exact matches are counted raw — NPU serving is not
-  bit-deterministic, so "differ" is information, not an automatic failure.
-  With `--gsm8k`, a seeded subset (default 200 samples, 5-shot, greedy) gives
-  an accuracy number per case.
+- **accuracy** — `--accuracy-requests` greedy requests per case (default
+  **64**): 8 fixed + template-generated short/medium prompts + a long-prompt
+  pair (same body, different tails — the second request rides the cached
+  prefix; `--accuracy-long-tokens`, default 32 k tokens). SHA-256 of each
+  output is compared per tag against case `00-baseline`: exact matches are
+  counted raw — NPU serving is not bit-deterministic, so "differ" is
+  information, not an automatic failure. With `--gsm8k`, a seeded subset
+  (default 200 samples, 5-shot, greedy) gives an accuracy number per case.
 - **speed** — one AISBench `prefix_cache` invocation per fresh server:
   `--input_len 1000000 --output_len 1 --data_num 16 --concurrency 16
   --repeat_rate 0.99 --seed 4`. TTFT mean/P90 (ms→s), E2E, qps and prefill
@@ -119,10 +125,11 @@ python3 run_pr_tests.py --dry-run
 
 ```
 prtest-results/<stamp>/
-  SUMMARY.md          # speed table + paired-accuracy table
+  SUMMARY.md          # speed table + paired-accuracy table (with skip reasons)
   results.json        # full records incl. per-case env + commit
   runner.log
-  <case>/server-tail.log  ais.log  accuracy.json  smoke.json
+  <case>/server.log   # full server log (captured on startup failure)
+  <case>/ais.log  accuracy.json  smoke.json
 ```
 
 `SUMMARY.md` statuses: `ok` measured · `failed` see case dir (server log tail

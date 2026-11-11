@@ -178,7 +178,51 @@ ACCURACY_PROMPTS = [
     ("short-code", "In Python, write a one-line function that reverses a string."),
     ("short-translate", "Translate to English: 今天下午三点开会，请准时参加。"),
     ("short-fact", "Name the largest planet in the solar system with one word."),
+    ("short-logic", "If all bloops are razzies and all razzies are lazzies, are all bloops definitely lazzies? Answer yes or no."),
+    ("short-order", "Sort these words alphabetically: mango, apple, cherry, banana. Answer with the sorted list only."),
+    ("short-count", "How many days are in February during a leap year? Answer with the number only."),
 ]
+
+# Deterministic template bank for the remaining accuracy requests.
+ACCURACY_TEMPLATES = [
+    "Compute {a} * {b} - {c}. Answer with just the number.",
+    "A shop buys {a} items at ${b} each and sells them at ${c} each. What is the total profit in dollars? Answer with just the number.",
+    "A train travels {a} km in {b} hours. What is its average speed in km/h? Answer with just the number.",
+    "Sum the integers from 1 to {a}. Answer with just the number.",
+    "Is {a} a prime number? Answer yes or no.",
+    "What is the capital of {c_word}? Answer with the city name only.",
+    "Write a Python one-liner that squares each element of a list called xs.",
+    "Translate to English: 会议将于明天上午十点在三层会议室开始。",
+]
+TEMPLATE_COUNTRIES = ["France", "Japan", "Egypt", "Brazil", "Canada", "Australia",
+                      "India", "Kenya", "Chile", "Norway", "Peru", "Spain"]
+
+
+def build_accuracy_prompts(total, long_tokens):
+    """Deterministic greedy set of exactly `total` (tag, prompt) pairs.
+
+    8 fixed + template-generated short/medium prompts + a long-prompt pair
+    (same body, different tails, so the second request rides the cached
+    prefix). Outputs are SHA-compared per tag against the baseline case.
+    """
+    prompts = [(f"fixed-{i}", p) for i, p in enumerate(ACCURACY_PROMPTS)]
+    i = 0
+    while len(prompts) < total - 2:
+        tpl = ACCURACY_TEMPLATES[i % len(ACCURACY_TEMPLATES)]
+        subs = {"a": 12 + (i * 7) % 89, "b": 3 + (i * 5) % 17,
+                "c": 2 + (i * 11) % 29,
+                "c_word": TEMPLATE_COUNTRIES[i % len(TEMPLATE_COUNTRIES)]}
+        try:
+            text = tpl.format(**subs)
+        except KeyError:
+            text = tpl
+        prompts.append((f"gen-{i:03d}", text))
+        i += 1
+    prompts.append(("long-cold", build_long_prompt(
+        long_tokens, "Summarize the text above in one short sentence.")))
+    prompts.append(("long-cached", build_long_prompt(
+        long_tokens, "How many shifts per day are described above? Answer with just the number.")))
+    return prompts[:total]
 
 GSM8K_EXEMPLARS = [
     ("Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes of babysitting. How much did she earn?",
@@ -365,6 +409,17 @@ def run_capture(container, cmd, timeout=120):
             stderr=f"timeout after {timeout}s: {cmd[:120]}")
 
 
+def run_detached(container, cmd):
+    """Start a long-lived process in the container that must outlive this exec."""
+    try:
+        return subprocess.run(["docker", "exec", "-d", container, "bash", "-c", cmd],
+                              capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=[], returncode=124, stdout="",
+            stderr=f"timeout after 60s: {cmd[:120]}")
+
+
 # Set from --git-proxy in main(); the box networks reach GitHub only through
 # the ghfast.top proxy the manual launch commands apply via insteadOf.
 GIT_PROXY = []
@@ -390,32 +445,55 @@ def launch_server(container, repo, env, args, case_dir, log):
     if args.context:
         server_args[server_args.index("--context-length") + 1] = str(args.context)
     server_args += shlex_split(args.extra_server_args)
+    # PYTHONPATH: the box serves the source tree, not a pip install (the
+    # archived recipe always sets ROOT/python). Detached exec (-d) + nohup +
+    # setsid + stdin redirect so the server survives this exec; $! is the
+    # server pid for clean group stops.
     command = (
-        f"cd '{repo}' && setsid env {env_str} {python} -m sglang.launch_server "
+        f"cd '{repo}' && export PYTHONPATH=\"{repo}/python:$PYTHONPATH\" && "
+        f"nohup setsid env {env_str} {python} -m sglang.launch_server "
         f"--load-format auto --model-path '{model}' "
         + " ".join(server_args)
-        + f" > '{remote_log}' 2>&1 & echo $! > '{remote_log}.pid'"
+        + f" > '{remote_log}' 2>&1 < /dev/null & echo $! > '{remote_log}.pid'"
     )
-    log(f"    launching server (pid file {remote_log}.pid)")
-    run_capture(container, command, timeout=60)
+    log(f"    launching server (log {remote_log})")
+    result = run_detached(container, command)
+    if result.returncode != 0:
+        log(f"    launch exec failed: {(result.stderr or '').strip()[:200]}")
     return remote_log
 
 
 def wait_health(container, remote_log, case_dir, args, log, deadline):
     started = time.time()
+    pid = run_capture(container, f"cat '{remote_log}.pid' 2>/dev/null",
+                      timeout=30).stdout.strip() or None
+    log(f"    server pid {pid or '?'}; polling /health "
+        f"(startup timeout {args.startup_timeout}s)")
     while time.time() - started < args.startup_timeout:
         if time.time() > deadline:
             return "time-budget"
         if health_ok():
+            log(f"    server healthy after {int(time.time() - started)}s")
             return "ok"
+        if pid and not pid_alive(container, pid) and not server_process_exists(container):
+            capture_server_log(container, remote_log, case_dir, log)
+            return "server-exited-early"
+        elapsed = int(time.time() - started)
+        if elapsed and elapsed % 60 < 10:
+            log(f"    still starting ({elapsed}s elapsed)")
         time.sleep(10)
-    dump_server_tail(container, remote_log, case_dir)
+    capture_server_log(container, remote_log, case_dir, log)
     return "startup-timeout"
 
 
-def dump_server_tail(container, remote_log, case_dir):
-    result = run_capture(container, f"tail -c 16384 '{remote_log}' 2>/dev/null")
-    (case_dir / "server-tail.log").write_text(result.stdout, encoding="utf-8")
+def capture_server_log(container, remote_log, case_dir, log=None):
+    """Full server log into the case dir; last lines into the runner log."""
+    result = run_capture(container, f"cat '{remote_log}' 2>/dev/null", timeout=60)
+    if result.stdout:
+        (case_dir / "server.log").write_text(result.stdout, encoding="utf-8")
+    if log is not None:
+        for line in result.stdout.strip().splitlines()[-15:]:
+            log("    | " + line[:180])
 
 
 def pid_alive(container, pid):
@@ -423,23 +501,42 @@ def pid_alive(container, pid):
                        timeout=30).stdout.strip() == "alive"
 
 
+def server_process_exists(container):
+    return bool(run_capture(
+        container, "pgrep -f sglang.launch_server | head -1", timeout=30
+    ).stdout.strip())
+
+
 def stop_server(container, remote_log, case_dir, log):
     pid_file = remote_log + ".pid"
-    pid = run_capture(container, f"cat '{pid_file}' 2>/dev/null").stdout.strip()
-    if not pid:
-        log("    no pid file; nothing to stop")
-        return True
-    run_capture(container, f"kill -TERM -{pid} 2>/dev/null; kill -TERM {pid} 2>/dev/null")
-    for _ in range(45):
-        if not pid_alive(container, pid):
-            log(f"    server pid {pid} stopped")
+    pid = run_capture(container, f"cat '{pid_file}' 2>/dev/null", timeout=30).stdout.strip()
+    if pid:
+        run_capture(container, f"kill -TERM -{pid} 2>/dev/null; kill -TERM {pid} 2>/dev/null",
+                    timeout=30)
+        for _ in range(45):
+            if not pid_alive(container, pid):
+                log(f"    server pid {pid} stopped")
+                break
+            time.sleep(1)
+        else:
+            run_capture(container, f"kill -KILL -{pid} 2>/dev/null; kill -KILL {pid} 2>/dev/null",
+                        timeout=30)
+            time.sleep(3)
+            log(f"    server pid {pid} "
+                f"{'alive after SIGKILL' if pid_alive(container, pid) else 'stopped after SIGKILL'}")
+    else:
+        log("    no pid file; sweeping by pattern")
+    run_capture(container, "pkill -TERM -f sglang.launch_server 2>/dev/null", timeout=30)
+    for _ in range(20):
+        if not server_process_exists(container):
             return True
         time.sleep(1)
-    run_capture(container, f"kill -KILL -{pid} 2>/dev/null; kill -KILL {pid} 2>/dev/null")
-    time.sleep(3)
-    alive = pid_alive(container, pid)
-    log(f"    server pid {pid} {'SURVIVED SIGKILL' if alive else 'stopped after SIGKILL'}")
-    return not alive
+    run_capture(container, "pkill -KILL -f sglang.launch_server 2>/dev/null", timeout=30)
+    time.sleep(2)
+    ok = not server_process_exists(container)
+    if not ok:
+        log("    STOP: a launch_server process survived cleanup")
+    return ok
 
 
 def require_free_port():
@@ -460,9 +557,21 @@ def shlex_split(text):
 # --------------------------------------------------------------------------
 def resolve_ref(container, repo, ref, fetch_url, log):
     if fetch_url:
-        result = git_in_repo(container, repo, "fetch", "--no-tags", fetch_url, ref)
-        if result.returncode != 0:
-            return None, f"fetch failed: {result.stderr.strip()[:200]}"
+        result = None
+        for attempt in (1, 2):
+            result = git_in_repo(container, repo, "fetch", "--no-tags",
+                                 fetch_url, ref, timeout=240)
+            if result.returncode == 0:
+                break
+            lines = (result.stderr or result.stdout or "").strip().splitlines()
+            detail = lines[-1][:200] if lines else f"rc={result.returncode}"
+            if attempt == 1:
+                log(f"    fetch attempt 1 failed ({detail}); retrying in 10s")
+                time.sleep(10)
+            else:
+                return None, f"fetch failed: {detail}"
+        if result is None or result.returncode != 0:
+            return None, "fetch failed"
         result = git_in_repo(container, repo, "rev-parse", "FETCH_HEAD")
         sha = result.stdout.strip()
         if result.returncode != 0 or not sha:
@@ -543,27 +652,33 @@ def run_case(case, container, repo, args, case_dir, log, deadline):
 
 
 def run_accuracy_prompts(args, case_dir, log):
+    prompts = build_accuracy_prompts(args.accuracy_requests, args.accuracy_long_tokens)
+    log(f"    accuracy: {len(prompts)} greedy requests "
+        f"(incl. 2 x {args.accuracy_long_tokens}-tok long)")
     results = {}
-    for tag, prompt in ACCURACY_PROMPTS:
-        text, _ = generate(prompt, max_new_tokens=64)
+    errors = 0
+    for i, (tag, prompt) in enumerate(prompts):
+        try:
+            text, _ = generate(prompt, max_new_tokens=64)
+        except Exception as exc:  # noqa: BLE001 - one bad request must not sink the case
+            text = f"<request error: {type(exc).__name__}>"
+            errors += 1
         results[tag] = text
-    long_suffix = "Summarize the text above in one short sentence."
-    long_prompt = build_long_prompt(args.accuracy_long_tokens, long_suffix)
-    text_first, _ = generate(long_prompt, max_new_tokens=64)
-    text_cached, _ = generate(long_prompt, max_new_tokens=64)  # cached-prefix pass
-    results["long-cold"] = text_first
-    results["long-cached"] = text_cached
+        if (i + 1) % 16 == 0:
+            log(f"    accuracy {i + 1}/{len(prompts)} ({errors} errors so far)")
     import hashlib
 
     digest = {tag: hashlib.sha256(t.encode()).hexdigest()[:12]
               for tag, t in results.items()}
-    out = {"outputs": results, "sha": digest}
+    out = {"requests": len(prompts), "errors": errors,
+           "outputs": results, "sha": digest}
     if args.gsm8k:
         rows = load_gsm8k(args.gsm8k, args.gsm8k_samples, args.gsm8k_seed)
         log(f"    gsm8k: {len(rows)} samples")
         out["gsm8k"] = run_gsm8k(rows, log)
     save(case_dir / "accuracy.json", out)
-    return {"sha": digest, "gsm8k": out.get("gsm8k", {}).get("accuracy")}
+    return {"sha": digest, "errors": errors,
+            "gsm8k": out.get("gsm8k", {}).get("accuracy")}
 
 
 # --------------------------------------------------------------------------
@@ -647,10 +762,12 @@ def describe_commands(case, container, repo, args):
     return [
         f"git -c '{args.git_proxy}' -C {repo} fetch --no-tags {args.fetch_url or '<local>'} {ref}",
         f"git -C {repo} checkout -B prtest/current <sha>",
-        f"docker exec {container} bash -c \"cd {repo} && setsid env {env_str} "
-        f"{args.container_python} -m sglang.launch_server ... > /tmp/prtest-server-{name}.log 2>&1 &\"",
-        "poll http://127.0.0.1:30000/health",
-        f"accuracy: {len(ACCURACY_PROMPTS)} short + 2 long ({args.accuracy_long_tokens} tok) greedy prompts"
+        f"docker exec -d {container} bash -c \"cd {repo} && export PYTHONPATH={repo}/python:$PYTHONPATH && "
+        f"nohup setsid env {env_str} {args.container_python} -m sglang.launch_server ... "
+        f"> /tmp/prtest-server-{name}.log 2>&1 < /dev/null &\"",
+        "poll http://127.0.0.1:30000/health (pid liveness + 60s progress notes; early exit captures server.log)",
+        f"accuracy: {args.accuracy_requests} greedy requests "
+        f"(8 fixed + generated + 2 x {args.accuracy_long_tokens}-tok long)"
         + (f" + gsm8k {args.gsm8k_samples}" if args.gsm8k else ""),
         f"bash AIS_SHELL {args.ais_env} {args.ais_dir} --input_len {args.length} "
         f"--output_len 1 --dataset_type prefix_cache --prefix_test --seed 4 "
@@ -685,6 +802,8 @@ def main():
     parser.add_argument("--chunk", type=int, default=32768)
     parser.add_argument("--context", type=int, default=1048576)
     parser.add_argument("--memfrac", type=float, default=0.88)
+    parser.add_argument("--accuracy-requests", type=int, default=64,
+                        help="greedy accuracy requests per case (incl. the 2 long prompts)")
     parser.add_argument("--accuracy-long-tokens", type=int, default=32768)
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--benchmark-timeout", type=int, default=14400)
