@@ -24,11 +24,6 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
 
 if is_npu():
-    # Registers the CANN ops-transformer kernels under
-    # torch.ops.cann_ops_transformer; without this import the
-    # torch.ops namespace is empty and op calls raise AttributeError.
-    # Optional: only the 950 MXFP8 quant indexer needs it, and a failed import
-    # here would drop every DSA model to the Transformers fallback on A3.
     try:
         import cann_ops_transformer  # noqa: F401
     except ImportError:
@@ -38,6 +33,7 @@ if is_npu():
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+_dsa_cp_local_topk = envs.SGLANG_NPU_DSA_CP_LOCAL_TOPK.get()
 
 
 @lru_cache(maxsize=1)
@@ -68,7 +64,21 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
     return (_create_hadamard_128_cpu().to(device=device) / (128**0.5)).contiguous()
 
 
-def _quantize_npu_indexer_activation(x, hadamard, dst_type):
+def _quantize_npu_indexer_activation(x, hadamard, dst_type, scale_type):
+    assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
+    if x.numel() == 0:
+        return (
+            torch.empty_like(x, dtype=dst_type),
+            torch.empty(x.shape[:-1], dtype=scale_type, device=x.device),
+        )
+    rotated = x @ hadamard
+    quantized, scale = torch_npu.npu_dynamic_quant(
+        rotated.reshape(-1, 128), dst_type=dst_type
+    )
+    return quantized.reshape(x.shape), scale.to(scale_type).reshape(x.shape[:-1])
+
+
+def _quantize_npu_indexer_activation_mxfp8(x, hadamard, dst_type):
     # Hadamard-rotate x and MX-quantize its 128-dim vectors.
     # Returns (quantized, scale): quantized has x's shape in dst_type (fp8)
     # and scale holds one E8M0 byte per 32-element block, shaped
@@ -93,6 +103,25 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type):
         scale = scale.view(torch.float8_e8m0fnu)
 
     return quantized.reshape(x.shape), scale
+
+def _quantize_npu_indexer_activation_int8(x, hadamard):
+    # B (branch B): Hadamard-rotate x and per-token int8-quantize its 128-dim
+    # vectors (npu_dynamic_quant). Returns (int8, fp16 per-token scale), the
+    # quant_mode 0 (per-token) layout the per-token quant op expects on A3.
+    assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
+    if x.numel() == 0:
+        return (
+            torch.empty_like(x, dtype=torch.int8),
+            torch.empty(x.shape[:-1], dtype=torch.float16, device=x.device),
+        )
+    rotated = x @ hadamard
+    quantized, scale = torch_npu.npu_dynamic_quant(
+        rotated.reshape(-1, 128), dst_type=torch.int8
+    )
+    return (
+        quantized.reshape(x.shape),
+        scale.to(torch.float16).reshape(x.shape[:-1]),
+    )
 
 
 def _check_quant_lightning_indexer_constraints(pool) -> None:
@@ -507,17 +536,65 @@ class DSANPUIndexerMixin:
             assert indexer_cache_loc is not None, (
                 "NPU DSA+DCP requires allocator-global origin_out_cache_loc metadata"
             )
-            assert indexer_cache_loc.shape[0] == positions.shape[0], (
+            # BUG 14: under D1v3 positions is row-sliced [rows] but
+            # dcp_origin_out_cache_loc is full batch width [num_tokens];
+            # compare against the plan's full token count instead.
+            if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+                _expected = get_dsa_token_shard_plan(forward_batch).num_tokens
+            else:
+                _expected = positions.shape[0]
+            assert indexer_cache_loc.shape[0] == _expected, (
                 "NPU DSA+DCP origin_out_cache_loc metadata has an incompatible "
-                f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
+                f"length: {indexer_cache_loc.shape[0]} != {_expected}"
             )
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
+        # B (branch B): per-token int8 index-K (A3); the MXFP8 path (A5) is the
+        # other quant mode. The pool builds exactly one, so int8 takes
+        # precedence when both flags are set.
+        use_int8_indexer = getattr(pool, "indexer_kv_store_int8", False)
         if use_quant_indexer:
-            _check_quant_lightning_indexer_constraints(pool)
-            k, k_scale = _quantize_npu_indexer_activation(
-                k, pool.indexer_hadamard_128, pool.dtype
+            if use_int8_indexer:
+                k, k_scale = _quantize_npu_indexer_activation_int8(
+                    k, pool.indexer_hadamard_128
+                )
+            else:
+                _check_quant_lightning_indexer_constraints(pool)
+                k, k_scale = _quantize_npu_indexer_activation_mxfp8(
+                    k, pool.indexer_hadamard_128, pool.dtype
+                )
+        if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+            # D1v3 seam S2: this rank computed the index-K for its own [rows]
+            # tokens only, but the pool write below scatters into the FULL
+            # out_cache_loc and the lightning indexer reads the whole pool, so
+            # the rows have to go back to full width before the write. Small
+            # traffic: [rows, 128] of k plus one float per row, per rank.
+            k_send = k.reshape(-1, k.shape[-1]).contiguous()
+            k_gathered = k_send.new_empty(
+                (k_send.shape[0] * get_parallel().attn_tp_size, k_send.shape[-1])
             )
+            attn_tp_all_gather_into_tensor(k_gathered, k_send)
+            k = k_gathered
+            if use_quant_indexer:
+                scale_send = k_scale.reshape(-1).contiguous()
+                scale_gathered = scale_send.new_empty(
+                    scale_send.numel() * get_parallel().attn_tp_size
+                )
+                attn_tp_all_gather_into_tensor(scale_gathered, scale_send)
+                k_scale = scale_gathered
+            # BUG 10: the S2 gather is [num_tokens_pad]-wide (rows*attn_tp) but
+            # out_cache_loc has exactly num_tokens rows; trim to the loc width
+            # before the scatter (no-op for divisible batches). Mirrors the
+            # BUG-6 KV trim in set_kv_buffer.
+            n_loc = indexer_cache_loc.numel()
+            if k.shape[0] > n_loc:
+                per_token = (
+                    k_scale.numel() // k.shape[0] if use_quant_indexer else 0
+                )
+                k = k[:n_loc]
+                if use_quant_indexer:
+                    k_scale = k_scale[: n_loc * per_token]
+        if use_quant_indexer:
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
@@ -535,6 +612,37 @@ class DSANPUIndexerMixin:
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
                 actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
+                # D1v3 token sharding: the query is pre-sliced to this rank's
+                # rows, so the full-batch query lengths would make the kernel
+                # walk past the end of `query`. Override with the plan's local
+                # cumulative query lengths. The KV stays full width (gathered
+                # above), so the key lengths are unchanged.
+                if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+                    # The override must key off the per-forward decision, not
+                    # plan presence: a logprob prefill has a cached plan while
+                    # token_sharded is False (the gate refuses it), and running
+                    # its full-width query with the local [rows] lengths here
+                    # corrupts the top-k (BUG 8). The gate requires the plan
+                    # when the flag is set, so the None check only guards a
+                    # wiring bug.
+                    _ts_plan = get_dsa_token_shard_plan(forward_batch)
+                    if _ts_plan is not None:
+                        actual_seq_lengths_q = torch.tensor(
+                            cumulative(_ts_plan.query_lens),
+                            dtype=torch.int32,
+                            device=actual_seq_lengths_kv.device,
+                        )
+                        # BUG 17: the KV buffer is full width (gathered above),
+                        # but the per-request key LENGTH must be the local one:
+                        # for a straddling request this rank's tokens are not
+                        # the request's last tokens, so full seq_lens makes
+                        # sparse_mode=3 reach forward into future keys.
+                        # key_lens is per-request (not cumulative).
+                        actual_seq_lengths_kv = torch.tensor(
+                            _ts_plan.key_lens,
+                            dtype=torch.int32,
+                            device=actual_seq_lengths_kv.device,
+                        )
         else:
             if get_attn_backend().forward_metadata.actual_seq_lengths_q is None:
                 if (
@@ -574,6 +682,12 @@ class DSANPUIndexerMixin:
             and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
         ):
+            if use_int8_indexer:
+                raise RuntimeError(
+                    "SGLANG_NPU_INDEXER_INT8 is on together with prefill CP "
+                    "(attn_cp_size>1); the per-token int8 indexer is not "
+                    "supported on the CP-balance path."
+                )
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
                 past_key_states,
@@ -601,8 +715,45 @@ class DSANPUIndexerMixin:
                 actual_seq_lengths_q = shard.actual_seq_lengths_q
                 actual_seq_lengths_kv = shard.actual_seq_lengths_kv
 
-            if use_quant_indexer:
+            if use_int8_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(
+                    query,
+                    pool.indexer_hadamard_128,
+                    pool.index_k_store_dtype,
+                    pool.index_k_scale_dtype,
+                )
+                op_weights = (
+                    weights.to(torch.float16)
+                    if pool.index_k_store_dtype == torch.int8
+                    else weights
+                )
+                if pool.index_k_store_dtype == torch.int8:
+                    # torch_npu.npu_quant_lightning_indexer is not working
+                    # for int8 cache in case of custom_ops imported
+                    quant_lightning_indexer = torch.ops.npu.npu_quant_lightning_indexer
+                else:
+                    quant_lightning_indexer = torch_npu.npu_quant_lightning_indexer
+
+                topk_indices = quant_lightning_indexer(
+                    query=query,
+                    key=past_key_states,
+                    weights=op_weights,
+                    query_dequant_scale=query_scale,
+                    key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
+                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
+                    actual_seq_lengths_key=actual_seq_lengths_kv.to(
+                        device=k.device, dtype=torch.int32
+                    ),
+                    block_table=block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                    query_quant_mode=0,
+                    key_quant_mode=0,
+                ).squeeze(1)
+            elif use_quant_indexer:
+                query, query_scale = _quantize_npu_indexer_activation_mxfp8(
                     query,
                     pool.indexer_hadamard_128,
                     pool.dtype,
@@ -639,7 +790,10 @@ class DSANPUIndexerMixin:
                 # Rows past cu_seqlens_q[-1] are untouched, and gather() slices
                 # them off.
                 _fm = get_attn_backend().forward_metadata
-                if shard is None:
+                _ts_active = getattr(
+                    forward_batch, "npu_dsa_cp_token_sharded", False
+                )
+                if shard is None and not _ts_active:
                     cu_seqlens_q = getattr(_fm, "quant_indexer_cu_seqlens_q", None)
                     seqused_k = getattr(_fm, "quant_indexer_seqused_k", None)
                     metadata = getattr(_fm, "quant_indexer_metadata", None)
@@ -649,7 +803,7 @@ class DSANPUIndexerMixin:
                                 actual_seq_lengths_q, actual_seq_lengths_kv, k.device
                             )
                         )
-                else:
+                elif shard is not None:
                     # Planned on this forward's first indexer layer and reused
                     # by the rest, which is what the backend's pre-plan buys.
                     if shard.quant_indexer_plan is None:
@@ -659,6 +813,14 @@ class DSANPUIndexerMixin:
                             k.device,
                         )
                     cu_seqlens_q, seqused_k, metadata = shard.quant_indexer_plan
+                else:
+                    # D1v3 token sharding: the backend's pre-plan describes the
+                    # full batch; plan locally for this rank's rows.
+                    cu_seqlens_q, seqused_k, metadata = (
+                        self._plan_quant_lightning_indexer(
+                            actual_seq_lengths_q, actual_seq_lengths_kv, k.device
+                        )
+                    )
                 block_table = block_table.to(torch.int32)
                 topk_indices, _ = (
                     torch.ops.cann_ops_transformer.quant_lightning_indexer(
@@ -696,7 +858,32 @@ class DSANPUIndexerMixin:
                     sparse_count=self.index_topk,
                     sparse_mode=3,
                 )[0].squeeze(1)
-            if shard is not None:
+            token_sharded = getattr(forward_batch, "npu_dsa_cp_token_sharded", False)
+            # BUG 18: gate on the per-forward token_sharded decision, not plan
+            # presence. A logprob prefill has a cached plan + active shard while
+            # token_sharded is False; setting npu_dsa_topk_local there corrupts
+            # the full-width path that the core's BUG-5 demotion selects.
+            if (
+                shard is not None
+                and token_sharded
+                and get_dsa_token_shard_plan(forward_batch) is not None
+            ):
+                # DSA-CP local top-k: the plan's token split is byte-identical to
+                # this shard's query split (both cut the padded batch into equal
+                # position slices), so the sparse operator takes this rank's rows
+                # directly and the full-width round-trip gather -- measured
+                # 8.42/15.83 ms, 100% exposed between the LightningIndexer and
+                # the next SparseFlashAttention -- is skipped. The marker tells
+                # the core the returned top-k is local rather than full width;
+                # every reuse layer below inherits the same layout through
+                # prev_topk_indices.
+                forward_batch.npu_dsa_topk_local = True
+                print_info_once(
+                    "DSA-CP local top-k is ON: the indexer's top-k stays in "
+                    "this rank's query rows; the full-width round-trip "
+                    "all-gather is skipped"
+                )
+            elif shard is not None:
                 topk_indices = shard.resolve(
                     topk_indices, num_query_tokens, forward_batch
                 )

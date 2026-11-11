@@ -226,6 +226,20 @@ def sum_output(
     may_quantize: bool,
 ) -> torch.Tensor:
     """Complete the sum an output owes over ``group`` on the rows it is on."""
+    if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+        # D1v3: the MoE output is full width (its input was all-gathered before
+        # the GEMM), so the sum this stage owes is the all-reduce's sum PLUS a
+        # scatter back to this rank's rows -- a reduce-scatter, not an all-reduce
+        # (which would leave the result full width and break the token-sharded
+        # residual invariant the next layer's slice assumes). The attention
+        # (o_proj) sum never reaches here: MixerExit.finish short-circuits it
+        # first because the o_proj output is already complete (G5b).
+        # Lazy import: dsa_token_shard crosses the layer-boundary edge.
+        from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+            dsa_cp_reduce_scatter_tokens,
+        )
+
+        return dsa_cp_reduce_scatter_tokens(hidden_states)
     parallel = get_parallel()
     if group is SumGroup.ATTN_TP:
         if parallel.attn_tp_size == 1:

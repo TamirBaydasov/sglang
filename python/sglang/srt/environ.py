@@ -337,6 +337,32 @@ class Envs:
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+    # E1 (branch E): route the blocking chat render+encode (apply_chat_template
+    # + tokenizer.encode) through a dedicated, size-bounded ThreadPoolExecutor
+    # owned by the TokenizerManager (min(8, cpu//2) workers, thread name
+    # "chat-encode") instead of the loop's default executor. The base already
+    # runs this off the asyncio loop (serving_base.handle_request ->
+    # run_in_executor(None, ...)); this flag adds the dedicated pool and
+    # engages it only for text-only models. Default ON; =0 restores the base
+    # default-executor path.
+    SGLANG_ENABLE_CHAT_ENCODE_POOL = EnvBool(True)
+    # E2a (branch E): render+encode memo for the chat ingest. Exact
+    # (template, messages, tools, kwargs) repeats skip render+encode, and a
+    # sibling of the first long prompt assembles from the encoded rendered
+    # prefix and re-encodes only its tail (verified rendered-prefix reuse;
+    # a few-token BPE-boundary skew at the cut, documented in
+    # managers/chat_encode_memo.py). Concurrent first-family requests are
+    # serialized: one full render per burst instead of one per request
+    # (removes the GIL wave that inflated 16 concurrent 1M-token ingests to
+    # a 17 s wall and starved the event loop). Engaged only with the
+    # chat-encode pool (text-only models).
+    SGLANG_CHAT_ENCODE_MEMO = EnvBool(True)
+    # E2d (branch E): encode the chat prompt through the raw Rust tokenizer
+    # (tokenizer._tokenizer.encode) instead of the HF wrapper. Default OFF:
+    # the wrapper is the reference. Requires E2a (memo) to be beneficial:
+    # without memo, raw encode holds the GIL during encoding, serializing
+    # all pool workers. With memo, only 1 full encode + 15 tail encodes.
+    SGLANG_CHAT_ENCODE_RAW = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
@@ -1218,6 +1244,38 @@ class Envs:
     # DSA prefill: each attention-TP rank scores only its shard of the indexer
     # queries, and the top-k is all-gathered.
     SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
+    # B (branch B): store the DSA LightningIndexer index-K as int8 with a fp16
+    # per-token scale and score it with the per-token quant op (quant_mode 0).
+    # This is the A3 path -- the MXFP8 index-K (dsa_kv_cache_store_fp8) is only
+    # supported on A5. Takes precedence over the MXFP8 path when both are set.
+    # Refused loudly together with prefill CP (attn_cp_size > 1).
+    SGLANG_NPU_INDEXER_INT8 = EnvBool(False)
+    # DSA SFA latent KV (F): store the MLA latent KV packed at 8 bits in the
+    # pool regardless of --kv-cache-dtype, which stays the model's COMPUTE dtype
+    # (bf16 here). Row = latent | rope BF16 | per-128-tile FP32 scales
+    # (656 B/token on a 512-rank / 64-rope model vs 1152 B bf16, ~x1.76 pool
+    # capacity at fixed GiB). On A2/A3 (910B) KvQuantSparseFlashAttention
+    # accepts INT8-only, so the latent is int8 (npu_dynamic_quant); on 950PR it
+    # also accepts FP8. Decoupled from --kv-cache-dtype and from the index-K
+    # store dtype. Writes quantise at set_kv_buffer; serving EXTEND reads are
+    # dequant-on-read (the DCP extend gather). The DCP DECODE read is not wired
+    # (the new base resolves the decode top-k through the paged block tables,
+    # which cannot address the opaque 656 B row), so this flag is EXTEND-ONLY
+    # for now: a DCP decode under it refuses loudly (no silent wrong-row read).
+    # Requires DCP > 1 (the paged packed read is not wired -- that is F2). Not
+    # supported with the MLA preprocess direct-write path. OFF keeps the plain
+    # bf16 pool bitwise.
+    SGLANG_NPU_SFA_KV_8BIT = EnvBool(False)
+    # F2 (under SGLANG_NPU_SFA_KV_8BIT): fuse the dequant into the quant
+    # sparse-attention operator instead of the F1 dequant-on-read. The DCP
+    # extend gather then moves the raw 656 B int8 rows (one uint8 key) and the
+    # operator dequantises in-kernel (key_quant_mode INT8 + the per-128-tile
+    # scales + a separate bf16 key_rope), ~x1.76 less wire than the F1 bf16
+    # halves. On by default under F; the box's CANN build is probed for the
+    # INT8 form (key_rope / key_dequant_scale / value_dequant_scale) and the
+    # read declines process-wide to the F1 dequant-on-read if the op does not
+    # take it -- never a per-call crash.
+    SGLANG_NPU_SFA_KV_QUANT_READ = EnvBool(True)
     # DSA prefill: each attention-TP rank computes every head for its slice of
     # the tokens. Consumes no ranks, so it composes with DCP.
     SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD = EnvBool(True)
@@ -1227,6 +1285,56 @@ class Envs:
     # DSA token-shard: exchange 256-wide tensors instead of the 512-wide latent.
     # Slower below 3k tokens and costs 4 GiB of KV pool, hence off.
     SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A = EnvBool(False)
+    # DSA-CP token sharding (D1v3, the full rebuild of the DSA-CP query swap):
+    # the residual stream becomes token-sharded across the attention-TP group
+    # (rank r owns rows [r*rows, (r+1)*rows)) and the head-sharded attention
+    # weights (q_b_proj, o_proj, w_vc, w_kc) become replicated, so every rank
+    # computes every head for its own token slice. Replaces the DSA-CP path's
+    # 3 allToAll + O-proj allReduce + topk allGather with 1 allGather (the MoE
+    # input) + 1 reduce-scatter (the MoE output). SparseFlashAttention is
+    # untouched (it already consumes this rank's queries + the rank-local top-k).
+    # OFF; requires NPU, a DSA model, attn TP size > 1, and MoE running TP.
+    SGLANG_NPU_DSA_CP_TOKEN_SHARDED = EnvBool(False)
+    # DSA-CP token sharding (D1v3): run q_b_proj at full width (every rank
+    # computes every query head) instead of the head-sharded projection.
+    # Version B of the DSA-CP Q all-to-all removal. Mutually exclusive with
+    # SGLANG_NPU_DSA_CP_Q_A2A_PREISSUE (version A); enabling both fails at
+    # startup.
+    SGLANG_NPU_DSA_CP_Q_FULL_WIDTH = EnvBool(True)
+    # DSA-CP Q all-to-all pre-issue (version A of the removal): issue the two Q
+    # head-redistribution all-to-alls in prepare, under the indexer, instead of
+    # in the core between the indexer and the sparse operator. Mutually
+    # exclusive with SGLANG_NPU_DSA_CP_Q_FULL_WIDTH.
+    SGLANG_NPU_DSA_CP_Q_A2A_PREISSUE = EnvBool(False)
+    # DSA-CP local top-k (D1v3): keep the indexer's top-k in this rank's query
+    # rows instead of gathering it back to full width; the sparse operator takes
+    # this rank's rows directly, dropping the round-trip all-gather (measured
+    # 8.42/15.83 ms, 100% exposed between the indexer and the next attention).
+    # Inert when the indexer query sharding is off or the plan declines.
+    SGLANG_NPU_DSA_CP_LOCAL_TOPK = EnvBool(True)
+    # DCP decode on NPU (D1v3): pre-issue the decode query all-gather before the
+    # indexer, so the SFA communication overlaps the top-k computation.
+    SGLANG_NPU_DCP_DECODE_Q_PREISSUE = EnvBool(True)
+    # DCP extend on NPU (D1v3): start the layer's prefix all-gather BEFORE the
+    # LightningIndexer runs, so the SFA KV communication overlaps the top-k
+    # computation, and wait for the gather only right before the sparse operator
+    # (the vLLM-Ascend pattern). OFF, pending box; costs ~+0.8-1.1 GiB at a ~1M
+    # context on the permuting path (one shared scratch becomes per-piece).
+    SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP = EnvBool(False)
+    # DSA-CP token sharding (D2v3): stream o_proj via all-gather instead of
+    # materializing the replicated weight. Requires DSA_CP_TOKEN_SHARDED.
+    SGLANG_NPU_STREAM_O_PROJ = EnvBool(True)
+    # DSA-CP token sharding (D2v4): stream q_b / w_kc / w_vc via all-gather
+    # instead of materializing the replicated weights. Requires
+    # DSA_CP_TOKEN_SHARDED.
+    SGLANG_NPU_STREAM_Q_B = EnvBool(False)
+    SGLANG_NPU_STREAM_W_KC = EnvBool(False)
+    SGLANG_NPU_STREAM_W_VC = EnvBool(False)
+    # DCP extend on NPU (D2v4): round the gather-buffer allocation to a grid to
+    # cut allocator fragmentation; 1 disables (the exact allocation).
+    SGLANG_NPU_DCP_GATHER_BUF_ROUND = EnvBool(True)
+    SGLANG_NPU_DCP_GATHER_BUF_GRID = EnvInt(131072)
+    SGLANG_NPU_DCP_GATHER_BUF_PREALLOC_ROWS = EnvInt(0)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
     # DCP extend on NPU: log how much of a batch's gathered prefix is the same
@@ -1238,6 +1346,48 @@ class Envs:
     # DCP extend on NPU: run each layer's prefix gather a layer ahead on a side
     # stream. Costs a second scratch; needs GATHER_PIECE_ROWS <= 0.
     SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH = EnvBool(False)
+    # DCP extend on NPU: let the sparse operator read the gathered prefix in
+    # the rank-major order the all-gather already produced, remapping the
+    # top-k instead of permuting ~1 GiB of KV back into position order.
+    # One-request extends only; the refusal cases fall back to the permuting
+    # path, which stays available. On by default (D2): the two D2 optimisations
+    # (prefetch, prime) are only valid on this path.
+    SGLANG_NPU_ENABLE_DCP_PACKED_READ = EnvBool(True)
+    # DCP extend on NPU (packed read): gather layer l+1's prefix on a side
+    # stream while layer l computes, into the other of two slots; the first
+    # layer's gather is primed in prepare, before the QKV. Requires the packed
+    # read above. This gates the PACKED-path prefetch (the side-stream double
+    # buffer the packed read rides on); it is distinct from the base
+    # SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH, which gates the piece-based
+    # (permuting) path's prefetch. The D2 AISBench run peaked at 49.90 GiB
+    # allocated against a ceiling near 51.7, so a serving box that takes both
+    # paths may need --mem-fraction-static a notch below 0.70.
+    SGLANG_NPU_ENABLE_DCP_PACKED_GATHER_PREFETCH = EnvBool(True)
+    # DCP extend on NPU (D2v2): split the per-layer context all-gather into N
+    # sub-all-gathers, each writing a contiguous chunk-major slice of the same
+    # packed buffer. The monolithic gather was one 9-16 ms AIV episode (93%
+    # MTE2) that starved the compute stream's own AIV work (pool writes at a
+    # 5.4 ms median, 1:1 lockstep with the gather, against 0.005 ms solo); N
+    # short episodes leave the inter-collective windows in which that work
+    # runs. Same bytes, no extra copy; 1 disables chunking (the single
+    # collective, bit for bit).
+    SGLANG_NPU_DCP_GATHER_CHUNKS = EnvInt(8)
+    # DCP extend on NPU (D2v2): the priority the gather's side stream is created
+    # with. The vLLM-CUDA "KV I/O yields to compute" pattern; the lowest
+    # torch_npu exposes is 0 (positive clamps to the same pool, -1 is the HIGH
+    # pool, never for a stream that must yield). Honest limit: torch_npu 2.x
+    # passes CANN priority 0 for both pools, so on this stack it is a scheduler
+    # hint -- the hard protection is the high-priority critical-path HCCL groups
+    # below plus the chunked gather above.
+    SGLANG_NPU_DCP_GATHER_STREAM_PRIORITY = EnvInt(0)
+    # NPU (D2v2): create the critical-path HCCL process groups -- the
+    # attention-TP group (the current-chunk exchange that feeds every layer's
+    # indexer) and the MoE groups (dispatch/combine) -- with
+    # is_high_priority_stream=True, so their collectives are served ahead of
+    # background work such as the DCP context-gather prefetch (which keeps the
+    # default group priority). Fail-soft: a torch_npu build without the option
+    # logs once and continues.
+    SGLANG_NPU_ENABLE_PG_PRIORITY = EnvBool(True)
     # DCP on NPU: shard the latent KV in page_size runs, as #37787 and
     # vLLM-Ascend do, instead of one position per rank.
     SGLANG_NPU_DCP_PAGE_INTERLEAVE = EnvBool(False)

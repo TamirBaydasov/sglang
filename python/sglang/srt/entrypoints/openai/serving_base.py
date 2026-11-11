@@ -98,9 +98,19 @@ class OpenAIServingBase(ABC):
 
             # Convert off-loop: jinja render + full-prompt tokenization blocks
             # the loop on long prompts, and the rust tokenizer releases the GIL.
+            # E1 (branch E): when the tokenizer manager engaged the dedicated
+            # chat-encode pool (text-only, SGLANG_ENABLE_CHAT_ENCODE_POOL), run
+            # the conversion on that pool; otherwise the default executor, which
+            # is the exact base path (run_in_executor(None, ...)).
             loop = asyncio.get_running_loop()
+            chat_encode_pool = getattr(
+                self.tokenizer_manager, "chat_encode_executor", None
+            )
             adapted_request, processed_request = await loop.run_in_executor(
-                None, self._convert_to_internal_request, request, raw_request
+                chat_encode_pool,
+                self._convert_to_internal_request,
+                request,
+                raw_request,
             )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):

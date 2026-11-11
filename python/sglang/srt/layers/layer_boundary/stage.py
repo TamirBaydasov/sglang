@@ -216,7 +216,29 @@ class StageBoundary:
                 owed = None
                 if completion is not None:
                     hidden_states = completion(hidden_states)
-            return stream_of(forward_batch).record(
+            stream = stream_of(forward_batch)
+            if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+                # D1v3: the attention output is already the COMPLETE result for
+                # this rank's row slice (o_proj ran the full-width W_O), so it
+                # owes no ATTN_TP sum here -- the declared ALWAYS_PARTIAL sum is
+                # a no-op for the token-sharded rebuild. The residual is still
+                # full width on the first layer and already sliced from the
+                # second on; take this rank's rows when needed. Lazy import:
+                # dsa_token_shard crosses the layer-boundary edge.
+                from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+                    dsa_token_shard_slice,
+                    get_dsa_token_shard_plan,
+                )
+
+                plan = get_dsa_token_shard_plan(forward_batch)
+                residual = stream.residual
+                # BUG 16: key off "not already this rank's rows" -- the
+                # first-layer residual is [num_tokens] (no padding), so
+                # == num_tokens_pad fails on non-divisible chunk sizes.
+                if residual is not None and residual.shape[0] != plan.rows:
+                    stream.residual = dsa_token_shard_slice(residual, plan)
+                owed = None
+            return stream.record(
                 hidden_states,
                 bind_update(produced.update, forward_batch, update_context),
                 declared_sum=owed,

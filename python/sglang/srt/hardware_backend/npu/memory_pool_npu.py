@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -18,16 +19,18 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_npu, print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
 
 if is_npu():
     import torch_npu
+
+logger = logging.getLogger(__name__)
 
 
 def _mla_fia_nz_scatter_indices(
@@ -703,16 +706,92 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             and dtype == torch.float8_e4m3fn
             and requested_kv_cache_dim is not None
         )
-        if self.dsa_kv_cache_store_fp8:
+        # F: the packed 8-bit SFA switch -- the same 656 B row as the packed-fp8
+        # DSA mode above (latent | rope BF16 | per-128-tile FP32 scales), but
+        # entered from the model's compute dtype (bf16, which stays self.dtype)
+        # with the row stored in the 8-bit dtype. On A2/A3 the latent is INT8
+        # (KvQuantSparseFlashAttention accepts INT8-only there). Decoupled from
+        # --kv-cache-dtype and from the index-K store dtype below.
+        self.sfa_kv_store_8bit = (
+            index_head_dim is not None
+            and not self.dsa_kv_cache_store_fp8
+            and envs.SGLANG_NPU_SFA_KV_8BIT.get()
+            and requested_kv_cache_dim is not None
+        )
+        self.sfa_packed_kv_storage = (
+            self.dsa_kv_cache_store_fp8 or self.sfa_kv_store_8bit
+        )
+        if self.sfa_packed_kv_storage:
             assert index_head_dim == 128 and kv_lora_rank % 128 == 0
             assert requested_kv_cache_dim == (
                 kv_lora_rank + kv_lora_rank // 128 * 4 + qk_rope_head_dim * 2
             )
-            self.store_dtype = dtype
+            # One byte per element: the in-tree mode stores FP8 (there
+            # store_dtype IS the compute dtype); the flag stores the latent
+            # INT8 on A2/A3.
+            self.store_dtype = torch.int8 if self.sfa_kv_store_8bit else dtype
         self.kv_cache_dim = (
-            requested_kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
+            requested_kv_cache_dim if self.sfa_packed_kv_storage else kv_lora_rank
         )
-        self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
+        self.kr_cache_dim = (
+            0
+            if (self.dsa_kv_cache_store_fp8 or self.sfa_packed_kv_storage)
+            else qk_rope_head_dim
+        )
+        # B (branch B): per-token int8 index-K store (A3). Sets the index-K
+        # store/scale dtypes so the buffer alloc and the set/get below are
+        # mode-aware. Two carve-outs keep the store in the KV dtype: under the
+        # MXFP8 / 8-bit SFA flag (dsa_kv_cache_store_fp8) the index-K never
+        # shares the latent row's int8 storage (it stays the KV dtype + uint8
+        # E8M0 scale), and under hierarchical cache the NPU host mirror
+        # allocates the index-K in the KV dtype with an FP32 scale
+        # (pool_host/mla.py), so an int8 + FP16 index-K would be copied to the
+        # host silently corrupted.
+        int8_requested = envs.SGLANG_NPU_INDEXER_INT8.get()
+        hicache_enabled = get_memory().enable_hierarchical_cache
+        if (
+            int8_requested
+            and not self.dsa_kv_cache_store_fp8
+            and index_head_dim is not None
+            and hicache_enabled
+        ):
+            logger.warning(
+                "SGLANG_NPU_INDEXER_INT8 is on but hierarchical cache is "
+                "enabled; the NPU host mirror cannot hold the int8 + FP16 "
+                "index-K store, so the index-K stays in the KV dtype."
+            )
+        self.indexer_kv_store_int8 = (
+            int8_requested
+            and not self.dsa_kv_cache_store_fp8
+            and index_head_dim is not None
+            and not hicache_enabled
+        )
+        if self.sfa_kv_store_8bit and get_parallel().attn_dcp_size <= 1:
+            raise ValueError(
+                "SGLANG_NPU_SFA_KV_8BIT stores the SFA latent KV as packed "
+                "8-bit rows, whose serving reads are the DCP dequant-on-read "
+                "gathers (extend prefix gather, decode top-k gather). With "
+                "attn_dcp_size 1 there is no DCP gather and the paged read of "
+                "the packed rows is not wired here (F2). Run with the flag "
+                "under DCP, or without the flag."
+            )
+        # The index-K keeps its OWN store dtype, decoupled from the packed
+        # latent row's store dtype. int8 index-K (branch B) is independent of
+        # the SFA 8-bit latent packing (branch F): they use different buffers.
+        if self.indexer_kv_store_int8:
+            self.index_k_store_dtype = torch.int8
+            self.index_k_scale_dtype = torch.float16
+        else:
+            # Under the 8-bit SFA flag the latent row is int8 but the index-K
+            # stays the model's bf16: storing it in the row's store dtype would
+            # reinterpret bf16 bits as int8 codes and break
+            # npu_quant_lightning_indexer.
+            self.index_k_store_dtype = (
+                self.dtype if self.sfa_kv_store_8bit else self.store_dtype
+            )
+            self.index_k_scale_dtype = (
+                torch.uint8 if self.dsa_kv_cache_store_fp8 else None
+            )
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
         self.index_page_size = page_size if index_page_size is None else index_page_size
@@ -763,7 +842,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     ),
                     dtype=(
                         torch.bfloat16
-                        if self.dsa_kv_cache_store_fp8
+                        if self.sfa_packed_kv_storage
                         else self.store_dtype
                     ),
                     device=self.device,
@@ -780,10 +859,26 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         1,
                         self.index_head_dim,
                     ),
-                    dtype=self.store_dtype,
+                    dtype=self.index_k_store_dtype,
                     device=self.device,
                 )
-                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
+                if self.indexer_kv_store_int8 and self.num_indexer_layers > 0:
+                    # B (branch B): per-token fp16 int8 scale (one per token),
+                    # the layout the per-token quant op (quant_mode 0, layout_k
+                    # PA_BSND) reads back.
+                    from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
+                        create_npu_hadamard_128,
+                    )
+
+                    self.index_k_scale_buffer = torch.zeros(
+                        (*self.index_k_buffer.shape[:-2], 1),
+                        dtype=self.index_k_scale_dtype,
+                        device=self.device,
+                    )
+                    self.indexer_hadamard_128 = create_npu_hadamard_128(
+                        self.index_head_dim, self.device
+                    )
+                elif self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
@@ -802,6 +897,23 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         self.index_head_dim, self.device
                     )
 
+        if self.sfa_kv_store_8bit:
+            # The startup pool table the flag's benefit is measured against:
+            # rows, row bytes, and the capacity delta vs the bf16 row it
+            # replaces (1152 B at kv_lora_rank 512 / rope 64). _finalize_
+            # allocation_log below reports the pool's own bytes; this line
+            # states the per-token contract.
+            bf16_row_bytes = (kv_lora_rank + qk_rope_head_dim) * 2
+            print_info_once(
+                "NPU MLA pool: packed 8-bit SFA KV (SGLANG_NPU_SFA_KV_8BIT) "
+                f"is active: row = latent int8 x {kv_lora_rank} + rope bf16 x "
+                f"{qk_rope_head_dim} + per-128-tile fp32 scales x "
+                f"{kv_lora_rank // 128} = {self.kv_cache_dim} B/token/layer "
+                f"(vs {bf16_row_bytes} B bf16, x"
+                f"{bf16_row_bytes / self.kv_cache_dim:.2f} capacity at fixed "
+                f"GiB); {self.layer_num} KV layers, {size} rows, index-K "
+                f"{self.index_k_store_dtype}"
+            )
         self._finalize_allocation_log(size)
 
     def _mla_buffer_info(self):
@@ -903,6 +1015,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ``layer_id`` reads another layer's KV, for the gather prefetch.
         """
         read_layer_id = layer.layer_id if layer_id is None else layer_id
+        if self.sfa_kv_store_8bit:
+            # F: the LSE sparse attention is bf16-only on A2/A3, so a read over
+            # the int8 packed pool selects the whole 656 B row and decodes it
+            # here (F1's temporary read; F2 fuses the dequant into the quant
+            # operator for the paged read). The in-tree packed-fp8 mode above
+            # is unchanged (the sparse operator reads it whole).
+            return self._gather_packed_sfa_rows(read_layer_id, loc, dst_dtype)
         idx = loc.to(torch.int64)
         if self.dsa_kv_cache_store_fp8:
             # One packed record per row -- nope, rope and the dequant scales
@@ -931,6 +1050,147 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_k_rope = cache_k_rope.to(dst_dtype)
         return cache_k_nope, cache_k_rope
 
+    def _gather_packed_sfa_rows(
+        self,
+        read_layer_id: int,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype],
+    ):
+        """Dequantise selected packed 8-bit SFA rows into ``(nope, rope)``.
+
+        The row layout is the pack's, from _pack_dsa_fp8_kv_cache: latent 8-bit
+        (kv_lora_rank) | rope BF16 (qk_rope_head_dim) | per-128-tile FP32 scales
+        (kv_lora_rank // 128), one byte per element in the store dtype. Dequant
+        is the pack's inverse: the scale from npu_dynamic_quant is a per-tile
+        multiplier, so ``latent.to(t) * scale.to(t)`` tile-wise, and the rope
+        bytes are a straight bf16 reinterpretation. Reading k_buffer directly
+        (not through get_key_buffer) because the storage view IS the packed row.
+        """
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(
+                read_layer_id - self.start_layer
+            )
+        storage = self.k_buffer[read_layer_id - self.start_layer].view(
+            -1, self.kv_cache_dim
+        )
+        rows = storage.index_select(0, loc.to(torch.int64))
+        out_dtype = dst_dtype if dst_dtype is not None else self.dtype
+        rope_bytes = self.qk_rope_head_dim * 2
+        tiles = self.kv_lora_rank // 128
+        # Dequantise in FP32 (the scale is exact there; a bf16 scale would add
+        # a second, unearned rounding) and round to the compute dtype once.
+        scale = (
+            rows[:, self.kv_lora_rank + rope_bytes :]
+            .view(torch.uint8)
+            .view(torch.float32)
+            .reshape(-1, tiles, 1)
+        )
+        nope = (
+            rows[:, : self.kv_lora_rank]
+            .to(torch.float32)
+            .reshape(-1, tiles, 128)
+            * scale
+        ).reshape(-1, self.kv_lora_rank)
+        rope = (
+            rows[:, self.kv_lora_rank : self.kv_lora_rank + rope_bytes]
+            .view(torch.uint8)
+            .view(torch.bfloat16)
+        )
+        # rope is a strided column slice of the packed row (dim-0 stride
+        # kv_cache_dim), so it is NOT contiguous, and .to(out_dtype) is a no-op
+        # copy once out_dtype is already bf16 -- npu_sparse_flash_attention_lse
+        # rejects a non-contiguous key_rope. Materialise both halves to match the
+        # non-packed path's contiguous index_select contract (nope is already a
+        # fresh copy from the fp32 dequant; .contiguous() is a no-op there).
+        return (
+            nope.to(out_dtype).contiguous().unsqueeze(1),
+            rope.to(out_dtype).contiguous().unsqueeze(1),
+        )
+
+    def gather_packed_sfa_rows_raw(
+        self, read_layer_id: int, loc: torch.Tensor
+    ) -> torch.Tensor:
+        """The raw 656 B packed rows at physical rows ``loc``, one byte each.
+
+        The DCP extend gather ships these as-is (F2): the all-gather runs over
+        the opaque one-byte row, so this is a plain index_select into the
+        storage view. Returned as uint8 so the caller can all-gather over a
+        single, collective-safe element type and hand the quant operator back
+        its storage dtype with one view.
+        """
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(
+                read_layer_id - self.start_layer
+            )
+        storage = self.k_buffer[read_layer_id - self.start_layer].view(
+            -1, self.kv_cache_dim
+        )
+        return storage.index_select(0, loc.to(torch.int64)).view(torch.uint8)
+
+    def view_packed_sfa_rows(self, rows: torch.Tensor):
+        """The (latent, rope, scale) views out of raw 656 B packed rows.
+
+        The inverse of _pack_dsa_fp8_kv_cache's record layout, as VIEWS (no
+        copy): latent int8 (kv_lora_rank) | rope BF16 (qk_rope_head_dim) |
+        per-128-tile FP32 scales (kv_lora_rank // 128). F2 hands these to the
+        quant operator, which dequantises in-kernel; the views are strided
+        (dim-0 stride kv_cache_dim), so the caller materialises them (the
+        operator's TND contract).
+        """
+        rows = rows.reshape(-1, self.kv_cache_dim)
+        rope_bytes = self.qk_rope_head_dim * 2
+        latent = rows[:, : self.kv_lora_rank].view(torch.int8)
+        rope = rows[
+            :, self.kv_lora_rank : self.kv_lora_rank + rope_bytes
+        ].view(torch.bfloat16)
+        scale = (
+            rows[:, self.kv_lora_rank + rope_bytes :]
+            .view(torch.uint8)
+            .view(torch.float32)
+        )
+        return latent, rope, scale
+
+    def dequant_packed_sfa_rows(
+        self, rows: torch.Tensor, dst_dtype: Optional[torch.dtype] = None
+    ):
+        """The F1 (nope, rope) halves of raw 656 B packed rows (F2 fallback).
+
+        The same dequant as _gather_packed_sfa_rows (the per-128-tile scale
+        applied in FP32, the rope a straight bf16 reinterpretation) but on rows
+        the caller already holds, so the F2 read can fall back to the F1 bf16
+        halves from the F2 buffer when the quant op declines on this box.
+        """
+        rows = rows.reshape(-1, self.kv_cache_dim)
+        out_dtype = dst_dtype if dst_dtype is not None else self.dtype
+        rope_bytes = self.qk_rope_head_dim * 2
+        tiles = self.kv_lora_rank // 128
+        scale = (
+            rows[:, self.kv_lora_rank + rope_bytes :]
+            .view(torch.uint8)
+            .view(torch.float32)
+            .reshape(-1, tiles, 1)
+        )
+        # The buffer is uint8 (the all-gather's own element type), so the latent
+        # half must be REINTERPRETED as int8 before it is turned into a float --
+        # .to(f32) on uint8 would give the byte values 0..255, not the signed
+        # int8 the quant operator stored (npu_dynamic_quant, dst_type int8).
+        nope = (
+            rows[:, : self.kv_lora_rank]
+            .view(torch.int8)
+            .to(torch.float32)
+            .reshape(-1, tiles, 128)
+            * scale
+        ).reshape(-1, self.kv_lora_rank)
+        rope = (
+            rows[:, self.kv_lora_rank : self.kv_lora_rank + rope_bytes]
+            .view(torch.uint8)
+            .view(torch.bfloat16)
+        )
+        return (
+            nope.to(out_dtype).contiguous().unsqueeze(1),
+            rope.to(out_dtype).contiguous().unsqueeze(1),
+        )
+
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
             return [], [], []
@@ -948,6 +1208,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
 
+        if self.sfa_packed_kv_storage:
+            # F: the packed row is opaque storage, not a value of the compute
+            # dtype: viewing 656 int8 elements as bf16 would halve the row and
+            # corrupt the layout the quant operator and the DCP dequant address.
+            # The readers are the two packed-aware paths (the quant sparse
+            # attention operator, and get_mla_kv_buffer's dequant).
+            return self.k_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
@@ -967,10 +1234,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if getattr(self, "index_k_buffer", None) is None:
             raise RuntimeError("NPU MLA index KV cache is not allocated.")
 
-        if self.store_dtype != self.dtype:
-            return self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
-                self.dtype
-            )
+        # Unlike the latent (get_key_buffer views through store_dtype), the
+        # index-K is stored element-wise in its OWN dtype (index_k_store_dtype)
+        # and its only NPU reader -- the LightningIndexer -- consumes it in
+        # exactly that dtype, handing the scale to the quant op separately. It
+        # is never packed/reinterpreted, so viewing it through the latent store
+        # dtype is wrong: under the 8-bit SFA flag store_dtype is int8 and
+        # viewing the int8 index-K as bf16 halves the row and mis-types the key
+        # (npu_quant_lightning_indexer rejects key=DT_BFLOAT16).
         return self.index_k_buffer[self._get_indexer_slot(layer_id)]
 
     def _get_indexer_slot(self, layer_id: int) -> int:
@@ -979,6 +1250,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_index_k_scale_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        if self.indexer_kv_store_int8:
+            # B (branch B): per-token fp16 scale (no E8M0 view).
+            return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
         # E8M0 view of the raw byte storage: (block_num, block_size, k_n, d/64, 2),
         # the k_descale layout quant_lightning_indexer (v2) expects with
         # quant_mode 3 and layout_k PA_BBND.
@@ -987,25 +1261,39 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
-        # Scatter whole per-token scale rows (k_n, d/64, 2) so the MX block
-        # scales keep the layout quant_lightning_indexer (v2) reads back.
-        assert scale.element_size() == 1, (
-            f"index_k scale must be a 1-byte (E8M0) MX scale, got dtype {scale.dtype}"
-        )
         buf = self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
-        tail = buf.shape[2:]
-        torch_npu.npu_scatter_nd_update_(
-            buf.view(-1, *tail),
-            loc.view(-1, 1),
-            scale.reshape(-1, *tail).view(torch.uint8),
-        )
+        if self.indexer_kv_store_int8:
+            # B (branch B): per-token fp16 scale (one per token).
+            assert scale.dtype == self.index_k_scale_dtype, (
+                f"index_k scale has to be {self.index_k_scale_dtype=} but it is "
+                f"{scale.dtype=}"
+            )
+            tail = buf.shape[2:]
+            torch_npu.npu_scatter_nd_update_(
+                buf.view(-1, *tail),
+                loc.view(-1, 1),
+                scale.reshape(-1, *tail),
+            )
+        else:
+            # Scatter whole per-token scale rows (k_n, d/64, 2) so the MX block
+            # scales keep the layout quant_lightning_indexer (v2) reads back.
+            assert scale.element_size() == 1, (
+                f"index_k scale must be a 1-byte (E8M0) MX scale, "
+                f"got dtype {scale.dtype}"
+            )
+            tail = buf.shape[2:]
+            torch_npu.npu_scatter_nd_update_(
+                buf.view(-1, *tail),
+                loc.view(-1, 1),
+                scale.reshape(-1, *tail).view(torch.uint8),
+            )
 
     def _get_disagg_buffer_entries(self):
         """Return (buffer, uses_global_slots) entries in PD transfer order."""
         self._raise_if_native_kv_cache_disabled()
         global_kv = self.is_draft_worker
         entries = [(buffer, global_kv) for buffer in self.k_buffer]
-        if not getattr(self, "dsa_kv_cache_store_fp8", False):
+        if not getattr(self, "sfa_packed_kv_storage", False):
             entries += [(buffer, global_kv) for buffer in self.v_buffer]
         if self.index_head_dim is not None:
             entries += [(buffer, True) for buffer in self.index_k_buffer]
@@ -1045,11 +1333,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _pack_dsa_fp8_kv_cache(self, cache_k, cache_v):
         latent = cache_k.reshape(-1, self.kv_lora_rank)
+        # dst_type is the STORAGE dtype, not the compute dtype: under the 8-bit
+        # SFA flag the model computes in bf16 and the latent must still quantise
+        # to the store dtype (int8 on A2/A3; in the in-tree mode the two
+        # coincide).
         quantized, scale = torch_npu.npu_dynamic_quant(
-            latent.reshape(-1, 128), dst_type=self.dtype
+            latent.reshape(-1, 128), dst_type=self.store_dtype
         )
         rows = latent.shape[0]
-        # Opaque record: latent FP8 | rope BF16 bytes | per-tile FP32 scales.
+        # Opaque record: latent 8-bit | rope BF16 bytes | per-tile FP32 scales.
         packed = torch.cat(
             (
                 quantized.reshape(rows, self.kv_lora_rank).view(torch.uint8),
@@ -1064,7 +1356,18 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ),
             dim=-1,
         )
-        return packed.view(self.dtype)
+        return packed.view(self.store_dtype)
+
+    def pack_sfa_kv_cache(self, cache_k, cache_v):
+        """Public pack for the DCP extend gather's own-chunk tail (F2).
+
+        The gather appends this forward's own KV to the packed buffer, holding
+        it as bf16 (nope, rope); packing it here with the same quantise+record
+        the pool uses in set_kv_buffer makes the buffer's tail the pool's own
+        rows (npu_dynamic_quant is deterministic, so the two quantisations
+        agree) instead of a bf16 row the operator's packed reader cannot address.
+        """
+        return self._pack_dsa_fp8_kv_cache(cache_k, cache_v)
 
     def _resolve_dcp_write(
         self,
@@ -1141,7 +1444,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
-        if self.dsa_kv_cache_store_fp8:
+        # BUG 6: the D1v3 S1 gather produces [num_tokens_pad]-wide KV
+        # (tp * ceil(num_tokens/tp)), but out_cache_loc has exactly
+        # num_tokens rows. Trim to the loc width before the scatter;
+        # a no-op for divisible batches and for base DCP.
+        n_loc = loc.numel()
+        if cache_k.shape[0] > n_loc:
+            cache_k = cache_k[:n_loc]
+            if cache_v is not None:
+                cache_v = cache_v[:n_loc]
+        if self.sfa_packed_kv_storage:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -1243,11 +1555,23 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             "indexer_layer_ids disagrees with the model's indexer layout"
         )
 
-        if index_k.dtype != self.dtype:
-            index_k = index_k.to(self.dtype)
+        if self.indexer_kv_store_int8:
+            # B (branch B): the indexer already produced int8 index-K; store it
+            # verbatim (no dtype cast / view).
+            assert index_k.dtype == self.index_k_store_dtype, (
+                f"index_k.dtype has to be {self.index_k_store_dtype=} but it is "
+                f"{index_k.dtype=}"
+            )
+        else:
+            if index_k.dtype != self.dtype:
+                index_k = index_k.to(self.dtype)
 
-        if self.store_dtype != self.dtype:
-            index_k = index_k.view(self.store_dtype)
+        # Bit-cast to the INDEX-K store dtype only where it differs. This used
+        # to view onto self.store_dtype, which is the latent row's dtype: under
+        # the 8-bit SFA flag that is int8 while the index-K is still the model's
+        # bf16, and the view would reinterpret the bits rather than store them.
+        if index_k.dtype != self.index_k_store_dtype:
+            index_k = index_k.view(self.index_k_store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
@@ -1293,11 +1617,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             buffers.append(self.index_k_buffer[slot].flatten(0, 1))
             if self.index_k_scale_buffer is not None:
                 buffers.append(self.index_k_scale_buffer[slot].flatten(0, 1))
-        if self.dsa_kv_cache_store_fp8:
-            # Retraction copies opaque records; byte views also avoid FP8
-            # advanced-indexing restrictions, without decoding/requantizing.
+        if self.sfa_packed_kv_storage:
+            # Retraction copies opaque records; byte views also avoid 8-bit
+            # (int8/fp8) advanced-indexing restrictions, without
+            # decoding/requantizing.
             buffers = [
-                buf.view(torch.uint8) if buf.dtype == torch.float8_e4m3fn else buf
+                buf.view(torch.uint8)
+                if buf.dtype in (torch.float8_e4m3fn, torch.int8)
+                else buf
                 for buf in buffers
             ]
         return buffers

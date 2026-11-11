@@ -1088,6 +1088,49 @@ class DeepseekV2MoE(nn.Module):
         )
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
+        # D1v3 (branch_moe / M): the MoE input is this rank's row slice. The
+        # TP-over-experts GEMM needs every token on every rank, so quantize the
+        # slice (per-token int8), all-gather the quantized payload + per-token
+        # scale back to full width, and dequantize. Everything from here on
+        # (gate, topk, dispatch, GEMM, finalize) runs on the full tensor exactly
+        # as without the rebuild -- and the trailing reduce below becomes a
+        # reduce-scatter onto this rank's slice.
+        #
+        # This is the int8 communication optimization layered on top of
+        # branch_token_sharded's self-sufficient form (a plain compute-dtype
+        # all-gather of the same slice). The position (all-gather before the
+        # MoE) and the result (the MoE consumes the full-width tensor; the
+        # trailing reduce-scatter is unchanged) are identical to the
+        # self-sufficient form; only the operator (quantize + gather + dequant
+        # vs all-gather) and the input dtype (int8 + a per-token scale vs the
+        # compute dtype) differ, halving the MoE-input traffic.
+        token_sharded = forward_batch is not None and getattr(
+            forward_batch, "npu_dsa_cp_token_sharded", False
+        )
+        # Expose the token-sharded state to the post-experts reduce helper (it
+        # runs inside MoE sub-methods that do not take the forward_batch).
+        from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+            dsa_cp_set_current_token_sharded,
+        )
+
+        dsa_cp_set_current_token_sharded(token_sharded)
+        if token_sharded:
+            import torch_npu
+
+            group = get_parallel().attn_tp_group
+            x_q, x_scale = torch_npu.npu_dynamic_quant(
+                hidden_states, dst_type=torch.int8
+            )
+            x_q_full = x_q.new_empty(
+                (x_q.shape[0] * group.world_size,) + x_q.shape[1:]
+            )
+            group.all_gather_into_tensor(x_q_full, x_q)
+            x_scale_full = x_scale.new_empty((x_scale.shape[0] * group.world_size,))
+            group.all_gather_into_tensor(x_scale_full, x_scale)
+            hidden_states = x_q_full.to(hidden_states.dtype) * x_scale_full.unsqueeze(
+                -1
+            ).to(hidden_states.dtype)
+
         num_token_non_padded = (
             forward_batch.moe_num_token_non_padded()
             if forward_batch is not None
@@ -1453,7 +1496,6 @@ class DeepseekV2MoE(nn.Module):
             def _post_combine_hook(
                 dispatcher: BaseDispatcher, hidden_states: torch.Tensor
             ):
-                nonlocal shared_output
                 torch.cuda.current_stream().wait_stream(self.alt_stream)
                 post_combine_hook_handle.remove()
 
@@ -2320,6 +2362,22 @@ class DeepseekV2AttentionMLA(
         # Full-head bf16 w_vc for project-before-merge: the V up-projection runs
         # on every group head before the DCP a2a, so the wire carries v_head_dim.
         self.w_vc_qrep = None
+        # Full W_O (o_proj) for the D1v3 token-sharded rebuild: every rank runs
+        # the complete output projection on its own token slice, so the
+        # attention output is the full [rows, hidden] result and the o_proj
+        # allReduce is skipped. Gathered once pre-capture by the model runner;
+        # None unless token sharding is on.
+        self.o_proj_qrep_weight = None
+        # D2v3: o_proj streamed (all-gathered on the fly) instead of a gathered
+        # replicated weight; set when SGLANG_NPU_STREAM_O_PROJ is on.
+        self.o_proj_stream_shard = None
+        # D2v4: the remaining token-sharded replicated weights streamed the same
+        # way -- this rank's TP shard only, all-gathered on the fly at the GEMM
+        # (the exact op that builds the static qrep, so bit-identical). Set when
+        # the matching SGLANG_NPU_STREAM_* flag is on under token sharding.
+        self.q_b_stream_shard = None
+        self.w_kc_stream_shard = None
+        self.w_vc_stream_shard = None
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -3543,6 +3601,26 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
+            if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+                # D1v3: the residual stream ended token-sharded, so the
+                # last-token rows the logits path indexes by
+                # cumsum(extend_seq_lens)-1 are split across the ranks. Gather
+                # them (a [num_requests, hidden] all-gather, not the full
+                # [N, hidden]) so the logits code below sees the shape it
+                # always did.
+                from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+                    dsa_cp_gather_last_token_rows,
+                )
+                from sglang.srt.utils.common import print_info_once
+
+                print_info_once(
+                    "D1v3: the logits tail gathers the last-token rows "
+                    "([num_requests, hidden]) so the logits code sees the shape "
+                    "it always did."
+                )
+                hidden_states = dsa_cp_gather_last_token_rows(
+                    hidden_states, forward_batch
+                )
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
