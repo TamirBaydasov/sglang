@@ -37,6 +37,9 @@ Every per-case env is recorded in `results.json`.
    `--ais-env` is the conda env file (default `/home/tbaydasov/set_env.sh`).
 3. The container (`sglang-a3`) is running with host networking.
 4. Port 30000 free — the runner refuses to start otherwise.
+5. GitHub reachability: the runner applies the same `ghfast.top` insteadOf
+   rewrite your manual box commands use (`--git-proxy`, on by default).
+   Pass `--git-proxy ''` on networks with direct GitHub access.
 
 ### The `07-combined` branch is local-only
 

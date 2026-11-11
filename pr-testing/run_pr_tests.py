@@ -41,6 +41,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import socket
 import statistics
 import subprocess
@@ -355,13 +356,24 @@ def docker(container):
 
 
 def run_capture(container, cmd, timeout=120):
-    return subprocess.run([*docker(container), "bash", "-c", cmd],
-                          capture_output=True, text=True, timeout=timeout)
+    try:
+        return subprocess.run([*docker(container), "bash", "-c", cmd],
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=[], returncode=124, stdout="",
+            stderr=f"timeout after {timeout}s: {cmd[:120]}")
+
+
+# Set from --git-proxy in main(); the box networks reach GitHub only through
+# the ghfast.top proxy the manual launch commands apply via insteadOf.
+GIT_PROXY = []
 
 
 def git_in_repo(container, repo, *git_args, timeout=600):
     quoted = " ".join("'" + a.replace("'", "'\\''") + "'" for a in git_args)
-    return run_capture(container, f"git -C '{repo}' {quoted}", timeout=timeout)
+    prefix = f"-c {shlex.quote(GIT_PROXY[0])} " if GIT_PROXY else ""
+    return run_capture(container, f"git {prefix}-C '{repo}' {quoted}", timeout=timeout)
 
 
 # --------------------------------------------------------------------------
@@ -440,8 +452,6 @@ def require_free_port():
 
 
 def shlex_split(text):
-    import shlex
-
     return shlex.split(text) if text else []
 
 
@@ -569,13 +579,16 @@ def fmt_ttft(record):
 def summarize(records, output, args):
     rows = ["# PR-series box results", "",
             f"Generated {now()} | round={args.round} | length={args.length} "
-            f"requests={args.requests} chunk={args.chunk} memfrac={args.memfrac}", "",
-            "## Speed (AISBench prefix-cache TTFT s mean/P90; single sample, no speedup claims)", "",
-            "| Case | Ref | Status | TTFT mean/P90 (s) | E2E (s) | Commit |",
-            "|---|---|---|---|---|---|"]
+            f"requests={args.requests} chunk={args.chunk} memfrac={args.memfrac}",
+            "",
+            "## Speed (AISBench prefix-cache TTFT s mean/P90; single sample, no speedup claims)",
+            "",
+            "| Case | Ref | Status | TTFT mean/P90 (s) | E2E (s) | Reason | Commit |",
+            "|---|---|---|---|---|---|---|"]
     for r in records:
+        reason = str(r.get("reason", ""))[:70]
         rows.append(f"| {r['case']} | {r['ref']} | {r['status']} | {fmt_ttft(r)} | "
-                    f"{r.get('metrics', {}).get('E2E_time', '')} | {r.get('commit', '')[:10]} |")
+                    f"{r.get('metrics', {}).get('E2E_time', '')} | {reason} | {r.get('commit', '')[:10]} |")
 
     base = next((r for r in records if r["case"] == "00-baseline"), None)
     if base and base.get("accuracy"):
@@ -632,7 +645,7 @@ def describe_commands(case, container, repo, args):
     name, ref, env, _ = case
     env_str = " ".join(f"{k}={v}" for k, v in {**BASE_ENV, **env}.items())
     return [
-        f"git -C {repo} fetch --no-tags {args.fetch_url or '<local>'} {ref}",
+        f"git -c '{args.git_proxy}' -C {repo} fetch --no-tags {args.fetch_url or '<local>'} {ref}",
         f"git -C {repo} checkout -B prtest/current <sha>",
         f"docker exec {container} bash -c \"cd {repo} && setsid env {env_str} "
         f"{args.container_python} -m sglang.launch_server ... > /tmp/prtest-server-{name}.log 2>&1 &\"",
@@ -658,6 +671,9 @@ def main():
     parser.add_argument("--model", default="/home/weights/GLM5.2-w4a8-int")
     parser.add_argument("--fetch-url", default=FORK_URL_DEFAULT,
                         help="fork to fetch branches from ('' or --no-fetch to skip)")
+    parser.add_argument("--git-proxy",
+                        default="url.https://ghfast.top/https://github.com/.insteadOf=https://github.com/",
+                        help="git -c insteadOf rewrite for reaching GitHub from the box ('' = direct)")
     parser.add_argument("--no-fetch", action="store_true", help="use local refs only")
     parser.add_argument("--ais-dir", default=AIS_DIR_DEFAULT)
     parser.add_argument("--ais-env", default=None)
@@ -683,6 +699,7 @@ def main():
 
     if args.no_fetch:
         args.fetch_url = ""
+    GIT_PROXY[:] = [args.git_proxy] if args.git_proxy else []
     if args.ais_env is None:
         args.ais_env = next((p for p in AIS_ENV_CANDIDATES if Path(p).is_file()),
                             AIS_ENV_CANDIDATES[0])
