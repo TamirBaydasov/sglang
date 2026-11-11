@@ -23,8 +23,16 @@ established A3 nightly workflow (`run_a3_nightly.py` lineage):
 | 07-combined | `npu-bde-combined` | everything | — |
 | 08-baseline-repeat | `dcp_ascend_testing` (from the fork) | none (control) | — |
 
-Defaults follow the BDE recipe: TP16 / DCP16, ctx 1,048,576, chunk 32768,
-memfrac 0.88, `--prefill-max-requests 1`, HCCL buffsize 1000/2500, etc.
+Defaults follow the archived 1M baseline pairing
+(`CTX=1024000 CHUNK=16384 MAXREQ=16 CAPTURE=1 MEMFRAC=0.70 EXTRA_ARGS="--watchdog-timeout 7200"
+of `p4_exit1_serve_dcp.sh`): TP16 / DCP16, decode-graph capture ON at bs 16,
+prefill capture off, `--prefill-max-requests 1`, watchdog 7200 s, HCCL
+buffsize 1000/2500. **memfrac 0.70, not 0.76/0.88** — the first live run at
+0.88 OOM'd at KV-pool init (12.83 GiB `index_k_buffer` short); the archived
+recipe pairs the 1M workload with 0.70. If a case still OOMs at pool init,
+the runner retries **once** at memfrac − `--memfrac-step` (0.06, floor 0.55)
+and records both values. `--moe-a2a-backend` stays unset (TP-MoE): the
+token-sharded PR refuses a2a backends, and a paired A/B needs one config.
 Every per-case env is recorded in `results.json`.
 
 ## Prerequisites (A3 host, one-time)
@@ -115,11 +123,14 @@ python3 run_pr_tests.py --dry-run
   counted raw — NPU serving is not bit-deterministic, so "differ" is
   information, not an automatic failure. With `--gsm8k`, a seeded subset
   (default 200 samples, 5-shot, greedy) gives an accuracy number per case.
-- **speed** — one AISBench `prefix_cache` invocation per fresh server:
+- **speed** — one AISBench `prefix_cache` invocation per fresh server
+  (`profile_aisbench.sh` with `PROFILE=0`): the prefix cache is flushed
+  (`/flush_cache`) first so the warm-up really prefills, then
   `--input_len 1000000 --output_len 1 --data_num 16 --concurrency 16
   --repeat_rate 0.99 --seed 4`. TTFT mean/P90 (ms→s), E2E, qps and prefill
   throughput are parsed from the `'TTFT avg'` metric lines into
-  `results.json`.
+  `results.json`. Queueing dominates per-request TTFT at concurrency 16
+  (prefill is serialised); read the mean/P90 with that in mind.
 
 ## Output
 

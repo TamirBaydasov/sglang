@@ -93,16 +93,31 @@ BASE_ENV = {
 }
 
 SERVER_PORT = 30000
+# Baseline serving recipe = the archived 1M pairing of p4_exit1_serve_dcp.sh
+# and profile_aisbench.sh (PROFILE=0):
+#   CTX=1024000 CHUNK=16384 MAXREQ=16 CAPTURE=1 MEMFRAC=0.70 \
+#     EXTRA_ARGS="--watchdog-timeout 7200" bash p4_exit1_serve_dcp.sh 16
+# Decode graph capture ON at max-bs 16 (= MAXREQ, a multiple of TP=16; the
+# token-sharded PR refuses only EXTEND capture). Prefill capture stays
+# disabled (NPU forces it off anyway). memfrac is 0.70, NOT 0.76/0.88: the
+# first live run OOM'd at pool init at 0.88 (12.83 GiB index_k_buffer, 47.40
+# GiB already allocated of a 61.28 GiB die), and the archived 1M recipe pairs
+# this exact workload with 0.70. moe-a2a stays 'none' deliberately: the ts PR
+# refuses a2a backends and a paired A/B needs one config across all cases
+# (TP-MoE is what the series optimizes; the checkpoint loads fine on 'none').
 BASE_SERVER_ARGS = [
     "--device", "npu",
     "--attention-backend", "ascend",
     "--tp-size", "16",
     "--dcp-size", "16",
+    "--trust-remote-code",
     "--cuda-graph-backend-prefill", "disabled",
-    "--cuda-graph-backend-decode", "disabled",
-    "--context-length", "1048576",
-    "--chunked-prefill-size", "32768",
-    "--mem-fraction-static", "0.88",
+    "--context-length", "1024000",
+    "--chunked-prefill-size", "16384",
+    "--max-running-requests", "16",
+    "--cuda-graph-max-bs-decode", "16",
+    "--watchdog-timeout", "7200",
+    "--mem-fraction-static", "0.70",
     "--port", str(SERVER_PORT),
     # Packed DCP reads require one request per prefill batch.
     "--prefill-max-requests", "1",
@@ -270,6 +285,22 @@ def health_ok():
         return False
 
 
+def flush_cache(log=None):
+    """profile_aisbench.sh habit: start the AISBench run from an EMPTY prefix
+    cache, so the warm-up really prefills 990k tokens instead of riding a
+    previous case's trunk."""
+    try:
+        http("/flush_cache?timeout=60", payload={}, timeout=120)
+        if log:
+            log("    prefix cache flushed")
+        return True
+    except Exception as exc:  # noqa: BLE001 - fail soft, like the recipe's warning
+        if log:
+            log(f"    WARNING: /flush_cache failed ({exc}); "
+                f"the warm-up may hit a stale prefix")
+        return False
+
+
 def generate(text, max_new_tokens=64):
     data = http(
         "/generate",
@@ -434,24 +465,28 @@ def git_in_repo(container, repo, *git_args, timeout=600):
 # --------------------------------------------------------------------------
 # Server lifecycle
 # --------------------------------------------------------------------------
-def launch_server(container, repo, env, args, case_dir, log):
+def launch_server(container, repo, env, args, case_dir, log, memfrac=None):
     remote_log = f"/tmp/prtest-server-{case_dir.name}.log"
     env_str = " ".join(f"{k}={v}" for k, v in {**BASE_ENV, **env}.items())
     python = args.container_python
     model = args.model
     server_args = list(BASE_SERVER_ARGS)
-    server_args[server_args.index("--mem-fraction-static") + 1] = str(args.memfrac)
+    server_args[server_args.index("--mem-fraction-static") + 1] = str(
+        args.memfrac if memfrac is None else memfrac)
     server_args[server_args.index("--chunked-prefill-size") + 1] = str(args.chunk)
     if args.context:
         server_args[server_args.index("--context-length") + 1] = str(args.context)
     server_args += shlex_split(args.extra_server_args)
     # PYTHONPATH: the box serves the source tree, not a pip install (the
     # archived recipe always sets ROOT/python). Detached exec (-d) + nohup +
-    # setsid + stdin redirect so the server survives this exec; $! is the
-    # server pid for clean group stops.
+    # stdin redirect so the server survives this exec. NO setsid: it forks
+    # when it is already a group leader, $! then records the instantly-reaped
+    # parent and pid liveness goes blind (observed on the box: server OOM'd,
+    # runner kept printing 'still starting'); nohup execs python directly, so
+    # $! IS the server pid.
     command = (
         f"cd '{repo}' && export PYTHONPATH=\"{repo}/python:$PYTHONPATH\" && "
-        f"nohup setsid env {env_str} {python} -m sglang.launch_server "
+        f"nohup env {env_str} {python} -m sglang.launch_server "
         f"--load-format auto --model-path '{model}' "
         + " ".join(server_args)
         + f" > '{remote_log}' 2>&1 < /dev/null & echo $! > '{remote_log}.pid'"
@@ -475,9 +510,19 @@ def wait_health(container, remote_log, case_dir, args, log, deadline):
         if health_ok():
             log(f"    server healthy after {int(time.time() - started)}s")
             return "ok"
-        if pid and not pid_alive(container, pid) and not server_process_exists(container):
-            capture_server_log(container, remote_log, case_dir, log)
-            return "server-exited-early"
+        if pid and not pid_alive(container, pid):
+            # The recorded pid may be a reaped wrapper: adopt the real server
+            # pid if one exists; if none does, the server died -- say so now,
+            # with its log, instead of polling to the startup timeout.
+            adopted = run_capture(container,
+                                  "pgrep -f sglang.launch_server | head -1",
+                                  timeout=30).stdout.strip()
+            if adopted:
+                log(f"    recorded pid {pid} is gone; adopting server pid {adopted}")
+                pid = adopted
+            else:
+                capture_server_log(container, remote_log, case_dir, log)
+                return "server-exited-early"
         elapsed = int(time.time() - started)
         if elapsed and elapsed % 60 < 10:
             log(f"    still starting ({elapsed}s elapsed)")
@@ -603,13 +648,29 @@ def run_case(case, container, repo, args, case_dir, log, deadline):
     record["commit"] = sha
     log(f"    at {sha[:10]}")
 
-    remote_log = launch_server(container, repo, env, args, case_dir, log)
-    record["server_log"] = remote_log
-
-    state = wait_health(container, remote_log, case_dir, args, log, deadline)
-    if state != "ok":
-        record.update(status="failed", reason=f"server {state}")
+    memfrac = args.memfrac
+    state = None
+    for attempt in (1, 2):
+        remote_log = launch_server(container, repo, env, args, case_dir, log,
+                                   memfrac=memfrac)
+        record["server_log"] = remote_log
+        state = wait_health(container, remote_log, case_dir, args, log, deadline)
+        if state == "ok":
+            record["memfrac"] = memfrac
+            break
         stop_server(container, remote_log, case_dir, log)
+        log_path = case_dir / "server.log"
+        oom = (log_path.exists()
+               and "OutOfMemoryError" in log_path.read_text(errors="replace"))
+        if (state == "server-exited-early" and oom and attempt == 1
+                and memfrac - args.memfrac_step >= 0.55):
+            memfrac = round(memfrac - args.memfrac_step, 3)
+            log(f"    server OOM'd at pool init; retrying once with "
+                f"memfrac {memfrac}")
+            record["memfrac_retry"] = memfrac
+            continue
+        record.update(status="failed",
+                      reason=f"server {state}" + (" (OOM)" if oom else ""))
         return record
 
     try:
@@ -626,8 +687,10 @@ def run_case(case, container, repo, args, case_dir, log, deadline):
             record["accuracy"] = accuracy
 
         if args.round in ("speed", "all") and state == "ok":
+            flush_cache(log)
             log(f"    AISBench: len={args.length} req={args.requests} "
-                f"chunk={args.chunk} (one invocation, fresh server)")
+                f"chunk={args.chunk} (one invocation, fresh server, "
+                f"PROFILE=0 semantics)")
             code, metrics, _ = run_aisbench(
                 args.ais_dir, args.ais_env, args, case_dir / "ais.log")
             record["ais_returncode"] = code
@@ -763,9 +826,12 @@ def describe_commands(case, container, repo, args):
         f"git -c '{args.git_proxy}' -C {repo} fetch --no-tags {args.fetch_url or '<local>'} {ref}",
         f"git -C {repo} checkout -B prtest/current <sha>",
         f"docker exec -d {container} bash -c \"cd {repo} && export PYTHONPATH={repo}/python:$PYTHONPATH && "
-        f"nohup setsid env {env_str} {args.container_python} -m sglang.launch_server ... "
+        f"nohup env {env_str} {args.container_python} -m sglang.launch_server ... "
+        f"(ctx {args.context}, chunk {args.chunk}, maxreq 16, decode-graph bs 16, "
+        f"memfrac {args.memfrac}, watchdog 7200)"
         f"> /tmp/prtest-server-{name}.log 2>&1 < /dev/null &\"",
-        "poll http://127.0.0.1:30000/health (pid liveness + 60s progress notes; early exit captures server.log)",
+        "poll /health (pid adopt/liveness + 60s notes; early exit captures server.log; pool-init OOM retries once at --memfrac-step)",
+        "POST /flush_cache before AISBench (PROFILE=0 semantics: clean prefix, one measured run)",
         f"accuracy: {args.accuracy_requests} greedy requests "
         f"(8 fixed + generated + 2 x {args.accuracy_long_tokens}-tok long)"
         + (f" + gsm8k {args.gsm8k_samples}" if args.gsm8k else ""),
@@ -799,9 +865,11 @@ def main():
     parser.add_argument("--gsm8k-seed", type=int, default=4)
     parser.add_argument("--length", type=int, default=1000000)
     parser.add_argument("--requests", type=int, default=16)
-    parser.add_argument("--chunk", type=int, default=32768)
-    parser.add_argument("--context", type=int, default=1048576)
-    parser.add_argument("--memfrac", type=float, default=0.88)
+    parser.add_argument("--chunk", type=int, default=16384)
+    parser.add_argument("--context", type=int, default=1024000)
+    parser.add_argument("--memfrac", type=float, default=0.70)
+    parser.add_argument("--memfrac-step", type=float, default=0.06,
+                        help="a pool-init OOM retries once at memfrac minus this (floor 0.55)")
     parser.add_argument("--accuracy-requests", type=int, default=64,
                         help="greedy accuracy requests per case (incl. the 2 long prompts)")
     parser.add_argument("--accuracy-long-tokens", type=int, default=32768)
