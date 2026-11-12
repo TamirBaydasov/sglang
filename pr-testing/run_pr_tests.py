@@ -132,15 +132,17 @@ CASES = [
     ("01-pr-e-chat-encode", "npu-chat-encode-pool", {
         "SGLANG_ENABLE_CHAT_ENCODE_POOL": "True",
         "SGLANG_CHAT_ENCODE_MEMO": "True",
-    }, "PR #2 (E): pool on, memo on; RAW stays off (its documented default)"),
+        "SGLANG_CHAT_ENCODE_RAW": "True",
+    }, "PR #2 (E): all three features - pool + memo + raw Rust encode"),
     ("02-pr-b-indexer-int8", "npu-dsa-indexer-int8", {
         "SGLANG_NPU_INDEXER_INT8": "True",
     }, "PR #3 (B): int8 index-K + per-token fp16 scale"),
     ("03-pr-prefetch-packed", "npu-dcp-packed-read", {
         "SGLANG_NPU_ENABLE_DCP_PACKED_READ": "True",
-        "SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH": "True",
+        "SGLANG_NPU_ENABLE_DCP_PACKED_GATHER_PREFETCH": "True",
         "SGLANG_NPU_ENABLE_PG_PRIORITY": "True",
-    }, "PR #4 (C1/D2p/D2v2): packed read + prime + chunked gather"),
+    }, "PR #4 (C1/D2p/D2v2): packed read + prime/prefetch + chunked gather "
+       "(CHUNKS=8 and stream priority are the branch defaults)"),
     ("04-pr-f-sfa-kv-8bit", "npu-sfa-kv-8bit", {
         "SGLANG_NPU_SFA_KV_8BIT": "True",
         "SGLANG_NPU_SFA_KV_QUANT_READ": "True",
@@ -151,16 +153,22 @@ CASES = [
         "SGLANG_NPU_DSA_CP_LOCAL_TOPK": "True",
         "SGLANG_NPU_DCP_DECODE_Q_PREISSUE": "True",
         "SGLANG_NPU_STREAM_O_PROJ": "True",
-    }, "PR #6 (D1v3): bf16 self-sufficient MoE input"),
+        "SGLANG_NPU_STREAM_Q_B": "True",
+        "SGLANG_NPU_STREAM_W_KC": "True",
+        "SGLANG_NPU_STREAM_W_VC": "True",
+        "SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP": "True",
+    }, "PR #6 (D1v3) every feature: rebuild + all four streamed weights + "
+       "SFA gather overlap (permuting-path flag; this branch has no packed read)"),
     ("06-pr-moe-int8", "npu-dsa-cp-moe-int8", {
         "SGLANG_NPU_DSA_CP_TOKEN_SHARDED": "True",
     }, "PR #7 (M): int8 MoE input (unconditional under the ts flag)"),
     ("07-combined", "npu-bde-combined", {
         "SGLANG_ENABLE_CHAT_ENCODE_POOL": "True",
         "SGLANG_CHAT_ENCODE_MEMO": "True",
+        "SGLANG_CHAT_ENCODE_RAW": "True",
         "SGLANG_NPU_INDEXER_INT8": "True",
         "SGLANG_NPU_ENABLE_DCP_PACKED_READ": "True",
-        "SGLANG_NPU_ENABLE_DCP_GATHER_PREFETCH": "True",
+        "SGLANG_NPU_ENABLE_DCP_PACKED_GATHER_PREFETCH": "True",
         "SGLANG_NPU_ENABLE_PG_PRIORITY": "True",
         "SGLANG_NPU_SFA_KV_8BIT": "True",
         "SGLANG_NPU_SFA_KV_QUANT_READ": "True",
@@ -169,7 +177,11 @@ CASES = [
         "SGLANG_NPU_DSA_CP_LOCAL_TOPK": "True",
         "SGLANG_NPU_DCP_DECODE_Q_PREISSUE": "True",
         "SGLANG_NPU_STREAM_O_PROJ": "True",
-    }, "full deployment configuration (local-only branch; see README)"),
+        "SGLANG_NPU_STREAM_Q_B": "True",
+        "SGLANG_NPU_STREAM_W_KC": "True",
+        "SGLANG_NPU_STREAM_W_VC": "True",
+    }, "full deployment configuration: every branch feature on (SFA overlap "
+       "stays off - superseded by the packed-read prime in this tree)"),
     ("08-baseline-repeat", "dcp_ascend_testing", {}, "control, bracket end"),
 ]
 

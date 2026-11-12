@@ -14,13 +14,13 @@ established A3 nightly workflow (`run_a3_nightly.py` lineage):
 | Case | Branch (fork) | Flags on | PR |
 |---|---|---|---|
 | 00-baseline | `dcp_ascend_testing` (from the fork) | none (control) | — |
-| 01-pr-e-chat-encode | `npu-chat-encode-pool` | pool + memo | #2 |
+| 01-pr-e-chat-encode | `npu-chat-encode-pool` | pool + memo + raw encode | #2 |
 | 02-pr-b-indexer-int8 | `npu-dsa-indexer-int8` | `INDEXER_INT8` | #3 |
-| 03-pr-prefetch-packed | `npu-dcp-packed-read` | packed read + prefetch + PG priority | #4 |
+| 03-pr-prefetch-packed | `npu-dcp-packed-read` | packed read + packed gather prefetch + PG priority | #4 |
 | 04-pr-f-sfa-kv-8bit | `npu-sfa-kv-8bit` | `SFA_KV_8BIT` + `SFA_KV_QUANT_READ` | #5 |
-| 05-pr-ts-token-sharded | `npu-dsa-cp-token-sharded` | ts + Q_FULL_WIDTH + LOCAL_TOPK + DECODE_Q_PREISSUE + STREAM_O_PROJ | #6 |
+| 05-pr-ts-token-sharded | `npu-dsa-cp-token-sharded` | ts + Q_FULL_WIDTH + LOCAL_TOPK + DECODE_Q_PREISSUE + all four streamed weights + SFA gather overlap | #6 |
 | 06-pr-moe-int8 | `npu-dsa-cp-moe-int8` | ts (int8 MoE input is unconditional under it) | #7 |
-| 07-combined | `npu-bde-combined` | everything | — |
+| 07-combined | `npu-bde-combined` | everything (SFA overlap off — superseded by the packed-read prime) | — |
 | 08-baseline-repeat | `dcp_ascend_testing` (from the fork) | none (control) | — |
 
 Defaults follow the archived 1M baseline pairing
@@ -54,16 +54,11 @@ Every per-case env is recorded in `results.json`.
    retries once on failure). Pass `--git-proxy ''` on networks with direct
    GitHub access.
 
-### The `07-combined` branch is local-only
+### The `07-combined` branch
 
-`npu-bde-combined` exists only in the local workspace (per the no-push
-instruction). To test it on the box, push it yourself first (optional):
-
-```bash
-git -C /home/orangeredeng/code/sglang_experimental/sglang push origin npu-bde-combined
-```
-
-Without it, case 07 is reported `skipped` and everything else runs.
+`npu-bde-combined` is the clean squash of the verified six-PR series
+(d850514275); it is pushed to the fork so case 07 can fetch it. The six
+reviewable PRs remain the history of record.
 
 ## Run
 
