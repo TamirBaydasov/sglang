@@ -488,35 +488,50 @@ GIT_PROXY = []
 CANN_ENV_FILE = None
 
 CANN_ENV_FALLBACKS = (
+    "/usr/local/Ascend/cann-9.2.0-beta.2/set_env.sh",
     "/usr/local/Ascend/cann-9.2/set_env.sh",
     "/usr/local/Ascend/cann-9.2.0/set_env.sh",
-    "/usr/local/Ascend/ascend-toolkit/latest/set_env.sh",
 )
 
 
 def resolve_cann_env(container, preferred, log):
-    """Pick the first CANN env file that exists INSIDE the container.
+    """Pick the first CANN env file that exists INSIDE the container AND
+    actually resolves to a 9.2 toolkit.
 
-    The preferred path may be host-only (e.g. /home/tbaydasov/... is the host
-    user's tree and the container may not mount it), so it is probed like the
-    fallbacks; the runner logs which one applies so results are attributable.
-    Returns the container path or None (container default CANN stays in
-    effect).
+    Version verification matters: on this box /usr/local/Ascend/ascend-toolkit
+    /latest exists but aliases 9.1, so sourcing it changed nothing (run
+    20261112-205244 logged 'no cann-9.2 paths' on every healthy case). Each
+    candidate is sourced and its LD_LIBRARY_PATH / toolkit home checked for
+    9.2; a 9.1-aliasing file is skipped with a note. The preferred path may be
+    host-only, so it is probed like the fallbacks. Returns the container path
+    or None (container default CANN stays in effect).
     """
     global CANN_ENV_FILE
     candidates = ([preferred] if preferred else []) + list(CANN_ENV_FALLBACKS)
     for candidate in candidates:
-        result = run_capture(container, f"test -f '{candidate}' && echo yes",
-                             timeout=30)
-        if result.stdout.strip() == "yes":
+        result = run_capture(
+            container,
+            f"if test -f '{candidate}'; then . '{candidate}' >/dev/null 2>&1; "
+            f'case "$LD_LIBRARY_PATH$ASCEND_TOOLKIT_HOME$ASCEND_HOME_PATH" '
+            f'in *9.2*) echo IS_9_2;; *) echo NOT_9_2;; esac; '
+            f"else echo MISSING; fi",
+            timeout=120,
+        )
+        verdict = result.stdout.strip()
+        if verdict == "IS_9_2":
             CANN_ENV_FILE = candidate
-            log(f"    CANN env: sourcing {candidate} (9.2 for the "
-                f"npu_sparse_flash_attention_lse op)")
+            log(f"    CANN env: sourcing {candidate} (verified a 9.2 toolkit "
+                f"in its env; for the npu_sparse_flash_attention_lse op)")
             return candidate
+        if verdict == "NOT_9_2":
+            log(f"    CANN env: {candidate} exists but resolves to a "
+                f"non-9.2 toolkit; skipping it")
+        # MISSING: silently try the next candidate
     CANN_ENV_FILE = None
-    log("    CANN env: no 9.2 env file found in the container "
-        f"(tried {', '.join(candidates)}); the container default CANN "
-        "stays in effect -- case 04 will fail on the missing op")
+    log("    CANN env: no env file resolving to CANN 9.2 found in the "
+        f"container (tried {', '.join(candidates)}); the container default "
+        "CANN stays in effect -- the sparse-attention-LSE op will be missing "
+        "and case 04 will fail on it")
     return None
 
 
@@ -796,16 +811,19 @@ def run_case(case, container, repo, args, case_dir, log, deadline):
             record["smoke"] = "ok"
             log(f"    smoke ok: {text.strip()[:40]!r}")
 
-        # CANN attribution: the server prints its LD_LIBRARY_PATH early; the
-        # 9.2 paths must appear or the case is really on the image default.
-        if CANN_ENV_FILE:
-            hit = run_capture(container,
-                              f"grep -m1 -c 'cann-9.2' '{remote_log}' 2>/dev/null",
-                              timeout=30).stdout.strip()
-            record["cann_9_2_in_server_env"] = bool(hit and hit != "0")
-            if not record["cann_9_2_in_server_env"]:
-                log("    WARNING: server env shows no cann-9.2 paths; "
-                    "it is running on the container default CANN")
+        # CANN attribution: the server prints its LD_LIBRARY_PATH early; an
+        # Ascend 9.2 path must appear or the case is really on the image
+        # default (9.1) -- checked on every case, env file chosen or not
+        # (run 20261112-205244 proved 'sourced' can still mean 9.1).
+        hit = run_capture(container,
+                          f"grep -m1 -cE 'Ascend.*9\\.2|cann-9\\.2' "
+                          f"'{remote_log}' 2>/dev/null",
+                          timeout=30).stdout.strip()
+        record["cann_9_2_in_server_env"] = bool(hit and hit != "0")
+        if not record["cann_9_2_in_server_env"]:
+            log("    WARNING: server env shows no CANN 9.2 paths; it is "
+                "running on the container default CANN (the "
+                "npu_sparse_flash_attention_lse op will be missing)")
 
         if args.round in ("accuracy", "all") and state == "ok":
             accuracy = run_accuracy_prompts(args, case_dir, log)
@@ -816,7 +834,7 @@ def run_case(case, container, repo, args, case_dir, log, deadline):
             log(f"    AISBench: len={args.length} req={args.requests} "
                 f"chunk={args.chunk} (one invocation, fresh server, "
                 f"PROFILE=0 semantics)")
-            code, metrics, _ = run_aisbench(
+            code, metrics, ais_text = run_aisbench(
                 args.ais_dir, args.ais_env, args, case_dir / "ais.log")
             record["ais_returncode"] = code
             if metrics:
@@ -827,7 +845,14 @@ def run_case(case, container, repo, args, case_dir, log, deadline):
                 log(f"    TTFT mean {ttft} ms / P90 {p90} ms")
             else:
                 record["status"] = "failed"
-                record["reason"] = "no TTFT metrics parsed from ais.log"
+                record["reason"] = (f"no TTFT metrics parsed from ais.log "
+                                    f"(rc={code})")
+                # The 20261112-205244 run's AIS invocations died instantly
+                # (server stopped 1s after launch) with the reason buried in
+                # ais.log -- print its tail so the cause is on the console.
+                tail = [l for l in (ais_text or "").splitlines() if l.strip()]
+                for line in tail[-8:]:
+                    log("    ais| " + line[:180])
     except Exception as exc:  # noqa: BLE001 - keep the server-stop path alive
         record.update(status="failed", reason=f"{type(exc).__name__}: {exc}")
     finally:
@@ -849,8 +874,13 @@ def run_accuracy_prompts(args, case_dir, log):
         try:
             text, _ = generate(prompt, max_new_tokens=64)
         except Exception as exc:  # noqa: BLE001 - one bad request must not sink the case
-            text = f"<request error: {type(exc).__name__}>"
+            text = f"<request error: {type(exc).__name__}: {str(exc)[:200]}>"
             errors += 1
+            # The 20261112-205244 run had exactly 8 errors on every case with
+            # no visibility into why -- print the first few reasons inline.
+            if errors <= 3:
+                log(f"    accuracy {tag} error: "
+                    f"{type(exc).__name__}: {str(exc)[:200]}")
         results[tag] = text
         if (i + 1) % 16 == 0:
             log(f"    accuracy {i + 1}/{len(prompts)} ({errors} errors so far)")
@@ -984,11 +1014,12 @@ def main():
                         default="url.https://ghfast.top/https://github.com/.insteadOf=https://github.com/",
                         help="git -c insteadOf rewrite for reaching GitHub from the box ('' = direct)")
     parser.add_argument("--container-cann-env",
-                        default="/home/tbaydasov/Ascend/cann-9.2/set_env.sh",
+                        default="/home/tbaydasov/Ascend/cann-9.2.0-beta.2/set_env.sh",
                         help="CANN 9.2 set_env.sh to source before each server "
-                             "launch (probed inside the container, with "
-                             "/usr/local/Ascend/cann-9.2 fallbacks; '' = keep "
-                             "the image default CANN)")
+                             "launch; probed inside the container AND verified "
+                             "to resolve a 9.2 toolkit (candidates: this path, "
+                             "then /usr/local/Ascend/cann-9.2* fallbacks; "
+                             "'' = keep the image default CANN)")
     parser.add_argument("--no-fetch", action="store_true", help="use local refs only")
     parser.add_argument("--ais-dir", default=AIS_DIR_DEFAULT)
     parser.add_argument("--ais-env", default=None)
