@@ -53,6 +53,18 @@ Every per-case env is recorded in `results.json`.
    rewrite your manual box commands use (`--git-proxy`, on by default; fetch
    retries once on failure). Pass `--git-proxy ''` on networks with direct
    GitHub access.
+7. CANN 9.2: the box image defaults to CANN 9.1.0, which does **not**
+   register `torch.ops.npu.npu_sparse_flash_attention_lse` — the one real
+   failure of the 2026-11-12 night run (case 04 crashed decode-graph
+   capture on the missing op). The runner sources a CANN 9.2 env before
+   every server launch: `--container-cann-env`
+   (default `/home/tbaydasov/Ascend/cann-9.2/set_env.sh`) is probed inside
+   the container, falling back to `/usr/local/Ascend/cann-9.2/set_env.sh`
+   and `/usr/local/Ascend/cann-9.2.0/set_env.sh`. The chosen file is logged
+   at startup and each case records `cann_9_2_in_server_env` (checked from
+   the server's own `LD_LIBRARY_PATH` log line) so results are attributable.
+   If no candidate exists in the container, the run continues on the image
+   default and says so loudly.
 
 ### The `07-combined` branch
 

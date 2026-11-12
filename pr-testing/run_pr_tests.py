@@ -460,6 +460,9 @@ def run_capture(container, cmd, timeout=120):
         return subprocess.CompletedProcess(
             args=[], returncode=124, stdout="",
             stderr=f"timeout after {timeout}s: {cmd[:120]}")
+    except OSError as exc:  # no docker binary here (e.g. local --dry-run)
+        return subprocess.CompletedProcess(
+            args=[], returncode=127, stdout="", stderr=str(exc))
 
 
 def run_detached(container, cmd):
@@ -476,6 +479,49 @@ def run_detached(container, cmd):
 # Set from --git-proxy in main(); the box networks reach GitHub only through
 # the ghfast.top proxy the manual launch commands apply via insteadOf.
 GIT_PROXY = []
+
+
+# Set from --container-cann-env in main(); the box's default CANN is 9.1.0,
+# which does NOT register torch.ops.npu.npu_sparse_flash_attention_lse (the
+# one real night-run failure, case 04). CANN_ENV_FILE is the container-side
+# path of the 9.2 set_env.sh sourced before every server launch.
+CANN_ENV_FILE = None
+
+CANN_ENV_FALLBACKS = (
+    "/usr/local/Ascend/cann-9.2/set_env.sh",
+    "/usr/local/Ascend/cann-9.2.0/set_env.sh",
+    "/usr/local/Ascend/ascend-toolkit/latest/set_env.sh",
+)
+
+
+def resolve_cann_env(container, preferred, log):
+    """Pick the first CANN env file that exists INSIDE the container.
+
+    The preferred path may be host-only (e.g. /home/tbaydasov/... is the host
+    user's tree and the container may not mount it), so it is probed like the
+    fallbacks; the runner logs which one applies so results are attributable.
+    Returns the container path or None (container default CANN stays in
+    effect).
+    """
+    global CANN_ENV_FILE
+    candidates = ([preferred] if preferred else []) + list(CANN_ENV_FALLBACKS)
+    for candidate in candidates:
+        result = run_capture(container, f"test -f '{candidate}' && echo yes",
+                             timeout=30)
+        if result.stdout.strip() == "yes":
+            CANN_ENV_FILE = candidate
+            log(f"    CANN env: sourcing {candidate} (9.2 for the "
+                f"npu_sparse_flash_attention_lse op)")
+            return candidate
+    CANN_ENV_FILE = None
+    log("    CANN env: no 9.2 env file found in the container "
+        f"(tried {', '.join(candidates)}); the container default CANN "
+        "stays in effect -- case 04 will fail on the missing op")
+    return None
+
+
+def cann_env_source():
+    return f". '{CANN_ENV_FILE}' 2>/dev/null || echo 'prtest: WARNING could not source {CANN_ENV_FILE}'; " if CANN_ENV_FILE else ""
 
 
 def git_in_repo(container, repo, *git_args, timeout=600):
@@ -511,9 +557,11 @@ def launch_server(container, repo, env, args, case_dir, log, memfrac=None,
     # when it is already a group leader, $! then records the instantly-reaped
     # parent and pid liveness goes blind (observed on the box: server OOM'd,
     # runner kept printing 'still starting'); nohup execs python directly, so
-    # $! IS the server pid.
+    # $! IS the server pid. The CANN 9.2 env is sourced first so the server
+    # sees the 9.2 toolkit, not the image default 9.1.
     command = (
-        f"cd '{repo}' && export PYTHONPATH=\"{repo}/python:$PYTHONPATH\" && "
+        f"cd '{repo}' && {cann_env_source()}"
+        f"export PYTHONPATH=\"{repo}/python:$PYTHONPATH\" && "
         f"nohup env {env_str} {python} -m sglang.launch_server "
         f"--load-format auto --model-path '{model}' "
         + " ".join(server_args)
@@ -748,6 +796,17 @@ def run_case(case, container, repo, args, case_dir, log, deadline):
             record["smoke"] = "ok"
             log(f"    smoke ok: {text.strip()[:40]!r}")
 
+        # CANN attribution: the server prints its LD_LIBRARY_PATH early; the
+        # 9.2 paths must appear or the case is really on the image default.
+        if CANN_ENV_FILE:
+            hit = run_capture(container,
+                              f"grep -m1 -c 'cann-9.2' '{remote_log}' 2>/dev/null",
+                              timeout=30).stdout.strip()
+            record["cann_9_2_in_server_env"] = bool(hit and hit != "0")
+            if not record["cann_9_2_in_server_env"]:
+                log("    WARNING: server env shows no cann-9.2 paths; "
+                    "it is running on the container default CANN")
+
         if args.round in ("accuracy", "all") and state == "ok":
             accuracy = run_accuracy_prompts(args, case_dir, log)
             record["accuracy"] = accuracy
@@ -889,6 +948,7 @@ def describe_commands(case, container, repo, args):
     name, ref, env, _ = case
     env_str = " ".join(f"{k}={v}" for k, v in {**BASE_ENV, **env}.items())
     return [
+        (f". {args.container_cann_env or '<no CANN 9.2 env>'} (sourced per launch if found in the container)"),
         f"git -c '{args.git_proxy}' -C {repo} fetch --no-tags {args.fetch_url or '<local>'} {ref}",
         f"git -C {repo} checkout -B prtest/current <sha>",
         f"docker exec -d {container} bash -c \"cd {repo} && export PYTHONPATH={repo}/python:$PYTHONPATH && "
@@ -923,6 +983,12 @@ def main():
     parser.add_argument("--git-proxy",
                         default="url.https://ghfast.top/https://github.com/.insteadOf=https://github.com/",
                         help="git -c insteadOf rewrite for reaching GitHub from the box ('' = direct)")
+    parser.add_argument("--container-cann-env",
+                        default="/home/tbaydasov/Ascend/cann-9.2/set_env.sh",
+                        help="CANN 9.2 set_env.sh to source before each server "
+                             "launch (probed inside the container, with "
+                             "/usr/local/Ascend/cann-9.2 fallbacks; '' = keep "
+                             "the image default CANN)")
     parser.add_argument("--no-fetch", action="store_true", help="use local refs only")
     parser.add_argument("--ais-dir", default=AIS_DIR_DEFAULT)
     parser.add_argument("--ais-env", default=None)
@@ -959,12 +1025,16 @@ def main():
     cases = apply_overrides(plan_cases(args), args.flags_overrides)
 
     if args.dry_run:
+        # No container access here: report what WOULD be sourced and stop.
         print(f"DRY RUN round={args.round} cases={len(cases)} budget={args.hours}h")
+        print(f"CANN 9.2 env candidate: {args.container_cann_env or '<none>'} "
+              f"(+ /usr/local/Ascend fallbacks, probed on the box)")
         for case in cases:
             print(f"\n== {case[0]} -> {case[1]}  ({case[3]})")
             for line in describe_commands(case, args.container, args.repo, args):
                 print(f"   {line}")
         return 0
+    resolve_cann_env(args.container, args.container_cann_env, print)
 
     if args.stop_only:
         run_capture(args.container, "pkill -TERM -f sglang.launch_server || true")
