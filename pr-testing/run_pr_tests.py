@@ -75,7 +75,11 @@ source "$1"
 # at /home/tbaydasov/aisbench/benchmark). set_env.sh usually activates it,
 # but this makes the env choice explicit and overridable.
 conda activate "$AIS_CONDA_ENV" 2>/dev/null || echo "prtest: WARNING conda activate $AIS_CONDA_ENV failed"
-echo "prtest: aisbench python=$(command -v python3) ais_bench=$(command -v ais_bench || echo MISSING)"
+# Fail FAST when the toolchain is absent: dataset generation costs ~7.5 min
+# of CPU before the first request, and a missing ais_bench kills the run
+# right after it (the 20261112-220328 shape). Exit 78 = missing prerequisite.
+command -v ais_bench >/dev/null || { echo "prtest FATAL: ais_bench not on PATH after conda activate $AIS_CONDA_ENV (python=$(command -v python3))"; exit 78; }
+echo "prtest: aisbench python=$(command -v python3) ais_bench=$(command -v ais_bench)"
 cd "$2"
 unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy
 export NO_PROXY=localhost,127.0.0.1,::1
@@ -873,18 +877,19 @@ def run_case(case, container, repo, args, case_dir, log, deadline):
                 if log_path.exists() else "")
         oom = "OutOfMemoryError" in text or "NPU out of memory" in text
         graph_oom = oom and "cuda-graph-max-bs-decode" in text
-        if attempt == 1 and (oom or "Received sigquit" in text):
-            if graph_oom:
-                decode_graph = False
-                record["graph_retry"] = "decode-graph disabled"
-                log("    decode-graph capture OOM'd; retrying once with the "
-                    "decode graph disabled (recorded deviation)")
-                continue
-            if oom and memfrac - args.memfrac_step >= 0.55:
-                memfrac = round(memfrac - args.memfrac_step, 3)
-                record["memfrac_retry"] = memfrac
-                log(f"    server OOM'd; retrying once with memfrac {memfrac}")
-                continue
+        # Retry only when there is an actionable change; a plain crash with
+        # the same settings would just reproduce (and burn another ~10 min).
+        if attempt == 1 and graph_oom:
+            decode_graph = False
+            record["graph_retry"] = "decode-graph disabled"
+            log("    decode-graph capture OOM'd; retrying once with the "
+                "decode graph disabled (recorded deviation)")
+            continue
+        if attempt == 1 and oom and memfrac - args.memfrac_step >= 0.55:
+            memfrac = round(memfrac - args.memfrac_step, 3)
+            record["memfrac_retry"] = memfrac
+            log(f"    server OOM'd; retrying once with memfrac {memfrac}")
+            continue
         record.update(status="failed",
                       reason=f"server {state}" + (" (OOM)" if oom else ""))
         return record
@@ -1009,9 +1014,16 @@ def run_accuracy_prompts(args, case_dir, log, case_name):
     out = {"requests": len(prompts), "errors": errors,
            "outputs": results, "sha": digest, "match_vs_baseline": match}
     if args.gsm8k:
-        rows = load_gsm8k(args.gsm8k, args.gsm8k_samples, args.gsm8k_seed)
-        log(f"    gsm8k: {len(rows)} samples")
-        out["gsm8k"] = run_gsm8k(rows, log)
+        # A missing/broken gsm8k file must not sink the accuracy results that
+        # were already computed -- log and continue.
+        try:
+            rows = load_gsm8k(args.gsm8k, args.gsm8k_samples, args.gsm8k_seed)
+            log(f"    gsm8k: {len(rows)} samples")
+            out["gsm8k"] = run_gsm8k(rows, log)
+        except Exception as exc:  # noqa: BLE001 - gsm8k is optional
+            log(f"    WARNING: gsm8k round failed ({exc}); accuracy results "
+                "are kept")
+            out["gsm8k_error"] = str(exc)[:200]
     save(case_dir / "accuracy.json", out)
     return {"sha": digest, "errors": errors,
             "gsm8k": out.get("gsm8k", {}).get("accuracy")}
@@ -1187,18 +1199,23 @@ def main():
             for line in describe_commands(case, args.container, args.repo, args):
                 print(f"   {line}")
         return 0
-    resolve_cann_env(args.container, args.container_cann_env, print)
-    ais_preflight(args, log=print)
-
     if args.stop_only:
-        run_capture(args.container, "pkill -TERM -f sglang.launch_server || true")
+        # The bracket pattern: pkill -f matches its own bash -c wrapper's
+        # cmdline otherwise (same reason SERVER_PATTERN has it).
+        run_capture(args.container,
+                    f"pkill -TERM -f '{SERVER_PATTERN}' || true", timeout=30)
         for _ in range(45):
-            if not health_ok():
+            if not server_process_exists(container):
                 break
             time.sleep(1)
-        run_capture(args.container, "pkill -KILL -f sglang.launch_server || true")
-        print("stopped; port free" if not health_ok() else "PORT STILL BUSY")
+        run_capture(args.container,
+                    f"pkill -KILL -f '{SERVER_PATTERN}' || true", timeout=30)
+        print("stopped; port free" if not server_process_exists(args.container)
+              else "SERVER PROCESS STILL ALIVE")
         return 0
+
+    resolve_cann_env(args.container, args.container_cann_env, print)
+    ais_preflight(args, log=print)
 
     require_free_port()
     lock = open("/tmp/prtest.lock", "w")  # noqa: SIM115 - held for the driver lifetime
@@ -1236,7 +1253,13 @@ def main():
         def case_log(message):
             log("  " + message)
 
-        record = run_case(case, args.container, args.repo, args, case_dir, case_log, deadline)
+        try:
+            record = run_case(case, args.container, args.repo, args, case_dir,
+                              case_log, deadline)
+        except Exception as exc:  # noqa: BLE001 - one broken case must not kill the sweep
+            log(f"    CASE CRASHED: {type(exc).__name__}: {exc}")
+            record = {"case": name, "ref": ref, "status": "failed",
+                      "reason": f"{type(exc).__name__}: {exc}"[:300]}
         records.append(record)
         save(output / "results.json", records)
         summarize(records, output, args)
