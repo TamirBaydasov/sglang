@@ -431,8 +431,13 @@ def parse_ttft_lines(text):
 
 
 def run_aisbench(ais_dir, ais_env, args, log_path):
+    # bash -c 'script' X Y Z ... assigns $0=X, $1=Y ... -- the script sources
+    # "$1" and cds "$2", so a placeholder must come first. Without it the
+    # runner sourced the AIS *directory* ('...: is a directory', set -e exit)
+    # -- the instant AIS death of runs 20261112-205244/212404/214138.
     command = [
         "bash", "-c", AIS_SHELL,
+        "prtest-ais",
         ais_env, ais_dir,
         "--input_len", str(args.length),
         "--output_len", "1",
@@ -835,8 +840,10 @@ def run_case(case, container, repo, args, case_dir, log, deadline):
                 "npu_sparse_flash_attention_lse op will be missing)")
 
         if args.round in ("accuracy", "all") and state == "ok":
-            accuracy = run_accuracy_prompts(args, case_dir, log)
+            acc_started = time.time()
+            accuracy = run_accuracy_prompts(args, case_dir, log, name)
             record["accuracy"] = accuracy
+            log(f"    accuracy round done in {int(time.time() - acc_started)}s")
 
         if args.round in ("speed", "all") and state == "ok":
             flush_cache(log)
@@ -849,9 +856,10 @@ def run_case(case, container, repo, args, case_dir, log, deadline):
             if metrics:
                 record["metrics"] = metrics[-1]
                 record["metrics_all"] = metrics
-                ttft = metrics[-1].get("TTFT avg")
-                p90 = metrics[-1].get("TTFT P90")
-                log(f"    TTFT mean {ttft} ms / P90 {p90} ms")
+                m = metrics[-1]
+                log(f"    TTFT mean {m.get('TTFT avg')} ms / P90 {m.get('TTFT P90')} ms "
+                    f"| E2E {m.get('E2E_time')} s | qps {m.get('qps')} | "
+                    f"prefill {m.get('prefill_token_throughput')} tok/s")
             else:
                 record["status"] = "failed"
                 record["reason"] = (f"no TTFT metrics parsed from ais.log "
@@ -873,7 +881,13 @@ def run_case(case, container, repo, args, case_dir, log, deadline):
     return record
 
 
-def run_accuracy_prompts(args, case_dir, log):
+# In-process baseline accuracy digest: set when case 00 finishes, so every
+# later case can log its exact-output match vs baseline right away (the
+# SUMMARY.md comparison still happens at the end).
+_BASELINE_ACCURACY = None
+
+
+def run_accuracy_prompts(args, case_dir, log, case_name):
     prompts = build_accuracy_prompts(args.accuracy_requests, args.accuracy_long_tokens)
     log(f"    accuracy: {len(prompts)} greedy requests "
         f"(incl. 2 x {args.accuracy_long_tokens}-tok long)")
@@ -897,8 +911,18 @@ def run_accuracy_prompts(args, case_dir, log):
 
     digest = {tag: hashlib.sha256(t.encode()).hexdigest()[:12]
               for tag, t in results.items()}
+    match = None
+    global _BASELINE_ACCURACY
+    if case_name == "00-baseline":
+        _BASELINE_ACCURACY = digest
+    elif _BASELINE_ACCURACY:
+        shared = set(digest) & set(_BASELINE_ACCURACY)
+        same = sum(digest[t] == _BASELINE_ACCURACY[t] for t in shared)
+        match = {"matched": same, "of": len(shared)}
+        log(f"    accuracy match vs baseline: {same}/{len(shared)} "
+            f"({same / max(len(shared), 1):.1%} exact)")
     out = {"requests": len(prompts), "errors": errors,
-           "outputs": results, "sha": digest}
+           "outputs": results, "sha": digest, "match_vs_baseline": match}
     if args.gsm8k:
         rows = load_gsm8k(args.gsm8k, args.gsm8k_samples, args.gsm8k_seed)
         log(f"    gsm8k: {len(rows)} samples")
