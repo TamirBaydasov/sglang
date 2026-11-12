@@ -709,10 +709,67 @@ def stop_server(container, remote_log, case_dir, log):
         time.sleep(1)
     run_capture(container, f"pkill -KILL -f '{SERVER_PATTERN}' 2>/dev/null", timeout=30)
     time.sleep(2)
+    # Remove the pid file so the next case's wait_health cannot read a stale
+    # pid (run 20261112-220328 printed the previous run's pid before the new
+    # launch's echo landed; harmless via adoption, but confusing).
+    run_capture(container, f"rm -f '{pid_file}'", timeout=30)
     ok = not server_process_exists(container)
     if not ok:
         log("    STOP: a launch_server process survived cleanup")
     return ok
+
+
+def ais_preflight(args, log):
+    """Run the profile_aisbench.sh preflight ONCE before the case loop.
+
+    aisbench_test.py needs: the tool file in its dir, the ais_bench binary on
+    the conda env's PATH, and a config.py pointing at THIS server. Any of
+    these missing wastes ~9 min per case (dataset generation) before dying --
+    exactly what run 20261112-220328 did on case 00. Runs host-side: AIS is a
+    host-side tool (the box recipe runs it outside docker).
+    """
+    script = (
+        f". '{args.ais_env}' >/dev/null 2>&1 || echo ENV_FAIL; "
+        f"cd '{args.ais_dir}' || {{ echo DIR_FAIL; exit 0; }}; "
+        "echo TOOL=$(test -f aisbench_test.py && echo ok || echo MISSING); "
+        "echo BENCH_PATH=$(command -v ais_bench || echo MISSING); "
+        "python3 - <<'PY' 2>/dev/null || echo CFG_FAIL\n"
+        "import runpy\n"
+        "c = runpy.run_path('config.py')\n"
+        "print('CFG_PORT', c.get('HOST_PORT'), 'CFG_IP', c.get('HOST_IP'))\n"
+        "print('CFG_MODEL', c.get('MODEL_PATH'))\n"
+        "print('CFG_WORK', c.get('WORK_PATH'))\n"
+        "PY"
+    )
+    try:
+        result = subprocess.run(["bash", "-c", script], capture_output=True,
+                                text=True, timeout=180)
+    except Exception as exc:  # noqa: BLE001 - preflight must never crash the run
+        log(f"    ais-preflight failed to run: {exc}")
+        return
+    out = result.stdout or ""
+    for line in out.splitlines():
+        log(f"    ais-preflight| {line.strip()[:170]}")
+    if "ENV_FAIL" in out:
+        log("    WARNING: sourcing the AIS env file failed -- aisbench_test "
+            "may run with the wrong python")
+    if "TOOL=MISSING" in out or "DIR_FAIL" in out:
+        log("    WARNING: aisbench_test.py not found in the AIS dir -- "
+            "every AISBench case will fail")
+    if "BENCH_PATH=MISSING" in out:
+        log("    WARNING: ais_bench binary NOT on PATH -- every AISBench "
+            "case will fail after dataset generation (the 20261112-220328 "
+            "failure shape)")
+    for line in out.splitlines():
+        if line.startswith("CFG_PORT"):
+            try:
+                port = str(line.split()[1])
+            except (IndexError, ValueError):
+                continue
+            if port != str(SERVER_PORT):
+                log(f"    WARNING: config.py sends requests to port {port} "
+                    f"but the server runs on {SERVER_PORT} -- the benchmark "
+                    "will hit nothing")
 
 
 def require_free_port():
@@ -864,12 +921,24 @@ def run_case(case, container, repo, args, case_dir, log, deadline):
                 record["status"] = "failed"
                 record["reason"] = (f"no TTFT metrics parsed from ais.log "
                                     f"(rc={code})")
-                # The 20261112-205244 run's AIS invocations died instantly
-                # (server stopped 1s after launch) with the reason buried in
-                # ais.log -- print its tail so the cause is on the console.
+                # The tool runs the dataset generation (~7 min of CPU
+                # tokenization) before anything else, so a failure here is
+                # inside the aisbench toolchain, not the server. Print the
+                # error-shaped lines from the WHOLE log plus a longer tail.
+                err_lines = [
+                    f"{i + 1}: {line.strip()[:170]}"
+                    for i, line in enumerate((ais_text or "").splitlines())
+                    if re.search(r"Traceback|Error|ERROR|Exception|No module|"
+                                 r"command not found|not found|denied|"
+                                 r"Fail|FAIL|Killed|is a directory", line)
+                ]
+                if err_lines:
+                    log(f"    ais error-shaped lines ({len(err_lines)}):")
+                    for line in err_lines[:12]:
+                        log("    ais| " + line)
                 tail = [l for l in (ais_text or "").splitlines() if l.strip()]
-                for line in tail[-8:]:
-                    log("    ais| " + line[:180])
+                for line in tail[-25:]:
+                    log("    ais-tail| " + line[:170])
     except Exception as exc:  # noqa: BLE001 - keep the server-stop path alive
         record.update(status="failed", reason=f"{type(exc).__name__}: {exc}")
     finally:
@@ -1099,6 +1168,7 @@ def main():
                 print(f"   {line}")
         return 0
     resolve_cann_env(args.container, args.container_cann_env, print)
+    ais_preflight(args, log=print)
 
     if args.stop_only:
         run_capture(args.container, "pkill -TERM -f sglang.launch_server || true")
