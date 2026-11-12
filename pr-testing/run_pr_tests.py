@@ -70,6 +70,12 @@ if ! declare -F conda >/dev/null; then
     fi
 fi
 source "$1"
+# Pin the tool env explicitly: the box runs aisbench from tbay_sglang
+# (/home/miniconda3/envs/tbay_sglang, ais_bench_benchmark installed editable
+# at /home/tbaydasov/aisbench/benchmark). set_env.sh usually activates it,
+# but this makes the env choice explicit and overridable.
+conda activate "$AIS_CONDA_ENV" 2>/dev/null || echo "prtest: WARNING conda activate $AIS_CONDA_ENV failed"
+echo "prtest: aisbench python=$(command -v python3) ais_bench=$(command -v ais_bench || echo MISSING)"
 cd "$2"
 unset HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy
 export NO_PROXY=localhost,127.0.0.1,::1
@@ -450,6 +456,7 @@ def run_aisbench(ais_dir, ais_env, args, log_path):
         "--concurrency", str(args.requests),
     ]
     env = dict(os.environ)
+    env["AIS_CONDA_ENV"] = args.ais_conda_env
     env["NO_PROXY"] = env["no_proxy"] = "localhost,127.0.0.1,::1"
     with open(log_path, "w") as log:
         process = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
@@ -733,6 +740,10 @@ def ais_preflight(args, log):
         f"cd '{args.ais_dir}' || {{ echo DIR_FAIL; exit 0; }}; "
         "echo TOOL=$(test -f aisbench_test.py && echo ok || echo MISSING); "
         "echo BENCH_PATH=$(command -v ais_bench || echo MISSING); "
+        "source /home/miniconda3/etc/profile.d/conda.sh 2>/dev/null && "
+        "conda activate tbay_sglang 2>/dev/null && "
+        "echo BENCH_TBAY=$(command -v ais_bench || echo MISSING) "
+        "|| echo BENCH_TBAY=CONDA_FAIL; "
         "python3 - <<'PY' 2>/dev/null || echo CFG_FAIL\n"
         "import runpy\n"
         "c = runpy.run_path('config.py')\n"
@@ -756,6 +767,11 @@ def ais_preflight(args, log):
     if "TOOL=MISSING" in out or "DIR_FAIL" in out:
         log("    WARNING: aisbench_test.py not found in the AIS dir -- "
             "every AISBench case will fail")
+    if "BENCH_TBAY=MISSING" in out:
+        log("    WARNING: ais_bench NOT in the tbay_sglang conda env -- "
+            "activate it or pip install ais-bench-benchmark there")
+    if "BENCH_TBAY=CONDA_FAIL" in out:
+        log("    NOTE: could not activate tbay_sglang for the preflight check")
     if "BENCH_PATH=MISSING" in out:
         log("    WARNING: ais_bench binary NOT on PATH -- every AISBench "
             "case will fail after dataset generation (the 20261112-220328 "
@@ -1125,6 +1141,10 @@ def main():
     parser.add_argument("--no-fetch", action="store_true", help="use local refs only")
     parser.add_argument("--ais-dir", default=AIS_DIR_DEFAULT)
     parser.add_argument("--ais-env", default=None)
+    parser.add_argument("--ais-conda-env", default="tbay_sglang",
+                        help="conda env aisbench runs in (tbay_sglang per the "
+                             "box convention; the AIS_SHELL activates it after "
+                             "sourcing the env file)")
     parser.add_argument("--gsm8k", default=None, help="path to gsm8k test jsonl (enables subset)")
     parser.add_argument("--gsm8k-samples", type=int, default=200)
     parser.add_argument("--gsm8k-seed", type=int, default=4)
