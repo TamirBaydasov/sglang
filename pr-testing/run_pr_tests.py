@@ -232,7 +232,11 @@ def build_accuracy_prompts(total, long_tokens):
     (same body, different tails, so the second request rides the cached
     prefix). Outputs are SHA-compared per tag against the baseline case.
     """
-    prompts = [(f"fixed-{i}", p) for i, p in enumerate(ACCURACY_PROMPTS)]
+    # ACCURACY_PROMPTS entries are (tag, prompt) pairs; take the prompt, not
+    # the pair. (The tuple-as-prompt bug sent JSON lists to /generate, which
+    # answered in batch mode with a list -- run 20261112-212404, exactly the
+    # 8 fixed prompts erroring 'list' object has no attribute get.)
+    prompts = [(f"fixed-{i}", prompt) for i, (_, prompt) in enumerate(ACCURACY_PROMPTS)]
     i = 0
     while len(prompts) < total - 2:
         tpl = ACCURACY_TEMPLATES[i % len(ACCURACY_TEMPLATES)]
@@ -324,11 +328,16 @@ def flush_cache(log=None):
 
 
 def generate(text, max_new_tokens=64):
+    if not isinstance(text, str):
+        # sglang batch-mode: a list 'text' returns a list of generations.
+        raise TypeError(f"generate() needs a str prompt, got {type(text).__name__}")
     data = http(
         "/generate",
         {"text": text, "sampling_params": {"temperature": 0, "max_new_tokens": max_new_tokens}},
         timeout=7200,
     )
+    if isinstance(data, list):
+        raise TypeError("/generate returned a list -- the prompt was not a plain str")
     return data.get("text", ""), data.get("meta_info", {})
 
 
