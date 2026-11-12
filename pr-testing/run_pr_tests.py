@@ -267,19 +267,29 @@ def now():
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def http(path, payload=None, timeout=10):
+def http_raw(path, payload=None, timeout=10):
     request = urllib.request.Request(
         f"http://127.0.0.1:{SERVER_PORT}" + path,
         data=json.dumps(payload).encode() if payload is not None else None,
         headers={"Content-Type": "application/json"},
     )
     with _OPENER.open(request, timeout=timeout) as response:
-        return json.loads(response.read())
+        return response.read().decode("utf-8", errors="replace")
+
+
+def http(path, payload=None, timeout=10):
+    body = http_raw(path, payload, timeout)
+    if not body:
+        return None
+    return json.loads(body)
 
 
 def health_ok():
+    # /health answers 200 with a PLAIN-TEXT body; json.loads on it raised and
+    # was swallowed here, so health_ok returned False forever while the server
+    # served 200 OKs (the overnight run burned 8x30min on exactly this).
     try:
-        http("/health", timeout=10)
+        http_raw("/health", timeout=10)
         return True
     except Exception:
         return False
@@ -290,7 +300,7 @@ def flush_cache(log=None):
     cache, so the warm-up really prefills 990k tokens instead of riding a
     previous case's trunk."""
     try:
-        http("/flush_cache?timeout=60", payload={}, timeout=120)
+        http_raw("/flush_cache?timeout=60", payload={}, timeout=120)
         if log:
             log("    prefix cache flushed")
         return True
@@ -465,7 +475,8 @@ def git_in_repo(container, repo, *git_args, timeout=600):
 # --------------------------------------------------------------------------
 # Server lifecycle
 # --------------------------------------------------------------------------
-def launch_server(container, repo, env, args, case_dir, log, memfrac=None):
+def launch_server(container, repo, env, args, case_dir, log, memfrac=None,
+                  decode_graph=True):
     remote_log = f"/tmp/prtest-server-{case_dir.name}.log"
     env_str = " ".join(f"{k}={v}" for k, v in {**BASE_ENV, **env}.items())
     python = args.container_python
@@ -476,6 +487,11 @@ def launch_server(container, repo, env, args, case_dir, log, memfrac=None):
     server_args[server_args.index("--chunked-prefill-size") + 1] = str(args.chunk)
     if args.context:
         server_args[server_args.index("--context-length") + 1] = str(args.context)
+    if not decode_graph:
+        # Recorded fallback for branches whose decode-graph capture OOMs at
+        # the bs-16 pool (observed: the SFA-packed branch at memfrac 0.70).
+        i = server_args.index("--cuda-graph-max-bs-decode")
+        server_args[i:i + 2] = ["--cuda-graph-backend-decode", "disabled"]
     server_args += shlex_split(args.extra_server_args)
     # PYTHONPATH: the box serves the source tree, not a pip install (the
     # archived recipe always sets ROOT/python). Detached exec (-d) + nohup +
@@ -498,24 +514,43 @@ def launch_server(container, repo, env, args, case_dir, log, memfrac=None):
     return remote_log
 
 
+CRASH_SIGNATURES = (
+    "Received sigquit from a child process",
+    "torch.OutOfMemoryError",
+    "NPU out of memory",
+)
+
+
 def wait_health(container, remote_log, case_dir, args, log, deadline):
     started = time.time()
     pid = run_capture(container, f"cat '{remote_log}.pid' 2>/dev/null",
                       timeout=30).stdout.strip() or None
     log(f"    server pid {pid or '?'}; polling /health "
         f"(startup timeout {args.startup_timeout}s)")
+    polls = 0
     while time.time() - started < args.startup_timeout:
         if time.time() > deadline:
             return "time-budget"
         if health_ok():
             log(f"    server healthy after {int(time.time() - started)}s")
             return "ok"
+        # Crash signatures in the log beat pid checks: the launcher announces
+        # a child's death ('Received sigquit...') while workers can linger
+        # briefly. Exit in minutes, not at the 30-min timeout.
+        polls += 1
+        tail = run_capture(container, f"tail -c 2048 '{remote_log}' 2>/dev/null",
+                           timeout=30).stdout
+        hit = next((s for s in CRASH_SIGNATURES if s in tail), None)
+        if hit:
+            log(f"    crash signature in server log: {hit!r}")
+            capture_server_log(container, remote_log, case_dir, log)
+            return "server-crashed"
         if pid and not pid_alive(container, pid):
             # The recorded pid may be a reaped wrapper: adopt the real server
-            # pid if one exists; if none does, the server died -- say so now,
-            # with its log, instead of polling to the startup timeout.
+            # pid if one exists (the [s]glang pattern keeps our own wrapper
+            # out of the match); if none does, the server died.
             adopted = run_capture(container,
-                                  "pgrep -f sglang.launch_server | head -1",
+                                  f"pgrep -f '{SERVER_PATTERN}' | head -1",
                                   timeout=30).stdout.strip()
             if adopted:
                 log(f"    recorded pid {pid} is gone; adopting server pid {adopted}")
@@ -546,9 +581,16 @@ def pid_alive(container, pid):
                        timeout=30).stdout.strip() == "alive"
 
 
+# pgrep/pkill -f pattern: the [s] brackets stop the check from matching its
+# own 'bash -c pgrep -f sglang...' wrapper, whose cmdline contains the literal
+# string (observed on the box: stop_server always reported 'survived cleanup'
+# and the health loop adopted its own wrappers one after another).
+SERVER_PATTERN = "[s]glang.launch_server"
+
+
 def server_process_exists(container):
     return bool(run_capture(
-        container, "pgrep -f sglang.launch_server | head -1", timeout=30
+        container, f"pgrep -f '{SERVER_PATTERN}' | head -1", timeout=30
     ).stdout.strip())
 
 
@@ -571,12 +613,12 @@ def stop_server(container, remote_log, case_dir, log):
                 f"{'alive after SIGKILL' if pid_alive(container, pid) else 'stopped after SIGKILL'}")
     else:
         log("    no pid file; sweeping by pattern")
-    run_capture(container, "pkill -TERM -f sglang.launch_server 2>/dev/null", timeout=30)
+    run_capture(container, f"pkill -TERM -f '{SERVER_PATTERN}' 2>/dev/null", timeout=30)
     for _ in range(20):
         if not server_process_exists(container):
             return True
         time.sleep(1)
-    run_capture(container, "pkill -KILL -f sglang.launch_server 2>/dev/null", timeout=30)
+    run_capture(container, f"pkill -KILL -f '{SERVER_PATTERN}' 2>/dev/null", timeout=30)
     time.sleep(2)
     ok = not server_process_exists(container)
     if not ok:
@@ -649,26 +691,38 @@ def run_case(case, container, repo, args, case_dir, log, deadline):
     log(f"    at {sha[:10]}")
 
     memfrac = args.memfrac
+    decode_graph = True
     state = None
     for attempt in (1, 2):
         remote_log = launch_server(container, repo, env, args, case_dir, log,
-                                   memfrac=memfrac)
+                                   memfrac=memfrac, decode_graph=decode_graph)
         record["server_log"] = remote_log
         state = wait_health(container, remote_log, case_dir, args, log, deadline)
         if state == "ok":
             record["memfrac"] = memfrac
+            record["decode_graph"] = decode_graph
             break
-        stop_server(container, remote_log, case_dir, log)
+        if not stop_server(container, remote_log, case_dir, log):
+            record.update(status="failed", reason=f"server {state}; cleanup failed",
+                          stop_failed=True)
+            return record
         log_path = case_dir / "server.log"
-        oom = (log_path.exists()
-               and "OutOfMemoryError" in log_path.read_text(errors="replace"))
-        if (state == "server-exited-early" and oom and attempt == 1
-                and memfrac - args.memfrac_step >= 0.55):
-            memfrac = round(memfrac - args.memfrac_step, 3)
-            log(f"    server OOM'd at pool init; retrying once with "
-                f"memfrac {memfrac}")
-            record["memfrac_retry"] = memfrac
-            continue
+        text = (log_path.read_text(errors="replace")
+                if log_path.exists() else "")
+        oom = "OutOfMemoryError" in text or "NPU out of memory" in text
+        graph_oom = oom and "cuda-graph-max-bs-decode" in text
+        if attempt == 1 and (oom or "Received sigquit" in text):
+            if graph_oom:
+                decode_graph = False
+                record["graph_retry"] = "decode-graph disabled"
+                log("    decode-graph capture OOM'd; retrying once with the "
+                    "decode graph disabled (recorded deviation)")
+                continue
+            if oom and memfrac - args.memfrac_step >= 0.55:
+                memfrac = round(memfrac - args.memfrac_step, 3)
+                record["memfrac_retry"] = memfrac
+                log(f"    server OOM'd; retrying once with memfrac {memfrac}")
+                continue
         record.update(status="failed",
                       reason=f"server {state}" + (" (OOM)" if oom else ""))
         return record
