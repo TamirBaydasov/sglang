@@ -1205,7 +1205,7 @@ def main():
         run_capture(args.container,
                     f"pkill -TERM -f '{SERVER_PATTERN}' || true", timeout=30)
         for _ in range(45):
-            if not server_process_exists(container):
+            if not server_process_exists(args.container):
                 break
             time.sleep(1)
         run_capture(args.container,
