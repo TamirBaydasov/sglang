@@ -1234,15 +1234,15 @@ def test_selected_cann_environment_failure_prevents_server_exec(tmp_path, script
     assert not marker.exists()
 
 
-def test_ep_default_and_explicit_tp_diagnostic():
+def test_tp_default_and_explicit_ep_control():
     args = args_for("--round", "speed")
     argv = h.server_argv(args, args.memfrac, True, phase="speed")
-    assert argv[argv.index("--moe-a2a-backend") + 1] == "deepep"
-    assert argv[argv.index("--ep-size") + 1] == "16"
-    tp = args_for("--round", "accuracy", "--moe-mode", "tp")
-    argv = h.server_argv(tp, tp.memfrac, True, phase="accuracy")
     assert argv[argv.index("--moe-a2a-backend") + 1] == "none"
     assert argv[argv.index("--ep-size") + 1] == "1"
+    ep = args_for("--round", "accuracy", "--moe-mode", "ep")
+    argv = h.server_argv(ep, ep.memfrac, True, phase="accuracy")
+    assert argv[argv.index("--moe-a2a-backend") + 1] == "deepep"
+    assert argv[argv.index("--ep-size") + 1] == "16"
     mega = next(case for case in h.CASES if case[0] == "09-pr1-megamoe")
     argv = h.server_argv(args, args.memfrac, True, mega[4], phase="speed")
     assert argv.count("--moe-a2a-backend") == 1
@@ -1255,16 +1255,17 @@ def test_overnight_budget_brackets_and_isolated_diagnostics(capsys):
     assert args.hours == 12
     assert cases[0][0] == "00-baseline"
     assert cases[-1][0] == "08-baseline-repeat"
-    assert sum(h.case_settings(args, case[0]).case_minutes for case in cases) == 675
-    assert len(cases) == 13
+    assert sum(h.case_settings(args, case[0]).case_minutes for case in cases) == 650
+    assert len(cases) == 12
     h.dry_run(args, cases)
     output = capsys.readouterr().out
     for name, _, env, _, case_args in cases:
         effective = h.case_settings(args, name)
-        if "tp-" in name:
-            assert effective.round == "accuracy"
-            assert effective.gsm8k_samples == 8
-            assert effective.case_minutes == 15
+        if name != "10-ep-p4-eager":
+            assert effective.round == "all"
+            assert effective.gsm8k_samples == 64
+            assert effective.case_minutes == 55
+            assert effective.gsm8k_min_accuracy == 0.90
         if name == "10-ep-p4-eager":
             assert effective.round == "accuracy"
             assert effective.chunk == -1
@@ -1286,7 +1287,7 @@ def test_overnight_budget_brackets_and_isolated_diagnostics(capsys):
         "speed: fresh server"
         not in output.split("== 10-ep-p4-eager")[1].split("== 08-baseline-repeat")[0]
     )
-    assert "8 samples in file order, parallel=16" in output
+    assert "8 samples in file order" not in output
     assert "64 samples in file order, parallel=64" in output
 
 
@@ -1294,7 +1295,7 @@ def test_overnight_budget_brackets_and_isolated_diagnostics(capsys):
     "extra",
     [
         ["--round", "accuracy"],
-        ["--moe-mode", "tp"],
+        ["--moe-mode", "ep"],
         ["--cases", "00-baseline"],
         ["--hours", "13"],
     ],
@@ -1316,3 +1317,65 @@ def test_tp_fix_is_an_explicit_accuracy_only_case():
     assert argv[argv.index("--moe-a2a-backend") + 1] == "none"
     assert "13-tp-bias-fix" not in [case[0] for case in h.plan_cases(args_for())]
     assert "13-tp-bias-fix" not in h.OVERNIGHT12_ORDER
+
+
+def test_baseline_override_covers_both_brackets_and_ep_controls():
+    args = args_for("--suite", "overnight12", "--baseline-ref", "npu-w4a8-tp-bias-fix")
+    cases = h.plan_cases(args)
+    controls = {"00-baseline", "08-baseline-repeat", "10-ep-p4-eager", "14-baseline-ep"}
+    for name, ref, _, note, _ in cases:
+        if name in controls:
+            assert ref == "npu-w4a8-tp-bias-fix"
+            assert "dcp_ascend_testing execution ref" in note
+    pins = []
+
+    def fake_git(args, *argv, **kwargs):
+        if argv[0] == "rev-parse":
+            pins.append(argv[-1])
+            return "a" * 40
+        return ""
+
+    from unittest.mock import patch
+
+    with patch.object(h, "git", fake_git):
+        h.pin_refs(cases, args, time.monotonic() + 10, lambda record: None)
+    assert len(pins) == len({case[1] for case in cases})
+    with pytest.raises(ValueError):
+        args_for("--baseline-ref=--bad")
+
+
+@pytest.mark.parametrize(
+    "case,backend", [("14-baseline-ep", "deepep"), ("09-pr1-megamoe", "ascend_fuseep")]
+)
+def test_backend_comparison_only_relaxes_declared_moe_variables(case, backend):
+    base = {
+        "memfrac": 0.7,
+        "model_files_sha256": {"config": "abc"},
+        "versions": {"torch": "x"},
+        "resolved_server": {
+            "moe_a2a_backend": "none",
+            "ep_size": 1,
+            "deepep_mode": "auto",
+            "fuseep_mode": 1,
+            "dtype": "bfloat16",
+            "context_length": 1024000,
+            "max_running_requests": 16,
+            "cuda_graph_backend_decode": "full",
+        },
+    }
+    variant = json.loads(json.dumps(base))
+    variant["resolved_server"].update(
+        moe_a2a_backend=backend, ep_size=16, fuseep_mode=3
+    )
+    assert h.backend_comparison_matches(case, variant, base)
+    assert not h.backend_comparison_matches("01-pr-e-chat-encode", variant, base)
+    for key, value in (
+        ("max_running_requests", 1),
+        ("dtype", "float16"),
+        ("cuda_graph_backend_decode", "disabled"),
+    ):
+        changed = json.loads(json.dumps(variant))
+        changed["resolved_server"][key] = value
+        assert not h.backend_comparison_matches(case, changed, base)
+    changed = dict(variant, memfrac=0.76)
+    assert not h.backend_comparison_matches(case, changed, base)

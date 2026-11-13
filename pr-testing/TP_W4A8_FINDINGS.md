@@ -77,3 +77,30 @@ CPU regressions exercise production allocation, rank slicing, and post-load
 bias reduction for TP1/2/4/8/16, checking that rank sums reconstruct the original
 compensation. This proves the loading defect; the A3 run must still establish
 whether it explains the observed 0/64 score.
+
+
+## A3 validation and full TP sweep
+
+User A3 log: case `13-tp-bias-fix` at `aa32b34a4aec` completed 64 GSM8K
+questions, 61 correct, zero errors, zero truncated responses and zero invalid
+answers. This validates recovery for that standalone TP16/DCP16/EP1 configuration,
+not yet for every feature branch or for 1M-token performance.
+
+The identical serving fix and CPU regression were propagated to:
+
+| Branch | Published head |
+|---|---|
+| npu-chat-encode-pool | d31e874e90 |
+| npu-dsa-indexer-int8 | c38d49cd45 |
+| npu-dcp-packed-read | 20a33dd934 |
+| npu-sfa-kv-8bit | f5d68a49d9 |
+| npu-dsa-cp-token-sharded | 3bd7c00de0 |
+| npu-dsa-cp-moe-int8 | 90166d624c |
+| npu-bde-combined | 0945595c91 |
+
+Protected baseline integration is tracked in
+[PR #8](https://github.com/TamirBaydasov/sglang/pull/8), pending required review.
+The launch script explicitly selects the validated baseline child ref until
+that PR merges. MegaMoE stays at its existing branch head. The new full suite
+uses TP defaults, one matching DeepEP accuracy/speed control and one P4 DeepEP
+accuracy control, with both TP baseline brackets fixed to one SHA per run.

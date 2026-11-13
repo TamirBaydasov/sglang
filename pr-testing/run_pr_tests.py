@@ -63,7 +63,7 @@ AIS_ENV_CANDIDATES = ("/home/tbaydasov/set_env.sh", "/home/tbaydasovset_env.sh")
 AIS_DIR_DEFAULT = "/home/tbaydasov/aisbench/aisbench_auto_tools_prefix"
 FORK_URL_DEFAULT = "https://github.com/TamirBaydasov/sglang.git"
 
-# DeepEP EP16 controls; inherit no unrecorded feature toggles.
+# Validated TP controls; inherit no unrecorded feature toggles.
 BASE_ENV = {
     # Reference ENV verbatim (test_pr1_megamoe_accuracy.py). DSA token-shard
     # and indexer query sharding are EXPLICIT here: the reference does not
@@ -88,7 +88,7 @@ BASE_ENV = {
 }
 
 SERVER_PORT = 30000
-# EP controls and PR variants share this recipe; case overrides are recorded.
+# TP controls and PR variants share this recipe; EP overrides are recorded.
 BASE_SERVER_ARGS = [
     "--device",
     "npu",
@@ -103,9 +103,9 @@ BASE_SERVER_ARGS = [
     "sglang",
     "--disable-shared-experts-fusion",
     "--ep-size",
-    "16",
+    "1",
     "--moe-a2a-backend",
-    "deepep",
+    "none",
     "--deepep-mode",
     "auto",
     "--tp-size",
@@ -293,7 +293,7 @@ CASES.extend(
             "dcp_ascend_testing",
             {},
             "P4 DeepEP accuracy: eager, no chunking, 64 active requests",
-            (),
+            ("--ep-size", "16", "--moe-a2a-backend", "deepep"),
         ),
         (
             "11-tp-graph-diagnostic",
@@ -316,16 +316,22 @@ CASES.extend(
             "W4A8 TP compensation fix: 64-question accuracy gate",
             ("--ep-size", "1", "--moe-a2a-backend", "none"),
         ),
+        (
+            "14-baseline-ep",
+            "dcp_ascend_testing",
+            {},
+            "DeepEP EP16 control against TP and MegaMoE; same workload and graphs",
+            ("--ep-size", "16", "--moe-a2a-backend", "deepep"),
+        ),
     ]
 )
 
 OVERNIGHT12_ORDER = [
     "00-baseline",
+    "14-baseline-ep",
     "09-pr1-megamoe",
     *[case[0] for case in CASES[1:8]],
     "10-ep-p4-eager",
-    "11-tp-graph-diagnostic",
-    "12-tp-eager-diagnostic",
     "08-baseline-repeat",
 ]
 
@@ -349,9 +355,11 @@ def case_settings(args, name):
         result.gsm8k_samples = min(args.gsm8k_samples, 8)
         result.gsm_rows = getattr(args, "gsm_rows", [])[: result.gsm8k_samples]
     if args.suite == "overnight12":
-        cap = 45 if name == "10-ep-p4-eager" else 15 if "tp-" in name else 60
+        cap = 45 if name == "10-ep-p4-eager" else 55
         result.case_minutes = min(args.case_minutes, cap)
         result.retry_oom = False
+        if result.gsm8k_min_accuracy is None:
+            result.gsm8k_min_accuracy = 0.90
     return result
 
 
@@ -2003,6 +2011,37 @@ def markdown(value):
     return str(value).replace("|", "\\|").replace("\n", " ")[:500]
 
 
+def backend_comparison_matches(case, candidate, baseline):
+    expected = {"14-baseline-ep": "deepep", "09-pr1-megamoe": "ascend_fuseep"}
+    if case not in expected or not candidate or not baseline:
+        return False
+    left = candidate.get("resolved_server", {})
+    right = baseline.get("resolved_server", {})
+    if (
+        left.get("moe_a2a_backend") != expected[case]
+        or left.get("ep_size") != 16
+        or right.get("moe_a2a_backend") != "none"
+        or right.get("ep_size") != 1
+    ):
+        return False
+    if case == "09-pr1-megamoe" and left.get("fuseep_mode") != 3:
+        return False
+    # Backend and expert partition are the declared experimental variables.
+    ignored = {"moe_a2a_backend", "ep_size", "deepep_mode", "fuseep_mode"}
+
+    def normalize(config):
+        return dict(
+            config,
+            resolved_server={
+                key: value
+                for key, value in config["resolved_server"].items()
+                if key not in ignored
+            },
+        )
+
+    return normalize(candidate) == normalize(baseline)
+
+
 def summarize(records, output, args):
     base = next((r for r in records if r["case"] == "00-baseline"), {})
     base_speed, base_attempt = speed_data(base)
@@ -2014,6 +2053,7 @@ def summarize(records, output, args):
         "",
         "TTFT uses milliseconds in JSON and seconds below. Ratios are single-run diagnostic samples.",
         "GSM8K quality and performance status are independent; unresolved quality does not stop timing collection.",
+        f"Opening baseline execution ref: {base.get('ref', 'unavailable')}; commit: {base.get('commit', 'unavailable')}.",
         "Current GSM8K runs use the reference raw-completion five-shot protocol and legacy-last-integer-v1 scorer; historical reports retain their original provenance.",
         "",
         "| Case | Status | GSM8K correct/total | Quality | TTFT mean/P90 (s) | Baseline/variant mean | Reason |",
@@ -2039,18 +2079,28 @@ def summarize(records, output, args):
             else "unavailable"
         )
         ratio = "unavailable"
+        backend_comparison = backend_comparison_matches(
+            record["case"],
+            attempt.get("comparison_config"),
+            base_attempt.get("comparison_config"),
+        )
         if record is base and metrics:
             ratio = "reference"
         elif (
             metrics
             and base_metrics
             and attempt.get("comparison_config") is not None
-            and attempt.get("comparison_config")
-            == base_attempt.get("comparison_config")
+            and (
+                attempt.get("comparison_config")
+                == base_attempt.get("comparison_config")
+                or backend_comparison
+            )
         ):
             ratio = (
                 f"{float(base_metrics['TTFT avg']) / float(metrics['TTFT avg']):.3f}x"
             )
+            if backend_comparison:
+                ratio += " (backend comparison; single run)"
             if quality(base) not in ("threshold met",) or quality(record) not in (
                 "threshold met",
             ):
@@ -2259,17 +2309,7 @@ def plan_cases(args):
     if args.suite == "overnight12":
         wanted = OVERNIGHT12_ORDER
     elif not args.cases:
-        wanted = [
-            case[0]
-            for case in CASES
-            if case[0]
-            not in (
-                "10-ep-p4-eager",
-                "11-tp-graph-diagnostic",
-                "12-tp-eager-diagnostic",
-                "13-tp-bias-fix",
-            )
-        ]
+        wanted = [name for name in OVERNIGHT12_ORDER if name != "10-ep-p4-eager"]
     table = {case[0]: case for case in CASES}
     cases = [table[name] for name in wanted]
     if args.skip_baseline_bracket:
@@ -2278,6 +2318,23 @@ def plan_cases(args):
         cases = [CASES[0]]
     if not cases:
         raise ValueError("no cases selected")
+    cases = [
+        (
+            name,
+            args.baseline_ref,
+            env,
+            note
+            + (
+                "; dcp_ascend_testing execution ref: " + args.baseline_ref
+                if args.baseline_ref != "dcp_ascend_testing"
+                else ""
+            ),
+            extra,
+        )
+        if ref == "dcp_ascend_testing"
+        else (name, ref, env, note, extra)
+        for name, ref, env, note, extra in cases
+    ]
     # Normalize to 5-tuples: (name, ref, env, note, extra_server_args). Older
     # 4-tuples get an empty extra-args tail so all consumers see one shape.
     cases = [tuple(case) if len(case) == 5 else (*case, ()) for case in cases]
@@ -2311,12 +2368,17 @@ def parser():
         "--round", choices=("smoke", "accuracy", "speed", "all"), default="all"
     )
     p.add_argument("--cases", default="")
+    p.add_argument(
+        "--baseline-ref",
+        default="dcp_ascend_testing",
+        help="explicit execution ref for all baseline controls and both brackets",
+    )
     p.add_argument("--suite", choices=("overnight12",), default=None)
     p.add_argument(
         "--moe-mode",
         choices=("ep", "tp"),
-        default="ep",
-        help="DeepEP EP16 by default; TP/EP1 is diagnostic",
+        default="tp",
+        help="TP/EP1 by default; --moe-mode ep selects DeepEP EP16",
     )
     p.add_argument("--accuracy-server-requests", type=int, default=1)
     p.add_argument("--flags-overrides", default="")
@@ -2408,17 +2470,19 @@ def parser():
 
 
 def validate_args(args):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]*", args.baseline_ref):
+        raise ValueError("invalid baseline execution ref")
     if args.hours is None:
         args.hours = 12 if args.suite else 10
     if args.suite and (
         args.cases
         or args.round != "all"
-        or args.moe_mode != "ep"
+        or args.moe_mode != "tp"
         or args.skip_baseline_bracket
         or args.diagnose_baseline
     ):
         raise ValueError(
-            "--suite overnight12 requires --round all, EP, and its complete case list"
+            "--suite overnight12 requires --round all, TP, and its complete case list"
         )
     if args.suite and args.hours > 12:
         raise ValueError("--suite overnight12 has a maximum global budget of 12 hours")
@@ -2669,7 +2733,7 @@ def run(args, cases):
             },
             "status": "pending",
             "phases": {},
-            "quality_threshold": args.gsm8k_min_accuracy,
+            "quality_threshold": case_settings(args, name).gsm8k_min_accuracy,
         }
         for name, ref, env, note, case_args in cases
     ]

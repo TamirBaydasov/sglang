@@ -84,9 +84,8 @@ python3 -u run_pr_tests.py "${COMMON[@]}" \
   --round all --cases 00-baseline,01-pr-e-chat-encode,08-baseline-repeat \
   --gsm8k "$GSM8K" --hours 8 --case-minutes 150
 
-# Full nine-case sweep using the repaired branch heads.
-python3 -u run_pr_tests.py "${COMMON[@]}" \
-  --round all --gsm8k "$GSM8K" --hours 24 --case-minutes 150
+# Full 12-hour TP sweep with DeepEP and MegaMoE controls.
+bash run_12h.sh "${COMMON[@]}" --gsm8k "$GSM8K"
 ```
 
 To retain the full sweep inside screen, replace its `python3 -u` prefix with
@@ -128,62 +127,65 @@ text is also retained to expose prompt-format effects. Confirm checkpoint,
 resolved quantization, full-model geometry, and loaded weights before assigning
 a cause. No baseline model-code change is claimed without this device evidence.
 
-## Twelve-hour EP sweep
-
-Use the published harness directory on the A3 host:
+## Twelve-hour TP sweep
 
 ```bash
 bash run_12h.sh --gsm8k /home/tbaydasov/grade-school-math/grade_school_math/data/test.jsonl
 ```
 
-`--suite overnight12` sets a 12-hour global work deadline. Cases finish early
-when measurements finish; it does not loop or wait to fill 12 hours. The maximum
-case allocations total 675 minutes, leaving 45 minutes for preflight and overhead.
-Each case includes worktree setup, server startup, clients, and retries within
-its cap. Owned cleanup still runs when a deadline or interruption is reached.
-Unfinished requested cases fail the run and remain visible in the report.
+TP16/DCP16/EP1 is now the default for the baseline and PR variants. The user A3
+accuracy run of `aa32b34a4aec` completed 64 questions with 61 correct (95.3125%),
+zero errors, invalid answers or truncations. The identical bias fix is published
+on all seven PR/combined branches. Those branch combinations still need A3 runs.
 
-| Order | Cases | Phases | Cap |
-|---|---|---|---|
-| 1 | Baseline on `dcp_ascend_testing` | Accuracy + speed | 60 min |
-| 2 | MegaMoE on `A3_megamoe_support` | Accuracy + speed | 60 min |
-| 3–9 | PR #2–#7 and combined | Accuracy + speed each | 7 × 60 min |
-| 10 | P4 DeepEP reference | Accuracy, 64 questions | 45 min |
-| 11–12 | TP/EP1 graph and eager diagnostics | Accuracy, same 8 questions each | 2 × 15 min |
-| 13 | Closing baseline, same pinned SHA | Accuracy + speed | 60 min |
+The protected `dcp_ascend_testing` branch requires review of
+[PR #8](https://github.com/TamirBaydasov/sglang/pull/8). Until it merges,
+`run_12h.sh` explicitly passes `--baseline-ref npu-w4a8-tp-bias-fix`, the tested
+child of baseline `3c94728b7c25`. This selects the execution source for both TP
+brackets and both DeepEP controls; it does not claim the fix is already merged
+into the protected branch. The ref and resolved SHA are recorded in the summary
+and JSON. After merging, pass `--baseline-ref dcp_ascend_testing` to the script.
 
-Regular EP cases use DeepEP `auto`, EP16/TP16/DCP16, 64 GSM8K questions,
-16 client workers, one active accuracy request, and fresh speed servers with
-16 active requests. AISBench remains 1M input tokens, one output token,
-16 requests/concurrency 16, seed 4. HCCL/DeepEP buffers are 1000/2500 MB.
-The launcher uses memory fraction 0.76. MegaMoE overrides the backend with
-`ascend_fuseep` mode 3, retaining EP16. The baseline branch is never replaced.
+The work budget is 12 hours. Maximum case allocations total 650 minutes,
+leaving 70 minutes for preflight and overhead. Runs finish early when requested
+measurements finish; they do not loop to fill the time. Startup and clients
+share each case cap. Cleanup runs on deadlines and interruption. Missing work
+is reported and returns nonzero.
 
-The P4 reference case uses eager decode, unchunked prefill, 32K context, memory
-fraction 0.76, and 64 server/client requests. Quantization, dtype, model
-implementation, shared-expert fusion, KV capacity and prefill limits resolve
-from model/server defaults as in the supplied launcher. It retains the harness
-ownership, fixed seed, watchdog and explicit automatic weight loading.
-The actual resolved settings are saved in `smoke.json` and `launch.json`.
-This is an accuracy diagnostic, not a comparable 1M-token speed sample.
+| Order | Cases | Mode | Phases | Cap |
+|---|---|---|---|---|
+| 1 | Opening baseline | TP/EP1 | Accuracy + speed | 55 min |
+| 2 | `14-baseline-ep` | DeepEP EP16 | Accuracy + speed | 55 min |
+| 3 | `09-pr1-megamoe` | FuseEP mode 3, EP16 | Accuracy + speed | 55 min |
+| 4–10 | PR #2–#7 and combined | TP/EP1 | Accuracy + speed each | 7 × 55 min |
+| 11 | `10-ep-p4-eager` | P4 DeepEP EP16, eager | Accuracy only | 45 min |
+| 12 | Closing baseline, same pinned SHA | TP/EP1 | Accuracy + speed | 55 min |
 
-TP diagnostics use the failed TP/EP1 recipe with graph/eager as the changed
-variable. Eight prompts limit wasted time; they cannot establish a 64-question
-accuracy score or a performance result. They never run AISBench. See
-[TP_W4A8_FINDINGS.md](TP_W4A8_FINDINGS.md) for the investigation and next cuts.
+Normal cases use 64 GSM8K questions, 16 client workers, one active accuracy
+request, 1,024 output tokens and memory fraction 0.70 as in the validated TP
+run. Every speed phase uses a fresh server with 16 active requests. AISBench
+remains 1M input tokens, one output token, 16 requests/concurrency 16, seed 4.
+Graph configuration, KV cap and memory settings match across the TP, DeepEP
+and MegaMoE speed controls; HCCL/DeepEP buffers remain 1000/2500 MB.
 
-The suite requires `--round all` and its complete case list. `--moe-mode tp`
-is available for separate diagnostic runs; the default for other runs is EP.
-Explicit `--cases` preserve the requested order. Lowering `--case-minutes` or
-`--hours` lowers caps; it may leave requested work incomplete. Fallback retries
-are disabled in this suite so memory/graph changes cannot replace its samples.
+The P4 accuracy control retains eager decode, unchunked prefill, 32K context,
+memory fraction 0.76, 64 server/client requests and model/server defaults for
+quantization, dtype, implementation, shared-expert fusion, KV capacity and
+prefill limits. Its changed configuration excludes it from speed comparisons.
+Old eight-question TP diagnostics and the standalone fix case remain explicitly
+selectable but are excluded from the full sweep.
 
-Accept baseline quality only after reading the raw responses: 64 completed,
-zero request failures and truncations, and accuracy at the expected historical
-level (roughly 92–95%; five questions overlap shots). This remains a diagnostic
-score with overlap, not a held-out claim. Keep unresolved quality beside speed
-measurements. Ratios require matching resolved settings; MegaMoE's different
-backend is reported with raw timings when that prevents comparison.
+The suite requires `--round all`, TP defaults and its complete case list. It
+sets a 90% accuracy threshold unless one is supplied. Poor accuracy does not
+suppress diagnostic speed collection. Zero errors and truncations remain
+necessary to qualify quality; five questions overlap shots, so this is not a
+held-out score. Fallback retries are disabled to preserve the configurations.
+
+Normal PR ratios require matching effective settings. For the two named backend
+comparisons, only MoE backend, EP size, DeepEP mode and FuseEP mode may differ;
+all other recorded settings must match. These ratios are explicitly labeled
+single-run backend comparisons, with raw TTFT and quality beside them. Closing
+baseline drift requires matching settings and the same pinned source SHA.
 
 ## Accuracy and timing interpretation
 
@@ -346,4 +348,4 @@ TP16/DCP16/EP1 with the same graph, memory, client, and single-active-request
 configuration as the failed 0/64 test. Only compensation loading changes.
 Accept recovery only with 64 complete requests, zero failures/truncations, and
 at least 90% accuracy; keep raw responses for comparison. The score includes
-five shot/test overlaps. Nightly integration waits for this standalone result.
+five shot/test overlaps. The standalone A3 test recovered 61/64 with no errors or truncations; the full sweep now includes the propagated fix.
