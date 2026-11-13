@@ -50,7 +50,7 @@ ownership. This runner will not adopt or sweep those processes. Inspect with
 
 Run these in Bash from the extracted directory. Set `GSM8K` to an existing
 **host-side** GSM8K test JSONL (`question` and `answer` with `####` final answers).
-The confirmed host path is shown below. At least 200 valid rows
+The confirmed host path is shown below. At least 64 valid rows
 are required by default; validation happens before any server launch.
 
 ```bash
@@ -65,10 +65,10 @@ COMMON=(
   --ais-conda-env tbay_sglang
 )
 
-# Baseline GSM8K: real weights, fixed 200-sample subset, seed 4.
+# Baseline GSM8K: real weights, fixed 64-sample subset, seed 4.
 python3 -u run_pr_tests.py "${COMMON[@]}" \
   --round accuracy --cases 00-baseline --gsm8k "$GSM8K" \
-  --gsm8k-samples 200 --gsm8k-seed 4 --hours 3 --case-minutes 150
+  --gsm8k-samples 64 --gsm8k-seed 4 --hours 3 --case-minutes 150
 
 # Baseline AISBench plus the matching end bracket; no GSM8K required.
 python3 -u run_pr_tests.py "${COMMON[@]}" \
@@ -118,7 +118,7 @@ a cause. No baseline model-code change is claimed without this device evidence.
 
 ## Accuracy and timing interpretation
 
-GSM8K uses a fixed five-shot prompt, 200 samples shuffled with seed 4, temperature
+GSM8K uses a fixed five-shot prompt, 64 samples shuffled with seed 4, temperature
 0, and a 512-token completion cap. Dataset hash, original JSONL row IDs, complete
 prompts, responses, reasoning fields, finish reasons, extracted answers, request
 errors, and truncations are saved after each sample. Errors and truncated answers

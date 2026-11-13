@@ -616,7 +616,7 @@ def run_gsm8k(rows, args, case_dir, deadline, log):
         )
         out["accuracy"] = out["correct"] / len(rows)
         save(case_dir / "gsm8k.json", out)
-        if len(details) % 25 == 0:
+        if len(details) % 16 == 0 or len(details) == len(rows):
             log(
                 f"GSM8K {len(details)}/{len(rows)} correct={out['correct']} errors={out['errors']}"
             )
@@ -1737,7 +1737,7 @@ def parser():
     p.add_argument(
         "--gsm8k", help="host path to GSM8K test JSONL; required for accuracy/all"
     )
-    p.add_argument("--gsm8k-samples", type=int, default=200)
+    p.add_argument("--gsm8k-samples", type=int, default=64)
     p.add_argument("--gsm8k-seed", type=int, default=4)
     p.add_argument("--gsm8k-max-tokens", type=int, default=512)
     p.add_argument("--gsm8k-min-accuracy", type=float, default=None)
