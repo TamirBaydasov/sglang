@@ -1302,3 +1302,17 @@ def test_overnight_budget_brackets_and_isolated_diagnostics(capsys):
 def test_overnight_rejects_incompatible_overrides(extra):
     with pytest.raises(ValueError):
         args_for("--suite", "overnight12", *extra)
+
+
+def test_tp_fix_is_an_explicit_accuracy_only_case():
+    args = args_for("--cases", "13-tp-bias-fix")
+    (case,) = h.plan_cases(args)
+    assert case[1] == "npu-w4a8-tp-bias-fix"
+    effective = h.case_settings(args, case[0])
+    assert h.phase_names(effective) == ["accuracy"]
+    assert effective.gsm8k_samples == 64
+    argv = h.server_argv(effective, effective.memfrac, True, case[4], phase="accuracy")
+    assert argv[argv.index("--ep-size") + 1] == "1"
+    assert argv[argv.index("--moe-a2a-backend") + 1] == "none"
+    assert "13-tp-bias-fix" not in [case[0] for case in h.plan_cases(args_for())]
+    assert "13-tp-bias-fix" not in h.OVERNIGHT12_ORDER

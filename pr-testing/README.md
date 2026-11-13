@@ -329,3 +329,21 @@ The tokenizer regressions require `transformers` and `tokenizers` and inspect bo
 local serving worktrees. The HTTP/process regressions need local loopback and
 subprocess access. Host checks do not establish A3 numerical quality, graph
 correctness, HCCL stability, or performance; the A3 commands above remain required.
+
+
+## Standalone TP compensation-fix accuracy test
+
+```bash
+python3 -u run_pr_tests.py --round accuracy --cases 13-tp-bias-fix \
+  --gsm8k /home/tbaydasov/grade-school-math/grade_school_math/data/test.jsonl \
+  --gsm8k-samples 64 --gsm8k-parallel 16 --gsm8k-max-tokens 1024 \
+  --gsm8k-min-accuracy 0.90 --memfrac 0.70 \
+  --save-dir /home/swx1199799 --hours 2 --case-minutes 90
+```
+
+This selects `npu-w4a8-tp-bias-fix`, based on the failed baseline SHA, and uses
+TP16/DCP16/EP1 with the same graph, memory, client, and single-active-request
+configuration as the failed 0/64 test. Only compensation loading changes.
+Accept recovery only with 64 complete requests, zero failures/truncations, and
+at least 90% accuracy; keep raw responses for comparison. The score includes
+five shot/test overlaps. Nightly integration waits for this standalone result.

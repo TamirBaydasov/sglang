@@ -42,5 +42,38 @@ compare one expert's dequantized w13/w2 outputs with a BF16 reference using
 saved inputs and loaded scales/biases. Any serving fix needs that reproducer,
 a focused regression, and a fresh A3 GSM8K run before propagation to PR branches.
 
-No TP serving fix is claimed or applied by this harness change. DeepEP is the
+The original EP-default harness change applied no TP serving fix; the isolated follow-up below now tests one. DeepEP is the
 explicit default; TP failures remain recorded rather than hidden as EP results.
+
+
+## Isolated TP fix for first A3 accuracy validation
+
+Branch `npu-w4a8-tp-bias-fix` starts directly from baseline `3c94728b7c25`.
+The scheme factory instantiates `ModelSlimW4A8Int8MoE` without `tp_size`, leaving
+its value at 1. Consequently the old code allocates all 16 down-projection
+compensation partials on every rank, labels them per-channel, copies the full
+checkpoint bias, and sums all partials before the TP output reduction.
+
+The fix derives compensation width from `layer.moe_tp_size` and labels
+compensation as grouped metadata so the existing loader slices the K/partial
+axis by TP rank. TP1/EP retains all 16 partials. Per-channel weight scales stay
+replicated. The new case `13-tp-bias-fix` explicitly uses TP/EP1, 64 questions,
+and accuracy only. It is excluded from default and overnight case lists until
+the standalone accuracy test is reviewed.
+
+Related upstream evidence:
+- [vLLM-Ascend #7088](https://github.com/vllm-project/vllm-ascend/issues/7088)
+  reports the unsliced W4A8 compensation axis.
+- [vLLM-Ascend #7090](https://github.com/vllm-project/vllm-ascend/pull/7090)
+  makes scale_bias part of grouped metadata even for per-channel weights.
+- [vLLM-Ascend #14378](https://github.com/vllm-project/vllm-ascend/issues/14378)
+  concerns C8 KV / PD accuracy fluctuations; it does not establish this TP cause.
+- Official MindIE issue search found no matching TP-bias report. Its
+  [W4A8 mixed precision guide](https://github.com/Ascend/MindIE-LLM/blob/master/docs/zh/user_guide/feature/w4a8_mixed_precision_quantization.md)
+  describes routed-expert quantization and model/feature restrictions, not a
+  fix for this loader. No MindIE issue is represented as a verified match.
+
+CPU regressions exercise production allocation, rank slicing, and post-load
+bias reduction for TP1/2/4/8/16, checking that rank sums reconstruct the original
+compensation. This proves the loading defect; the A3 run must still establish
+whether it explains the observed 0/64 score.

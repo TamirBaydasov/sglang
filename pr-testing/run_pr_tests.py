@@ -309,6 +309,13 @@ CASES.extend(
             "W4A8 TP/EP1 eager diagnostic; same eight prompts as graph",
             ("--ep-size", "1", "--moe-a2a-backend", "none"),
         ),
+        (
+            "13-tp-bias-fix",
+            "npu-w4a8-tp-bias-fix",
+            {},
+            "W4A8 TP compensation fix: 64-question accuracy gate",
+            ("--ep-size", "1", "--moe-a2a-backend", "none"),
+        ),
     ]
 )
 
@@ -325,7 +332,9 @@ OVERNIGHT12_ORDER = [
 
 def case_settings(args, name):
     result = argparse.Namespace(**vars(args))
-    if name == "10-ep-p4-eager":
+    if name == "13-tp-bias-fix":
+        result.round = "accuracy"
+    elif name == "10-ep-p4-eager":
         result.round = "accuracy"
         result.p4_reference = True
         result.memfrac = 0.76
@@ -2258,6 +2267,7 @@ def plan_cases(args):
                 "10-ep-p4-eager",
                 "11-tp-graph-diagnostic",
                 "12-tp-eager-diagnostic",
+                "13-tp-bias-fix",
             )
         ]
     table = {case[0]: case for case in CASES}
