@@ -1286,6 +1286,8 @@ def test_overnight_budget_brackets_and_isolated_diagnostics(capsys):
         "speed: fresh server"
         not in output.split("== 10-ep-p4-eager")[1].split("== 08-baseline-repeat")[0]
     )
+    assert "8 samples in file order, parallel=16" in output
+    assert "64 samples in file order, parallel=64" in output
 
 
 @pytest.mark.parametrize(

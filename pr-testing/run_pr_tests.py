@@ -2501,7 +2501,7 @@ def dry_run(args, cases):
                 )
             if phase == "accuracy":
                 print(
-                    f"  GSM8K reference: {args.gsm8k_samples} samples in file order, parallel={args.gsm8k_parallel}, max_new_tokens={args.gsm8k_max_tokens}, dataset={args.gsm8k or '<required at execution>'}"
+                    f"  GSM8K reference: {effective.gsm8k_samples} samples in file order, parallel={effective.gsm8k_parallel}, max_new_tokens={effective.gsm8k_max_tokens}, dataset={effective.gsm8k or '<required at execution>'}"
                 )
     return 0
 
