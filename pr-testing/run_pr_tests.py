@@ -1242,7 +1242,7 @@ print('PRTEST_PROBE='+json.dumps({'versions': versions, 'ops':ops, 'model_config
 """
 
 
-def server_argv(args, memfrac, graph, case_args=()):
+def server_argv(args, memfrac, graph, case_args=(), *, phase=None):
     values = list(BASE_SERVER_ARGS)
     for key, value in [
         ("--mem-fraction-static", memfrac),
@@ -1250,6 +1250,8 @@ def server_argv(args, memfrac, graph, case_args=()):
         ("--context-length", args.context),
     ]:
         values[values.index(key) + 1] = str(value)
+    if phase == "accuracy":
+        values[values.index("--max-running-requests") + 1] = "1"
     if not graph:
         index = values.index("--cuda-graph-max-bs-decode")
         values[index : index + 2] = ["--cuda-graph-backend-decode", "disabled"]
@@ -1705,6 +1707,7 @@ def run_phase(
                 memfrac,
                 graph,
                 record.get("case_server_args", ()),
+                phase=phase,
             )
             command = server_shell(args, worktree, record["case_env"], argv)
             attempt.update(
@@ -2358,7 +2361,7 @@ def dry_run(args, cases):
                     args,
                     worktree,
                     env,
-                    server_argv(args, args.memfrac, graph, case_args),
+                    server_argv(args, args.memfrac, graph, case_args, phase=phase),
                 )
             )
             if phase == "speed":

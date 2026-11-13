@@ -132,14 +132,54 @@ def test_dry_run_uses_real_builders(capsys):
     )
     h.dry_run(args, h.plan_cases(args))
     output = capsys.readouterr().out
-    assert (
-        h.server_shell(
-            args, "<run-root>/worktrees/00-baseline", {}, h.server_argv(args, 0.7, True)
-        )
-        in output
-    )
+    for phase, width in (("accuracy", "1"), ("speed", "16")):
+        argv = h.server_argv(args, args.memfrac, True, phase=phase)
+        assert argv[argv.index("--max-running-requests") + 1] == width
+        assert h.server_shell(
+            args, "<run-root>/worktrees/00-baseline", {}, argv
+        ) in output
     assert h.shlex.join(h.ais_command(args)) in output
     assert "accuracy: fresh server" in output and "speed: fresh server" in output
+
+
+def test_combined_phases_launch_and_stop_separate_servers(tmp_path, monkeypatch):
+    args = args_for("--round", "all")
+    args.ais_preflight_record = None
+    args.ais_preflight_error = None
+    args.gsm_rows = []
+    record = {"case": "00-baseline", "case_env": {}}
+    registry = {"processes": []}
+    runtime = {"model_files_sha256": {}, "versions": {}, "environment": {}, "ops": {}}
+    events = []
+
+    def launch(args, command, directory, registry, deadline):
+        phase = directory.parent.name
+        state = phase + "-owned"
+        registry["processes"].append({"state": state})
+        events.append(("launch", phase))
+        return state, None
+
+    monkeypatch.setattr(h, "require_free_port", lambda: None)
+    monkeypatch.setattr(h, "probe_runtime", lambda *a: runtime)
+    monkeypatch.setattr(h, "launch_server", launch)
+    monkeypatch.setattr(h, "wait_health", lambda *a: None)
+    monkeypatch.setattr(h, "smoke", lambda *a: {"server": {}})
+    monkeypatch.setattr(h, "resolved_comparison", lambda config, smoke: config)
+    monkeypatch.setattr(h, "run_gsm8k", lambda *a: {"status": "ok", "accuracy": 1})
+    monkeypatch.setattr(h, "run_accuracy_prompts", lambda *a: {"errors": 0})
+    monkeypatch.setattr(h, "run_aisbench", lambda *a: {"status": "ok", "reason": ""})
+    monkeypatch.setattr(h, "stop_server", lambda args, state: events.append(("stop", state)))
+    for phase, width in (("accuracy", "1"), ("speed", "16")):
+        h.run_phase(args, record, phase, "/tree", tmp_path, registry,
+                    time.monotonic() + 10, lambda message: None, lambda: None)
+        attempt = record["phases"][phase]["attempts"][0]
+        assert attempt["status"] == "ok"
+        saved = json.loads((tmp_path / phase / "attempt-1" / "launch.json").read_text())
+        argv = saved["argv"]
+        assert argv[argv.index("--max-running-requests") + 1] == width
+        assert saved["command"] == h.server_shell(args, "/tree", {}, argv)
+    assert events == [("launch", "accuracy"), ("stop", "accuracy-owned"),
+                      ("launch", "speed"), ("stop", "speed-owned")]
 
 
 @pytest.mark.parametrize("discovery", ["exe", "path", "inherited_stub"])

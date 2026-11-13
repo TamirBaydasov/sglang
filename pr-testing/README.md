@@ -68,7 +68,7 @@ COMMON=(
   --ais-conda-env tbay_sglang
 )
 
-# Baseline GSM8K: reference raw five-shot client, first 64 questions, 16 workers.
+# Baseline GSM8K: 64 questions, 16 client workers, one active server request.
 python3 -u run_pr_tests.py "${COMMON[@]}" \
   --round accuracy --cases 00-baseline --gsm8k "$GSM8K" \
   --gsm8k-samples 64 --gsm8k-parallel 16 --gsm8k-max-tokens 1024 \
@@ -193,11 +193,12 @@ are rejected. TPOT is null for one-token output. JSON preserves TTFT in
 milliseconds; the summary displays seconds. Ratios require matching effective
 configurations and remain diagnostic when quality is unresolved.
 
-Server launch arguments and feature flags are preserved from the existing
-harness. The reference server launchers are not imported: memory fraction stays
-0.70, running-request capacity stays 16, and the single-request prefill cap stays
-1 for packed DCP reads. The client protocol repair does not claim to reproduce
-the PR #1 server configuration or its historical performance.
+Accuracy uses `--max-running-requests 1`, matching the reference accuracy
+launcher. Client parallelism remains 16: requests queue at the server. Speed
+keeps `--max-running-requests 16` and the standard AISBench workload. Combined
+runs launch fresh servers for each phase. Other serving settings are unchanged
+from revision `9cc38f1a24`; this does not establish reproduction of the historical
+92% accuracy or performance. Inspect raw responses and truncation on A3.
 
 A smoke response confirms endpoint availability. Empty, nonsensical, or wrong
 answers remain unresolved quality. Successful HTTP requests and exact-output
