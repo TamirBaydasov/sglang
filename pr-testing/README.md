@@ -1,7 +1,9 @@
 # GLM PR accuracy and performance harness
 
 Run GSM8K accuracy, AISBench prefix-cache performance, or both for the six PRs,
-the combined branch, and the two baseline brackets. `all` starts separate fresh
+the combined branch, and the two baseline brackets. The GSM8K client and
+PROFILE=0 wrapper are extracted verbatim from the two PR #1 runbooks;
+`REFERENCE_SOURCES.json` records their source and extracted-content hashes. `all` starts separate fresh
 servers for accuracy and speed. The driver runs on the A3 **host**; serving runs
 inside `sglang-a3`. Python 3.9+ is required on both sides.
 
@@ -36,7 +38,8 @@ sha256sum --check CHECKSUMS.sha256
 python3 run_pr_tests.py --round speed --cases 00-baseline --dry-run
 ```
 
-The archive contains the driver, process helper, and this runbook. Serving
+The archive contains the driver, process helper, reference clients, provenance
+manifest, and this runbook. Serving
 repairs are committed directly to `npu-chat-encode-pool` and `npu-bde-combined`.
 The driver fetches and pins those branch heads, then tests pristine isolated
 worktrees. No runtime patch files or overlay arguments are used.
@@ -50,7 +53,7 @@ ownership. This runner will not adopt or sweep those processes. Inspect with
 
 Run these in Bash from the extracted directory. Set `GSM8K` to an existing
 **host-side** GSM8K test JSONL (`question` and `answer` with `####` final answers).
-The confirmed host path is shown below. At least 64 valid rows
+The confirmed host path is shown below. At least 64 valid rows and five shot examples
 are required by default; validation happens before any server launch.
 
 ```bash
@@ -65,10 +68,11 @@ COMMON=(
   --ais-conda-env tbay_sglang
 )
 
-# Baseline GSM8K: real weights, fixed 64-sample subset, seed 4.
+# Baseline GSM8K: reference raw five-shot client, first 64 questions, 16 workers.
 python3 -u run_pr_tests.py "${COMMON[@]}" \
   --round accuracy --cases 00-baseline --gsm8k "$GSM8K" \
-  --gsm8k-samples 64 --gsm8k-seed 4 --hours 3 --case-minutes 150
+  --gsm8k-samples 64 --gsm8k-parallel 16 --gsm8k-max-tokens 1024 \
+  --hours 3 --case-minutes 150
 
 # Baseline AISBench plus the matching end bracket; no GSM8K required.
 python3 -u run_pr_tests.py "${COMMON[@]}" \
@@ -118,20 +122,34 @@ a cause. No baseline model-code change is claimed without this device evidence.
 
 ## Accuracy and timing interpretation
 
-GSM8K uses a fixed five-shot prompt, 64 samples shuffled with seed 4, temperature
-0, and a 512-token completion cap. Dataset hash, original JSONL row IDs, complete
-prompts, responses, reasoning fields, finish reasons, extracted answers, request
-errors, and truncations are saved after each sample. Errors and truncated answers
-count as incorrect; incomplete or failed requests make the phase fail. If 512
-is insufficient for the checkpoint, increase `--gsm8k-max-tokens` consistently
-for both baseline and variants and rerun their comparisons.
+GSM8K uses the unmodified client extracted from `test_pr1_megamoe_accuracy.py`:
+raw `/generate`, the first 64 dataset questions in file order, the first five
+examples from that same dataset, 16 client workers, temperature 0, top-p 1,
+1,024 output tokens, and stops `Question`, `Assistant:`, `<|separator|>`.
+`--gsm8k-samples`, `--gsm8k-parallel`, `--gsm8k-max-tokens`, and
+`--gsm8k-timeout` override client settings. `--gsm8k-seed` is retained for old
+commands but does not shuffle the reference protocol's question order.
 
-Use `--gsm8k-min-accuracy VALUE` only with a justified threshold for this exact
-checkpoint and workload. Without a threshold, the harness reports the measured
-score and leaves correctness acceptance unqualified. Zero-correct or incomplete
-runs are marked unresolved. Poor quality does not suppress diagnostic AISBench
-runs. The paired-output suite remains diagnostic and excludes errored/truncated
-outputs from its match counts.
+The legacy scorer takes the last integer, matching the earlier reported score;
+it does not preserve signs or decimals. A truncated answer can still score as
+correct under that reference rule. Truncation, invalid responses, and request
+failures are reported separately. Truncated results remain quality-unqualified.
+The summary displays shot/test overlap; the default examples overlap the test
+set, so this is a reproduction metric rather than a held-out score. Use
+`--gsm8k-shots-data /path/to/train.jsonl` for a separate five-shot dataset and
+compare only runs with matching prompt/scorer manifests.
+
+Each attempt retains `gsm8k-reference/manifest.json`, `server_info.json`,
+`raw.jsonl`, and `result.json`, plus the driver's normalized `gsm8k.json` and
+live `gsm8k-client.log`. Completed responses are flushed by the client and
+checkpointed by the driver while it monitors server liveness. Request failures
+or incomplete execution make the phase fail. `--gsm8k-min-accuracy` remains an
+optional threshold for the exact chosen protocol.
+
+Additional chat-output comparisons are optional and off by default. Enable
+`--accuracy-requests 64` to run them separately; they never replace the raw
+GSM8K score. This keeps the default accuracy workload at 64 GSM8K requests.
+Poor GSM8K quality does not suppress diagnostic speed runs.
 
 AISBench preflight and execution initialize the Conda Bash hook before sourcing
 `--ais-env`, because that file may itself call `conda activate`. The hook is
@@ -142,14 +160,36 @@ port, tool, and working directory. The model/tokenizer directory must also be
 accessible to the host client. Preflight failure prevents expensive speed-server
 launches; an independent accuracy phase can still run.
 
-Speed requires successful cache clearing, a preparation record, a measurement
-record, the expected request counts, zero failed requests, valid metrics, and a
-successful tool exit. Python-repr and JSON metrics are accepted. `99999` failure
-placeholders cannot become timings. JSON preserves TTFT in milliseconds; the
-summary converts it to seconds. Only matching effective configurations receive
-baseline/variant mean-TTFT ratios. These are single-run diagnostic comparisons,
-with baseline-repeat drift shown separately. Missing provenance or unresolved
-quality is never presented as an accepted performance improvement.
+Speed invokes the unmodified `PROFILE0_SCRIPT` extracted from
+`test_pr1_megamoe.py`, with profiling disabled. The driver performs a strict
+cache flush once, then lets the wrapper prepare the 99% prefix and measure
+16 requests at concurrency 16, 1M input tokens and one output token. The
+wrapper's own optional flush is disabled to avoid a duplicate flush.
+
+The driver verifies enabled radix caching, sufficient resolved running-request
+capacity, and page/DCP-rounded KV capacity using the reference formula. A missing
+or insufficient capacity is reported as capacity-blocked before the expensive
+prefix preparation. It monitors the owned server while the wrapper runs and
+terminates owned client processes, including detached AISBench children, on
+failure, interruption or timeout.
+
+The reference wrapper captures `config.py`, `server_info.json`, tool logs,
+`aisbench_result.csv` and experiment directories under `profile0/<run>/`.
+`capacity.json`, `cache-flush.json`, `timed-server.log` and `prefix-cache.json`
+record the driver's validation evidence. Cached-prefix hits must be visible in
+the timed server log; missing evidence leaves performance unverified.
+
+Successful tool exit, preparation/measurement records, expected request counts,
+zero failed requests, and valid metrics are required. `99999` failure records
+are rejected. TPOT is null for one-token output. JSON preserves TTFT in
+milliseconds; the summary displays seconds. Ratios require matching effective
+configurations and remain diagnostic when quality is unresolved.
+
+Server launch arguments and feature flags are preserved from the existing
+harness. The reference server launchers are not imported: memory fraction stays
+0.70, running-request capacity stays 16, and the single-request prefill cap stays
+1 for packed DCP reads. The client protocol repair does not claim to reproduce
+the PR #1 server configuration or its historical performance.
 
 A smoke response confirms endpoint availability. Empty, nonsensical, or wrong
 answers remain unresolved quality. Successful HTTP requests and exact-output
@@ -163,8 +203,10 @@ matches do not establish full-model correctness.
   runner.log, run-status.json
   <case>/<accuracy|speed|smoke|diagnostic-graph|diagnostic-eager>/attempt-N/
     launch.json, process.json, smoke.json, server.log
-    gsm8k.json, accuracy.json                    # accuracy phase
-    ais-command.json, ais.log                   # speed phase
+    gsm8k.json, gsm8k-client.log, gsm8k-reference/ # accuracy phase
+    accuracy.json                                # optional chat diagnostics
+    ais-command.json, ais.log, profile0/          # speed phase
+    capacity.json, prefix-cache.json, timed-server.log
     tokenizer.json, diagnosis.json              # diagnostic phase
 ```
 
@@ -173,8 +215,9 @@ parent with `--save-dir /path/to/save`; `--output /exact/run/directory` takes
 precedence when provided. This changes saved results and captured logs; ownership
 state and temporary container worktrees retain their separate locations.
 
-`results.json` is atomically checkpointed after each phase transition; GSM8K and
-paired diagnostics also checkpoint each request. A summary-rendering error keeps
+`results.json` is atomically checkpointed after each phase transition; the reference client flushes each completed response to `raw.jsonl`, and
+the driver checkpoints its normalized GSM8K record while monitoring. Optional
+paired diagnostics checkpoint each request. A summary-rendering error keeps
 those records and makes the run fail. Every case and requested phase has a final
 status. Exit 0 means the requested benchmark execution completed; it does not
 mean quality acceptance. Failures/skips return 1, argument/prerequisite validation

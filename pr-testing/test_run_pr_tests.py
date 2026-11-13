@@ -181,6 +181,9 @@ def test_ais_preflight_and_runtime_share_custom_conda(tmp_path, monkeypatch, dis
             '() { echo "CondaError: uninitialized" >&2; return 1; }',
         )
     env.write_text("conda activate fixture\n")
+    wrapper = tmp_path / "profile-wrapper.sh"
+    wrapper.write_text('test "$1" = --\nshift\nexec "$@"\n')
+    monkeypatch.setattr(h, "REFERENCE_PROFILE0", wrapper)
     args = args_for(
         "--model",
         str(model),
@@ -206,37 +209,101 @@ def test_ais_preflight_and_runtime_share_custom_conda(tmp_path, monkeypatch, dis
         h.ais_preflight(args, time.monotonic() + 10)
 
 
-def test_gsm8k_records_responses_errors_and_truncation(tmp_path, monkeypatch):
-    args = args_for("--gsm8k-samples", "3")
-    args.dataset_sha256 = "dataset-hash"
+def test_gsm8k_reference_protocol_and_truncation(tmp_path, monkeypatch):
     rows = [
         {"sample_id": n, "question": f"question {n}", "answer": "reason #### 42"}
-        for n in range(3)
+        for n in range(5)
     ]
-    outputs = iter(
-        [
-            ("The answer is 42", {"finish_reason": "stop"}),
-            ("42", {"finish_reason": "length"}),
-            RuntimeError("HTTP failure"),
-        ]
+    dataset = tmp_path / "data.jsonl"
+    dataset.write_text(
+        "".join(
+            json.dumps({k: v for k, v in row.items() if k != "sample_id"}) + "\n"
+            for row in rows
+        )
     )
+    requests = []
 
-    def fake_chat(*args):
-        item = next(outputs)
-        if isinstance(item, Exception):
-            raise item
-        return item
+    class ReferenceServer(BaseHTTPRequestHandler):
+        def do_GET(self):
+            assert self.path == "/server_info"
+            body = json.dumps(
+                dict(
+                    tp_size=16,
+                    dcp_size=16,
+                    ep_size=1,
+                    moe_a2a_backend="none",
+                    load_format="auto",
+                    max_running_requests=16,
+                )
+            ).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
 
-    monkeypatch.setattr(h, "chat", fake_chat)
-    result = h.run_gsm8k(
-        rows, args, tmp_path, time.monotonic() + 10, lambda message: None
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append((self.path, body))
+            if body["text"].endswith("Question: question 2\nAnswer:"):
+                self.send_response(500)
+                self.end_headers()
+                return
+            finish = (
+                "length"
+                if body["text"].endswith("Question: question 1\nAnswer:")
+                else "stop"
+            )
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    {
+                        "text": "The answer is 42",
+                        "meta_info": {
+                            "finish_reason": {"type": finish},
+                            "completion_tokens": 12,
+                        },
+                    }
+                ).encode()
+            )
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ReferenceServer)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(h, "SERVER_PORT", server.server_port)
+    args = args_for("--gsm8k", str(dataset), "--gsm8k-samples", "3")
+    args.dataset_sha256 = h.hashlib.sha256(dataset.read_bytes()).hexdigest()
+    try:
+        result = h.run_gsm8k(
+            rows[:3], args, tmp_path, time.monotonic() + 15, lambda message: None
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert (result["correct"], result["errors"], result["truncated"]) == (2, 1, 1)
+    assert result["status"] == "failed"
+    assert len(requests) == 3 and {path for path, _ in requests} == {"/generate"}
+    prefix = "".join(
+        f"Question: question {n}\nAnswer: reason #### 42\n\n" for n in range(5)
     )
-    assert (result["correct"], result["errors"], result["truncated"]) == (1, 1, 1)
-    saved = json.loads((tmp_path / "gsm8k.json").read_text())
-    assert saved["details"][0]["output"] == "The answer is 42"
-    assert saved["details"][0]["prompt"].endswith("Question: question 0\nAnswer:")
-    assert saved["details"][2]["id"] == 2
-    assert saved["status"] == "failed"
+    assert {body["text"] for _, body in requests} == {
+        prefix + f"Question: question {n}\nAnswer:" for n in range(3)
+    }
+    for _, body in requests:
+        assert body["stream"] is False
+        assert body["sampling_params"] == {
+            "temperature": 0,
+            "top_p": 1,
+            "max_new_tokens": 1024,
+            "stop": ["Question", "Assistant:", "<|separator|>"],
+        }
+    assert result["manifest"]["shot_overlap_question_ids"] == [0, 1, 2]
+    assert result["manifest"]["parallel"] == 16
+    assert result["manifest"]["scorer"] == "legacy-last-integer-v1"
+    assert result["details"][1]["truncated"] and result["details"][1]["ok"]
+    assert (tmp_path / "gsm8k-reference/raw.jsonl").exists()
+    assert (tmp_path / "gsm8k-reference/result.json").exists()
 
 
 def test_error_strings_excluded_from_output_comparisons(tmp_path, monkeypatch):
@@ -496,7 +563,7 @@ def test_startup_exception_and_interrupt_always_cleanup(tmp_path, monkeypatch):
 def test_failed_accuracy_does_not_suppress_speed_or_later_cases(tmp_path, monkeypatch):
     dataset = tmp_path / "gsm8k.jsonl"
     dataset.write_text(
-        json.dumps({"question": "What is 2+2?", "answer": "#### 4"}) + "\n"
+        (json.dumps({"question": "What is 2+2?", "answer": "#### 4"}) + "\n") * 5
     )
     args = args_for(
         "--round",
@@ -623,7 +690,7 @@ def test_shared_case_deadline_skips_speed_and_records_every_remaining_case(
 ):
     dataset = tmp_path / "gsm8k.jsonl"
     dataset.write_text(
-        json.dumps({"question": "What is 2+2?", "answer": "#### 4"}) + "\n"
+        (json.dumps({"question": "What is 2+2?", "answer": "#### 4"}) + "\n") * 5
     )
     clock = [100.0]
     monkeypatch.setattr(h, "time", SimpleNamespace(monotonic=lambda: clock[0]))
@@ -756,3 +823,185 @@ def test_previous_boot_identity_is_rejected(tmp_path):
     finally:
         state.write_text(original)
         owned_stop(state)
+
+
+def test_e2e_capacity_and_cache_guards():
+    args = args_for("--round", "speed")
+    server = dict(
+        max_running_requests=16, disable_radix_cache=False, page_size=128, dcp_size=16
+    )
+    result = h.speed_capacity(server, "max_total_num_tokens=1196032", args)
+    assert result["required"] == 1189888 and result["status"] == "ok"
+    assert (
+        h.speed_capacity(server, "max_total_num_tokens=1000000", args)["status"]
+        == "capacity-blocked"
+    )
+    assert (
+        h.speed_capacity(server, "no capacity evidence", args)["status"]
+        == "capacity-blocked"
+    )
+    with pytest.raises(RuntimeError, match="radix"):
+        h.speed_capacity(dict(server, disable_radix_cache=True), "", args)
+    with pytest.raises(RuntimeError, match="below concurrency"):
+        h.speed_capacity(dict(server, max_running_requests=1), "", args)
+    assert (
+        h.prefix_evidence(
+            "Prefill batch, #new-seq: 1, #new-token: 100, #cached-token: 0"
+        )["status"]
+        == "cache-hit-unverified"
+    )
+
+
+def test_monitored_client_failure_stops_its_process(tmp_path):
+    pidfile = tmp_path / "pid"
+    script = f"import os,pathlib,time; pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())); time.sleep(60)"
+
+    def monitor():
+        if pidfile.exists():
+            raise RuntimeError("server exited")
+
+    with pytest.raises(RuntimeError, match="server exited"):
+        h.execute(
+            [sys.executable, "-c", script],
+            time.monotonic() + 5,
+            log_path=tmp_path / "client.log",
+            monitor=monitor,
+            monitor_interval=0.02,
+        )
+    info = remote.proc_info(pidfile.read_text())
+    assert info is None or info["state"] == "Z"
+
+
+def test_reference_e2e_wrapper_and_artifact_capture(tmp_path, monkeypatch):
+    tool = tmp_path / "tool"
+    tool.mkdir()
+    model = tmp_path / "model"
+    model.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    fixture = ARCHIVE / "00-baseline/ais.log"
+    (tool / "aisbench_test.py").write_text(
+        "import json,os,sys\nfrom pathlib import Path\n"
+        f'Path("arguments.json").write_text(json.dumps(sys.argv[1:]))\n'
+        'Path("artifact").mkdir(exist_ok=True)\n'
+        'Path("artifact/result.json").write_text("{\\"requests\\":16}")\n'
+        'Path("aisbench.log").write_text("Current exp folder: artifact\\n")\n'
+        'Path("aisbench_result.csv").write_text("requests,ttft\\n16,36104.9553\\n")\n'
+        f"print(Path({str(fixture)!r}).read_text(),flush=True)\n"
+    )
+    binary = tmp_path / "ais_bench"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    conda = tmp_path / "conda"
+    conda.write_text("#!/bin/bash\necho 'conda() { return 0; };'\n")
+    conda.chmod(0o755)
+    monkeypatch.setenv("CONDA_EXE", str(conda))
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    env = tmp_path / "env.sh"
+    env.write_text("conda activate fixture\n")
+    server_info = dict(
+        max_running_requests=16,
+        disable_radix_cache=False,
+        page_size=128,
+        dcp_size=16,
+        context_length=1024000,
+        chunked_prefill_size=16384,
+    )
+    routes = []
+
+    class Server(BaseHTTPRequestHandler):
+        def do_GET(self):
+            routes.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(server_info).encode() if self.path == "/server_info" else b""
+            )
+
+        def do_POST(self):
+            routes.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Cache flushed")
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Server)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(h, "SERVER_PORT", server.server_port)
+    (tool / "config.py").write_text(
+        f'HOST_IP="127.0.0.1"\nHOST_PORT={server.server_port}\nMODEL_PATH={str(model)!r}\nWORK_PATH={str(work)!r}\n'
+    )
+    args = args_for("--round", "speed", "--ais-dir", str(tool), "--ais-env", str(env))
+    case = tmp_path / "output"
+    case.mkdir()
+    captures = [0]
+
+    def capture(*a):
+        captures[0] += 1
+        text = "max_total_num_tokens=1196032\n"
+        if captures[0] > 1:
+            text += "[ TP0] Prefill batch, #new-seq: 1, #new-token: 10000, #cached-token: 989184\n"
+        (case / "server.log").write_text(text)
+        return text
+
+    monkeypatch.setattr(h, "capture_server_log", capture)
+    monkeypatch.setattr(
+        h, "remote_action", lambda *a: {"identity": {"pid": 1}, "members": [{"pid": 1}]}
+    )
+    try:
+        result = h.run_aisbench(
+            args,
+            case,
+            time.monotonic() + 20,
+            server_info,
+            "owned",
+            "remote.log",
+            lambda message: None,
+            "commit",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert result["status"] == "ok", result
+    assert result["metrics"]["TTFT avg"] == 36104.9553
+    assert result["metrics"]["TPOT avg"] is None
+    assert result["preparation"]["total_req"] == 1
+    assert result["prefix_cache"]["cached_tokens"] == 989184
+    profile = next((case / "profile0").iterdir())
+    assert (profile / "aisbench_result.csv").exists()
+    assert (profile / "aisbench_outputs/artifact/result.json").exists()
+    assert (profile / "config.py").exists() and (profile / "server_info.json").exists()
+    assert json.loads((case / "ais-environment.json").read_text())["PROFILE"] == "0"
+    assert len([route for route in routes if route.startswith("/flush_cache")]) == 1
+    assert not any("profile" in route for route in routes)
+    command = json.loads((tool / "arguments.json").read_text())
+    assert command[command.index("--data_num") + 1] == "16"
+    assert command[command.index("--concurrency") + 1] == "16"
+
+
+def test_monitored_timeout_kills_detached_client(tmp_path):
+    pidfile = tmp_path / "detached.pid"
+    child = "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)"
+    script = (
+        "import subprocess,pathlib,time; "
+        f'p=subprocess.Popen([{sys.executable!r},"-c",{child!r}],start_new_session=True); '
+        f"pathlib.Path({str(pidfile)!r}).write_text(str(p.pid)); time.sleep(60)"
+    )
+    with pytest.raises(h.BudgetExpired):
+        h.execute(
+            [sys.executable, "-c", script],
+            time.monotonic() + 0.4,
+            log_path=tmp_path / "out.log",
+            monitor=lambda: None,
+            monitor_interval=0.05,
+        )
+    deadline = time.monotonic() + 2
+    while (
+        (info := remote.proc_info(pidfile.read_text()))
+        and info["state"] != "Z"
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+    assert info is None or info["state"] == "Z"

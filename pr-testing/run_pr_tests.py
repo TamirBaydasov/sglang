@@ -20,12 +20,12 @@ Cases (in order; baseline bracket first + last):
 
 Rounds:
   smoke     server starts, /health + one greedy generation per case
-  accuracy  paired greedy prompt set (+ optional GSM8K subset) per case
+  accuracy  reference raw five-shot GSM8K (+ optional chat diagnostics) per case
   speed     AISBench prefix-cache 1M TTFT per case
   all       accuracy and speed on separate fresh servers (default)
 
 Usage (on the A3 HOST):
-  python3 run_pr_tests.py --round all --hours 10 --case-minutes 60
+  python3 run_pr_tests.py --round all --gsm8k /path/to/test.jsonl --hours 10 --case-minutes 60
   python3 run_pr_tests.py --round speed
   python3 run_pr_tests.py --stop-only
   python3 run_pr_tests.py --dry-run
@@ -40,6 +40,7 @@ import ast
 import datetime
 import fcntl
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -330,30 +331,6 @@ def build_accuracy_prompts(total, long_tokens):
     return prompts[:total]
 
 
-GSM8K_EXEMPLARS = [
-    (
-        "Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes of babysitting. How much did she earn?",
-        "Weng earns 12/60 = $0.2 per minute. Working 50 minutes, she earned 0.2 x 50 = $10. #### 10",
-    ),
-    (
-        "Betty is saving money to buy a new wallet which costs $100. Betty has only half of the money she needs. Her parents decided to give her $15 for that purpose, and her grandparents twice as much as her parents. How much more money does Betty need to buy the wallet?",
-        "Betty has 100/2 = $50. Her grandparents gave 15*2 = $30. Betty now has 50+15+30 = $95. She needs 100-95 = $5 more. #### 5",
-    ),
-    (
-        "James writes a 3-page letter to 2 different friends twice a week. How many pages does he write a year?",
-        "He writes 3*2*2 = 12 pages per week. Per year 12*52 = 624. #### 624",
-    ),
-    (
-        "A robe takes 2 bolts of blue fiber and half that much white fiber. How many bolts in total does it take?",
-        "It takes 2/2 = 1 bolt of white fiber. So the total is 2+1 = 3 bolts. #### 3",
-    ),
-    (
-        "Ken had fifty apples. He gave half to James and sold the rest for $0.60 each. How much did he earn?",
-        "He gave away 50/2 = 25. He sold 25 apples at 0.60 = $15. #### 15",
-    ),
-]
-
-
 # All host and container work shares a monotonic deadline.
 class BudgetExpired(TimeoutError):
     pass
@@ -377,9 +354,41 @@ def now():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 
-def execute(command, deadline, timeout=120, env=None, input_text=None, log_path=None):
+def stop_tagged_clients(token):
+    if not token:
+        return
+    for path in Path("/proc").iterdir():
+        if not path.name.isdigit():
+            continue
+        info = PROCESS_HELPER.proc_info(path.name)
+        if info and info["state"] != "Z" and info["token"] == token:
+            current = PROCESS_HELPER.proc_info(info["pid"])
+            if (
+                current
+                and current["start"] == info["start"]
+                and current["token"] == token
+            ):
+                try:
+                    os.kill(info["pid"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+def execute(
+    command,
+    deadline,
+    timeout=120,
+    env=None,
+    input_text=None,
+    log_path=None,
+    monitor=None,
+    monitor_interval=15,
+):
     """Kill the entire host command group on timeout or interruption."""
     seconds = remaining(deadline, timeout)
+    client_token = uuid.uuid4().hex if monitor is not None else None
+    if client_token:
+        env = dict(os.environ if env is None else env, PRTEST_RUN_TOKEN=client_token)
     output = open(log_path, "w") if log_path else subprocess.PIPE
     try:
         process = subprocess.Popen(
@@ -396,7 +405,21 @@ def execute(command, deadline, timeout=120, env=None, input_text=None, log_path=
             output.close()
         raise
     try:
-        stdout, _ = process.communicate(input_text, timeout=seconds)
+        if monitor is None:
+            stdout, _ = process.communicate(input_text, timeout=seconds)
+        else:
+            if log_path is None or input_text is not None:
+                raise ValueError("monitored commands require a log file and no stdin")
+            command_deadline = min(deadline, time.monotonic() + seconds)
+            while process.poll() is None:
+                remaining(command_deadline)
+                monitor()
+                try:
+                    process.wait(timeout=remaining(command_deadline, monitor_interval))
+                except subprocess.TimeoutExpired:
+                    continue
+            stdout = ""
+        stop_tagged_clients(client_token)
         return subprocess.CompletedProcess(
             command, process.returncode, stdout or "", ""
         )
@@ -409,6 +432,7 @@ def execute(command, deadline, timeout=120, env=None, input_text=None, log_path=
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             pass
+        stop_tagged_clients(client_token)
         # Children can outlive a reaped parent and ignore SIGTERM.
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -554,8 +578,6 @@ def gold_number(answer):
 
 
 def load_gsm8k(path, samples, seed):
-    import random
-
     rows = []
     with open(path, encoding="utf-8") as handle:
         for index, line in enumerate(handle):
@@ -570,58 +592,163 @@ def load_gsm8k(path, samples, seed):
             rows.append(dict(row, sample_id=index))
     if len(rows) < samples:
         raise ValueError(f"GSM8K has {len(rows)} samples; requested {samples}")
-    random.Random(seed).shuffle(rows)
     return rows[:samples]
 
 
-def run_gsm8k(rows, args, case_dir, deadline, log):
-    shots = "\n\n".join(f"Question: {q}\nAnswer: {a}" for q, a in GSM8K_EXEMPLARS)
+def gsm8k_snapshot(folder, args, complete=False, returncode=None):
+    raw = folder / "raw.jsonl"
     details = []
-    out = {
-        "dataset_sha256": args.dataset_sha256,
-        "seed": args.gsm8k_seed,
-        "requested": len(rows),
+    if raw.exists():
+        for line in raw.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue  # The writer may still be completing its last line.
+            details.append(
+                dict(
+                    row,
+                    id=row["prompt_id"],
+                    ok=row["correct"],
+                    got=row["prediction"],
+                    metadata=row.get("meta_info", {}),
+                )
+            )
+    details.sort(key=lambda row: row["id"])
+    result = {
+        "requested": args.gsm8k_samples,
+        "completed": len(details),
         "details": details,
-        "generation": {"temperature": 0, "max_tokens": args.gsm8k_max_tokens},
+        "correct": sum(row["ok"] for row in details),
+        "errors": sum(bool(row.get("error")) for row in details),
+        "truncated": sum(bool(row.get("truncated")) for row in details),
+        "invalid": sum(bool(row.get("invalid")) for row in details),
+        "dataset_sha256": args.dataset_sha256,
+        "scorer": "legacy-last-integer-v1",
+        "prompt_mode": "raw-completion-legacy-five-shot",
+        "question_selection": "first N dataset rows in file order",
+        "generation": {
+            "temperature": 0,
+            "top_p": 1,
+            "max_new_tokens": args.gsm8k_max_tokens,
+            "stop": ["Question", "Assistant:", "<|separator|>"],
+        },
+        "parallel": args.gsm8k_parallel,
         "status": "running",
     }
-    for row in rows:
-        remaining(deadline)
-        prompt = shots + "\n\nQuestion: " + row["question"] + "\nAnswer:"
-        detail = {"id": row["sample_id"], "prompt": prompt, "gold": row["answer"]}
-        try:
-            text, meta = chat(prompt, args.model, deadline, args.gsm8k_max_tokens)
-            detail.update(
-                output=text,
-                metadata=meta,
-                got=last_number(text),
-                want=gold_number(row["answer"]),
-                truncated=meta.get("finish_reason") == "length",
-            )
-            detail["ok"] = (
-                not detail["truncated"]
-                and detail["got"] is not None
-                and abs(detail["got"] - detail["want"]) < 1e-6
-            )
-        except (BudgetExpired, subprocess.TimeoutExpired):
-            raise
-        except Exception as exc:
-            detail.update(error=f"{type(exc).__name__}: {exc}", ok=False)
-        details.append(detail)
-        out.update(
-            completed=len(details),
-            correct=sum(d["ok"] for d in details),
-            errors=sum("error" in d for d in details),
-            truncated=sum(d.get("truncated", False) for d in details),
+    result["accuracy"] = result["correct"] / args.gsm8k_samples
+    manifest = folder / "manifest.json"
+    if manifest.exists():
+        result["manifest"] = json.loads(manifest.read_text())
+        if result["manifest"]["dataset_sha256"] != args.dataset_sha256:
+            raise ValueError("GSM8K dataset changed after validation")
+    summary = folder / "result.json"
+    if summary.exists():
+        result["reference_result"] = json.loads(summary.read_text())
+    if complete:
+        result["returncode"] = returncode
+        result["status"] = (
+            "ok"
+            if returncode == 0
+            and not result["errors"]
+            and len(details) == args.gsm8k_samples
+            and summary.exists()
+            else "failed"
         )
-        out["accuracy"] = out["correct"] / len(rows)
+    return result
+
+
+def client_monitor(
+    args, state_path, case_dir, deadline, log, progress_path=None, snapshot=None
+):
+    offset = 0
+
+    def monitor():
+        nonlocal offset
+        if state_path:
+            status = remote_action(args, "check", state_path, deadline)
+            if not any(
+                info["pid"] == status["identity"]["pid"] for info in status["members"]
+            ):
+                raise RuntimeError(
+                    "owned server exited while benchmark client was running"
+                )
+        if progress_path and progress_path.exists():
+            with progress_path.open(errors="replace") as handle:
+                handle.seek(offset)
+                text = handle.read()
+                offset = handle.tell()
+            for line in text.splitlines():
+                if line.startswith(("Completed ", "ERROR:", "Shot/test overlap:")):
+                    log(line)
+        if snapshot:
+            snapshot()
+
+    return monitor
+
+
+def run_gsm8k(rows, args, case_dir, deadline, log, state_path=None, server=None):
+    folder = case_dir / "gsm8k-reference"
+    script = Path(__file__).with_name("prtest_gsm8k.py")
+    resolved = (server or {}).get("server_args", server or {})
+    variant = (
+        "megamoe"
+        if resolved.get("moe_a2a_backend") == "ascend_fuseep"
+        and resolved.get("fuseep_mode") == 3
+        else "baseline"
+    )
+    # Reuse the reference client verbatim; no server launch options are imported.
+    command = [
+        sys.executable,
+        "-u",
+        str(script),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(SERVER_PORT),
+        "--variant",
+        variant,
+        "--data-path",
+        str(Path(args.gsm8k).resolve()),
+        "--num-questions",
+        str(args.gsm8k_samples),
+        "--parallel",
+        str(args.gsm8k_parallel),
+        "--max-new-tokens",
+        str(args.gsm8k_max_tokens),
+        "--timeout",
+        str(args.gsm8k_timeout),
+        "--output",
+        str(folder),
+    ]
+    if args.gsm8k_shots_data:
+        command += ["--shots-data", str(Path(args.gsm8k_shots_data).resolve())]
+    save(case_dir / "gsm8k-command.json", command)
+    path = case_dir / "gsm8k-client.log"
+
+    def snapshot():
+        save(case_dir / "gsm8k.json", gsm8k_snapshot(folder, args))
+
+    monitor = client_monitor(args, state_path, case_dir, deadline, log, path, snapshot)
+    code = None
+    try:
+        result = execute(
+            command,
+            deadline,
+            remaining(deadline),
+            log_path=path,
+            monitor=monitor,
+            monitor_interval=2,
+        )
+        code = result.returncode
+    finally:
+        out = gsm8k_snapshot(folder, args, complete=True, returncode=code)
+        if code is None:
+            out["status"] = "incomplete"
         save(case_dir / "gsm8k.json", out)
-        if len(details) % 16 == 0 or len(details) == len(rows):
-            log(
-                f"GSM8K {len(details)}/{len(rows)} correct={out['correct']} errors={out['errors']}"
-            )
-    out["status"] = "failed" if out["errors"] or out["truncated"] else "ok"
-    save(case_dir / "gsm8k.json", out)
+    log(
+        f"GSM8K {out['completed']}/{out['requested']} correct={out['correct']} "
+        f"errors={out['errors']} truncated={out['truncated']} invalid={out['invalid']}"
+    )
     return out
 
 
@@ -710,6 +837,9 @@ def validate_ais(text, returncode, requests, length=None):
                 errors.append("AISBench output length differs from 1")
         except (KeyError, TypeError, ValueError):
             errors.append(f"phase {index} missing/non-numeric metrics")
+    for item in metrics:
+        if item.get("output_len") == 1:
+            item.update({"TPOT avg": None, "TPOT SLO_P90": None})
     return {
         "status": "failed" if errors else "ok",
         "reason": "; ".join(dict.fromkeys(errors)),
@@ -767,14 +897,20 @@ PYCHECK
 """
 
 
+REFERENCE_PROFILE0 = Path(__file__).with_name("prtest_profile0.sh")
+
+
 def ais_command(args, preflight=False):
     script = AIS_SETUP + (
-        AIS_PREFLIGHT if preflight else 'exec python3 aisbench_test.py "${@:3}"\n'
+        AIS_PREFLIGHT
+        if preflight
+        else 'exec bash "$3" -- python3 aisbench_test.py "${@:4}"\n'
     )
     command = ["bash", "-c", script, "prtest-ais", args.ais_env, args.ais_dir]
     if preflight:
         return command + [args.model, str(SERVER_PORT)]
     return command + [
+        str(REFERENCE_PROFILE0),
         "--input_len",
         str(args.length),
         "--output_len",
@@ -816,25 +952,198 @@ def ais_preflight(args, deadline):
     raise ValueError("AIS preflight produced no environment record")
 
 
-def run_aisbench(args, case_dir, deadline):
-    # A failed flush invalidates the cold-prefix contract.
-    http_raw("/flush_cache?timeout=60", {}, deadline, 120)
+def speed_capacity(server, server_log, args):
+    server = server.get("server_args", server)
+    if server.get("disable_radix_cache"):
+        raise RuntimeError("prefix-cache benchmark requires radix caching")
+    width = server.get("max_running_requests")
+    if not isinstance(width, int) or width < args.requests:
+        raise RuntimeError(
+            f"server max_running_requests={width} is below concurrency {args.requests}"
+        )
+    page_size, dcp = server.get("page_size"), server.get("dcp_size")
+    if (
+        not isinstance(page_size, int)
+        or not isinstance(dcp, int)
+        or min(page_size, dcp) < 1
+    ):
+        raise RuntimeError(
+            "resolved page size or DCP size is unavailable for KV capacity validation"
+        )
+    page = page_size * dcp
+    cached = (int(args.length * 0.99) - 1) // page * page
+    suffix = (args.length + 1 - cached + page - 1) // page * page
+    required = (
+        max(
+            (args.length + 1 + page - 1) // page * page, cached + args.requests * suffix
+        )
+        + 4096
+    )
+    capacities = [
+        int(value) for value in re.findall(r"max_total_num_tokens=(\d+)", server_log)
+    ]
+    return {
+        "actual": min(capacities) if capacities else None,
+        "required": required,
+        "page_size": page_size,
+        "dcp_size": dcp,
+        "length": args.length,
+        "status": "ok"
+        if capacities and min(capacities) >= required
+        else "capacity-blocked",
+    }
+
+
+def prefix_evidence(text):
+    lines = [line for line in text.splitlines() if "Prefill batch" in line]
+    tp0 = [line for line in lines if " TP0" in line]
+    pattern = re.compile(
+        r"Prefill batch.*?#new-seq: (\d+), #new-token: (\d+), #cached-token: (\d+)"
+    )
+    rows = [
+        tuple(map(int, match.groups()))
+        for line in tp0 or lines
+        if (match := pattern.search(line))
+    ]
+    computed = sum(row[1] for row in rows)
+    cached = sum(row[2] for row in rows)
+    return {
+        "status": "observed" if cached else "cache-hit-unverified",
+        "prefill_batches": len(rows),
+        "computed_tokens": computed,
+        "cached_tokens": cached,
+        "cached_fraction": cached / max(computed + cached, 1),
+        "scope": "server scheduler logs for this AISBench invocation; cold prefix included",
+    }
+
+
+def run_aisbench(
+    args,
+    case_dir,
+    deadline,
+    server=None,
+    state_path=None,
+    remote_log=None,
+    log=print,
+    commit="",
+):
+    if server is None or not state_path or not remote_log:
+        raise RuntimeError(
+            "AISBench requires owned-server configuration and log provenance"
+        )
+    startup_log = capture_server_log(args, remote_log, case_dir, deadline)
+    capacity = speed_capacity(server, startup_log, args)
+    save(case_dir / "capacity.json", capacity)
+    if capacity["status"] != "ok":
+        raise RuntimeError(
+            f"capacity-blocked: KV capacity {capacity['actual']} < {capacity['required']}"
+        )
+    profile_root = case_dir / "profile0"
     command = ais_command(args)
     save(case_dir / "ais-command.json", command)
+    env = dict(
+        ais_environment(args),
+        PROFILE="0",
+        PROFILE_PHASE="",
+        PROFILE_DELAY="0",
+        PROFILE_STEPS="",
+        FLUSH="0",
+        HOST="127.0.0.1",
+        PORT=str(SERVER_PORT),
+        BENCH_DIR=args.ais_dir,
+        LABEL=case_dir.parent.parent.name,
+        OUT_ROOT=str(profile_root.resolve()),
+        SERVER_LOG=str((case_dir / "server.log").resolve()),
+        SGLANG_REV=commit,
+    )
+    save(
+        case_dir / "ais-environment.json",
+        {
+            key: env[key]
+            for key in (
+                "PROFILE",
+                "FLUSH",
+                "HOST",
+                "PORT",
+                "BENCH_DIR",
+                "LABEL",
+                "OUT_ROOT",
+                "SERVER_LOG",
+                "SGLANG_REV",
+            )
+        },
+    )
+    # Flush strictly here; the reference wrapper only warns when its flush fails.
+    response = http_raw("/flush_cache?timeout=60", {}, deadline, 120)
+    save(case_dir / "cache-flush.json", {"status": "ok", "response": response})
+    offset = len(startup_log)
+    base_monitor = client_monitor(args, state_path, case_dir, deadline, log)
+
+    def monitor():
+        base_monitor()
+        capture_server_log(args, remote_log, case_dir, deadline)
+        log(
+            "AISBench running (prefix preparation and measurement use the reference PROFILE=0 script)"
+        )
+
     path = case_dir / "ais.log"
-    result = execute(
-        command,
-        deadline,
-        args.benchmark_timeout,
-        env=ais_environment(args),
-        log_path=path,
+    code = None
+    try:
+        process = execute(
+            command,
+            deadline,
+            args.benchmark_timeout,
+            env=env,
+            log_path=path,
+            monitor=monitor,
+            monitor_interval=15,
+        )
+        code = process.returncode
+    finally:
+        # Keep the client failure as the primary error if log export also fails.
+        try:
+            full_log = capture_server_log(args, remote_log, case_dir)
+            invocation_log = full_log[offset:]
+            (case_dir / "timed-server.log").write_text(invocation_log)
+            evidence = prefix_evidence(invocation_log)
+            save(case_dir / "prefix-cache.json", evidence)
+            for directory in profile_root.glob("*") if profile_root.exists() else []:
+                if directory.is_dir():
+                    (directory / "server_log.txt").write_text(invocation_log)
+        except Exception as exc:
+            save(case_dir / "client-log-export-error.json", {"error": str(exc)})
+            log(f"AISBench log export failed: {exc}")
+            if code is not None:
+                raise
+    candidates = list(profile_root.glob("*/bench.log"))
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"expected one reference PROFILE=0 output, found {len(candidates)}"
+        )
+    result = validate_ais(
+        candidates[0].read_text(errors="replace"), code, args.requests, args.length
     )
-    return validate_ais(
-        path.read_text(errors="replace"), result.returncode, args.requests, args.length
+    result.update(
+        capacity=capacity,
+        prefix_cache=evidence,
+        reference_profile=str(candidates[0].parent.relative_to(case_dir)),
     )
+    if evidence["status"] != "observed":
+        result.update(
+            status="failed",
+            reason="cached-prefix hits unverified in the timed server log",
+            metrics=None,
+        )
+    return result
 
 
 REMOTE = Path(__file__).with_name("prtest_remote.py").read_text()
+_PROCESS_SPEC = importlib.util.spec_from_file_location(
+    "prtest_process_helper", Path(__file__).with_name("prtest_remote.py")
+)
+PROCESS_HELPER = importlib.util.module_from_spec(_PROCESS_SPEC)
+_PROCESS_SPEC.loader.exec_module(PROCESS_HELPER)
+
 CANN_ENV_FALLBACKS = (
     "/usr/local/Ascend/cann-9.2.0-beta.2/set_env.sh",
     "/usr/local/Ascend/cann-9.2/set_env.sh",
@@ -1010,9 +1319,12 @@ def stop_server(args, state_path):
         raise RuntimeError("owned server cleanup did not confirm termination")
 
 
-def capture_server_log(args, remote_log, case_dir):
+def capture_server_log(args, remote_log, case_dir, deadline=None):
     output = run_capture(
-        args, shlex.join(["cat", remote_log]), time.monotonic() + 20, timeout=15
+        args,
+        shlex.join(["cat", remote_log]),
+        deadline or time.monotonic() + 20,
+        timeout=15,
     )
     (case_dir / "server.log").write_text(output)
     return output
@@ -1128,6 +1440,12 @@ def resolved_comparison(config, smoke_record):
         "cuda_graph_backend_decode",
         "cuda_graph_max_bs_decode",
         "json_model_override_args",
+        "model_impl",
+        "disable_shared_experts_fusion",
+        "disable_radix_cache",
+        "max_prefill_tokens",
+        "max_total_tokens",
+        "page_size",
     )
     return dict(config, resolved_server={key: server.get(key) for key in keys})
 
@@ -1288,7 +1606,15 @@ def run_phase(
                 )
             checkpoint()
             if phase == "accuracy":
-                gsm = run_gsm8k(args.gsm_rows, args, attempt_dir, deadline, log)
+                gsm = run_gsm8k(
+                    args.gsm_rows,
+                    args,
+                    attempt_dir,
+                    deadline,
+                    log,
+                    state_path,
+                    attempt["smoke"]["server"],
+                )
                 attempt["gsm8k"] = gsm
                 checkpoint()
                 attempt["accuracy"] = run_accuracy_prompts(
@@ -1300,7 +1626,9 @@ def run_phase(
                         status="failed", reason="paired-output requests failed"
                     )
                 if gsm["status"] != "ok":
-                    attempt["reason"] = "GSM8K requests failed or responses truncated"
+                    attempt["reason"] = (
+                        "GSM8K reference client failed or did not complete"
+                    )
                 elif (
                     args.gsm8k_min_accuracy is not None
                     and gsm["accuracy"] < args.gsm8k_min_accuracy
@@ -1312,7 +1640,16 @@ def run_phase(
             elif phase == "speed":
                 if args.ais_preflight_error:
                     raise RuntimeError(args.ais_preflight_error)
-                attempt["speed"] = run_aisbench(args, attempt_dir, deadline)
+                attempt["speed"] = run_aisbench(
+                    args,
+                    attempt_dir,
+                    deadline,
+                    attempt["smoke"]["server"],
+                    state_path,
+                    remote_log,
+                    log,
+                    record.get("commit", ""),
+                )
                 attempt["status"] = attempt["speed"]["status"]
                 attempt["reason"] = attempt["speed"]["reason"]
             elif phase.startswith("diagnostic-"):
@@ -1424,6 +1761,7 @@ def quality(record):
         return "unverified"
     if (
         gsm.get("status") != "ok"
+        or gsm.get("truncated", 0)
         or not gsm.get("correct")
         or attempt.get("status") != "ok"
     ):
@@ -1450,6 +1788,7 @@ def summarize(records, output, args):
         "",
         "TTFT uses milliseconds in JSON and seconds below. Ratios are single-run diagnostic samples.",
         "GSM8K quality and performance status are independent; unresolved quality does not stop timing collection.",
+        "Current GSM8K runs use the reference raw-completion five-shot protocol and legacy-last-integer-v1 scorer; historical reports retain their original provenance.",
         "",
         "| Case | Status | GSM8K correct/total | Quality | TTFT mean/P90 (s) | Baseline/variant mean | Reason |",
         "|---|---|---|---|---|---|---|",
@@ -1462,6 +1801,10 @@ def summarize(records, output, args):
             if gsm.get("requested")
             else "unavailable"
         )
+        if gsm.get("manifest"):
+            overlap = gsm["manifest"].get("shot_overlap_question_ids", [])
+            gsm_text += f"; shot/test overlap={len(overlap)}"
+
         speed, attempt = speed_data(record)
         metrics = speed.get("metrics") if speed.get("status") == "ok" else None
         timing = (
@@ -1593,7 +1936,12 @@ def regenerate(args):
         for phase_name, phase in phases.items():
             for index, attempt in enumerate(phase.get("attempts", []), 1):
                 attempt_dir = directory / phase_name / f"attempt-{index}"
-                log_path = attempt_dir / "ais.log"
+                profile_logs = list((attempt_dir / "profile0").glob("*/bench.log"))
+                log_path = (
+                    profile_logs[0]
+                    if len(profile_logs) == 1
+                    else attempt_dir / "ais.log"
+                )
                 if phase_name == "speed" and log_path.exists():
                     old_speed = attempt.get("speed", {})
                     speed = validate_ais(
@@ -1738,8 +2086,19 @@ def parser():
         "--gsm8k", help="host path to GSM8K test JSONL; required for accuracy/all"
     )
     p.add_argument("--gsm8k-samples", type=int, default=64)
-    p.add_argument("--gsm8k-seed", type=int, default=4)
-    p.add_argument("--gsm8k-max-tokens", type=int, default=512)
+    p.add_argument(
+        "--gsm8k-seed",
+        type=int,
+        default=4,
+        help="deprecated: reference client uses file order, not shuffling",
+    )
+    p.add_argument("--gsm8k-max-tokens", type=int, default=1024)
+    p.add_argument("--gsm8k-parallel", type=int, default=16)
+    p.add_argument("--gsm8k-timeout", type=float, default=900)
+    p.add_argument(
+        "--gsm8k-shots-data",
+        help="optional separate five-shot dataset; default matches reference test-set shots",
+    )
     p.add_argument("--gsm8k-min-accuracy", type=float, default=None)
     p.add_argument("--length", type=int, default=1000000)
     p.add_argument("--requests", type=int, default=16)
@@ -1754,7 +2113,12 @@ def parser():
     )
     p.add_argument("--decode-graph", choices=("on", "off"), default="on")
     p.add_argument("--server-seed", type=int, default=4)
-    p.add_argument("--accuracy-requests", type=int, default=64)
+    p.add_argument(
+        "--accuracy-requests",
+        type=int,
+        default=0,
+        help="optional extra chat-output diagnostics; GSM8K is separate",
+    )
     p.add_argument("--accuracy-long-tokens", type=int, default=32768)
     p.add_argument("--startup-timeout", type=float, default=1800)
     p.add_argument("--benchmark-timeout", type=float, default=14400)
@@ -1792,6 +2156,8 @@ def validate_args(args):
     for key in (
         "gsm8k_samples",
         "gsm8k_max_tokens",
+        "gsm8k_parallel",
+        "gsm8k_timeout",
         "length",
         "requests",
         "chunk",
@@ -1839,6 +2205,11 @@ def validate_args(args):
         AIS_ENV_CANDIDATES[0],
     )
     args.cann_env_resolved = args.container_cann_env
+    manifest = Path(__file__).with_name("REFERENCE_SOURCES.json")
+    for entry in json.loads(manifest.read_text()):
+        asset = manifest.parent / entry["file"]
+        if hashlib.sha256(asset.read_bytes()).hexdigest() != entry["sha256"]:
+            raise ValueError("reference client checksum mismatch: " + entry["file"])
     return apply_overrides(plan_cases(args), args.flags_overrides)
 
 
@@ -1864,7 +2235,7 @@ def dry_run(args, cases):
                 )
             if phase == "accuracy":
                 print(
-                    f"  GSM8K: {args.gsm8k_samples} samples, seed={args.gsm8k_seed}, dataset={args.gsm8k or '<required at execution>'}"
+                    f"  GSM8K reference: {args.gsm8k_samples} samples in file order, parallel={args.gsm8k_parallel}, max_new_tokens={args.gsm8k_max_tokens}, dataset={args.gsm8k or '<required at execution>'}"
                 )
     return 0
 
@@ -1931,6 +2302,7 @@ def main(argv=None):
                     "--gsm8k is required for accuracy/all; speed runs independently with --round speed"
                 )
             args.gsm_rows = load_gsm8k(args.gsm8k, args.gsm8k_samples, args.gsm8k_seed)
+            load_gsm8k(args.gsm8k_shots_data or args.gsm8k, 5, args.gsm8k_seed)
             args.dataset_sha256 = hashlib.sha256(
                 Path(args.gsm8k).read_bytes()
             ).hexdigest()

@@ -1,0 +1,18 @@
+[
+  {
+    "source": "test_pr1_megamoe_accuracy.py",
+    "source_sha256": "3fb8b761dc893471d7562a3708b0be171b723d9caa32fd94759bb4a1e387e7e9",
+    "extracted_constant": "GSM8K_CLIENT",
+    "file": "prtest_gsm8k.py",
+    "sha256": "63dff0fb73dfc727e52ddb889c1230bef15de8cd1dcbd1c885908066c67c1795",
+    "modifications": "none; launcher and server arguments are not imported"
+  },
+  {
+    "source": "test_pr1_megamoe.py",
+    "source_sha256": "ea6e3e5daa9434f6fce62e01a1ac43866e0c351b6dccb05dfbb8bab7a1526a9f",
+    "extracted_constant": "PROFILE0_SCRIPT",
+    "file": "prtest_profile0.sh",
+    "sha256": "16c0b210b823419d8cf7be0df3a2cae36164c762e04c9fa37bccedeac8306bd9",
+    "modifications": "none; launcher and server arguments are not imported"
+  }
+]
