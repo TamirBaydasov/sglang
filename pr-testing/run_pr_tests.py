@@ -1238,7 +1238,7 @@ requires_lse = 'torch.ops.npu.npu_sparse_flash_attention_lse(' in backend
 print('PRTEST_PROBE='+json.dumps({'versions': versions, 'ops':ops, 'model_config':config,
  'requires_sparse_fa_lse': requires_lse,
  'model_files_sha256':files, 'python':sys.executable, 'torch_path':torch.__file__,
- 'environment':{k:v for k,v in os.environ.items() if k.startswith(('SGLANG_', 'ASCEND_', 'HCCL_', 'DEEPEP_')) or k in ('PYTHONPATH','LD_LIBRARY_PATH','PATH')}}))
+ 'environment':{k:v for k,v in os.environ.items() if k.startswith(('SGLANG_', 'ASCEND_', 'HCCL_', 'DEEPEP_')) or k in ('PYTHONPATH','LD_LIBRARY_PATH','LD_PRELOAD','PATH','CANN_HOME')}}))
 """
 
 
@@ -1271,29 +1271,67 @@ def server_argv(args, memfrac, graph, case_args=()):
     ]
 
 
+SERVER_ENV = r"""
+import json, os, re, subprocess, sys
+from pathlib import Path
+
+x = json.loads(sys.argv[1])
+env = dict(os.environ)
+setup = x['cann_env']
+if setup:
+    setup = Path(setup)
+    if not setup.is_absolute() or not setup.is_file():
+        raise RuntimeError('CANN environment must be an existing absolute set_env.sh path')
+    # Old bindings must not win imports after selecting a different toolkit.
+    roots = [Path(env[key]).resolve() for key in
+             ('ASCEND_HOME_PATH', 'CANN_HOME', 'ASCEND_TOOLKIT_HOME') if env.get(key)]
+    roots.append(Path('/usr/local/Ascend/ascend-toolkit').resolve())
+    for key in ('PATH', 'PYTHONPATH', 'LD_LIBRARY_PATH', 'LD_PRELOAD'):
+        parts = re.split(r'[: ]+', env.get(key, '')) if key == 'LD_PRELOAD' else env.get(key, '').split(os.pathsep)
+        env[key] = os.pathsep.join(part for part in parts if part and not any(
+            Path(part).resolve().is_relative_to(root) for root in roots))
+    for key in ('ASCEND_HOME_PATH', 'CANN_HOME', 'ASCEND_TOOLKIT_HOME', 'ASCEND_OPP_PATH',
+                'ASCEND_AICPU_PATH', 'TOOLCHAIN_HOME', 'TBE_IMPL_PATH'):
+        env.pop(key, None)
+    capture = 'import json, os; print(json.dumps(dict(os.environ)))'
+    env = json.loads(subprocess.check_output(
+        ['bash', '-c', 'set -e; source "$1" >/dev/null; exec "$2" -c "$3"',
+         '_', str(setup), sys.executable, capture], env=env, text=True, timeout=30))
+    if not any(env.get(key) for key in ('ASCEND_HOME_PATH', 'CANN_HOME')):
+        raise RuntimeError('Selected CANN environment did not set ASCEND_HOME_PATH or CANN_HOME')
+
+paths = [x['worktree']+'/python', *filter(None, env.get('PYTHONPATH', '').split(os.pathsep))]
+for key in ('ASCEND_HOME_PATH', 'CANN_HOME'):
+    if env.get(key):
+        for relative in ('python/site-packages', 'runtime/python/site-packages', 'pyACL/python/site-packages'):
+            path = Path(env[key])/relative
+            if path.is_dir():
+                paths.append(str(path))
+conda = env.get('CONDA_PREFIX')
+if conda and (Path(conda)/'lib/libstdc++.so.6').is_file():
+    library = str(Path(conda)/'lib/libstdc++.so.6')
+    preload = re.split(r'[: ]+', env.get('LD_PRELOAD', ''))
+    env['LD_PRELOAD'] = ':'.join(dict.fromkeys([*filter(None, preload), library]))
+# Unknown inherited feature flags must not contaminate baseline controls.
+env = {key: value for key, value in env.items() if not key.startswith('SGLANG_')}
+for key in ('HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
+    env.pop(key, None)
+env.update(x['env'], PYTHONPATH=os.pathsep.join(dict.fromkeys(paths)))
+os.chdir(x['worktree'])
+os.execvpe(x['argv'][0], x['argv'], env)
+"""
+
+
 def server_shell(args, worktree, env, argv):
-    # Clear inherited feature toggles so the baseline is a real control.
-    # CASES rows are 5-tuples: (name, ref, env, note, extra_server_args).
-    keys = sorted(
-        {key for _, _, flags, _, _ in CASES for key in flags} | set(BASE_ENV)
+    payload = dict(
+        cann_env=args.cann_env_resolved,
+        worktree=worktree,
+        env=dict(BASE_ENV, **env),
+        argv=argv,
     )
-    setup = "set -e; "
-    if args.cann_env_resolved:
-        setup += "source " + shlex.quote(args.cann_env_resolved) + "; "
-    setup += "cd " + shlex.quote(worktree) + "; "
-    setup += "unset " + " ".join(keys) + "; "
-    assignments = dict(BASE_ENV, **env)
-    setup += (
-        "export "
-        + shlex.join([f"{key}={value}" for key, value in assignments.items()])
-        + "; "
+    return "exec " + shlex.join(
+        [args.container_python, "-c", SERVER_ENV, json.dumps(payload)]
     )
-    setup += (
-        "export PYTHONPATH="
-        + shlex.quote(worktree + "/python")
-        + ':"${PYTHONPATH:-}"; '
-    )
-    return setup + "exec " + shlex.join(argv)
 
 
 def resolve_cann_env(args, deadline, log):
@@ -1479,7 +1517,14 @@ def comparison_config(args, runtime, memfrac, graph):
         "runtime_environment": {
             key: value
             for key, value in runtime["environment"].items()
-            if key in ("LD_LIBRARY_PATH", "ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME")
+            if key
+            in (
+                "LD_LIBRARY_PATH",
+                "LD_PRELOAD",
+                "ASCEND_HOME_PATH",
+                "CANN_HOME",
+                "ASCEND_TOOLKIT_HOME",
+            )
         },
         "ais_environment": getattr(args, "ais_preflight_record", None),
     }

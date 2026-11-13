@@ -470,7 +470,10 @@ def test_refs_are_pinned_once_with_same_baseline_bracket(monkeypatch):
 
     monkeypatch.setattr(h, "git", fake_git)
     result = h.pin_refs(
-        [h.CASES[0], h.CASES[-1]], args, time.monotonic() + 10, lambda pins: None
+        [h.CASES[0], next(case for case in h.CASES if case[0] == "08-baseline-repeat")],
+        args,
+        time.monotonic() + 10,
+        lambda pins: None,
     )
     assert len(calls) == 1
     assert result["dcp_ascend_testing"]["commit"] == "a" * 40
@@ -1005,3 +1008,171 @@ def test_monitored_timeout_kills_detached_client(tmp_path):
     ):
         time.sleep(0.01)
     assert info is None or info["state"] == "Z"
+
+
+@pytest.mark.parametrize("selected", [True, False])
+def test_server_environment_scrubs_toolkit_and_feature_leaks(tmp_path, selected):
+    old = tmp_path / "old-cann"
+    alias = tmp_path / "old-alias"
+    old.mkdir()
+    alias.symlink_to(old, target_is_directory=True)
+    unrelated = tmp_path / "old-cann-extra"
+    worktree = tmp_path / "work tree"
+    worktree.mkdir()
+    current = tmp_path / "selected cann"
+    binding = current / "runtime/python/site-packages"
+    binding.mkdir(parents=True)
+    script = current / "set_env.sh"
+    script.write_text(
+        'test -z "${ASCEND_OPP_PATH:-}" || return 21\n'
+        f"export ASCEND_HOME_PATH={h.shlex.quote(str(current))}\n"
+        f'export LD_LIBRARY_PATH={h.shlex.quote(str(current / "lib"))}:"${{LD_LIBRARY_PATH:-}}"\n'
+        # Exercise binding discovery when the setup script does not set PYTHONPATH.
+        "export SGLANG_FROM_SETUP=unexpected\n"
+    )
+    env = dict(os.environ)
+    env.update(
+        ASCEND_HOME_PATH=str(old),
+        CANN_HOME=str(alias),
+        ASCEND_TOOLKIT_HOME=str(old),
+        ASCEND_OPP_PATH=str(old / "opp"),
+        TBE_IMPL_PATH=str(old / "impl"),
+        PATH=str(alias / "bin") + os.pathsep + os.defpath,
+        PYTHONPATH=os.pathsep.join([str(alias / "python"), str(unrelated)]),
+        LD_LIBRARY_PATH=os.pathsep.join([str(old / "lib"), str(unrelated)]),
+        SGLANG_UNKNOWN_INHERITED="unexpected",
+        SGLANG_NPU_INDEXER_INT8="inherited",
+        HTTP_PROXY="http://inherited.invalid:8080",
+        https_proxy="http://inherited.invalid:8080",
+    )
+    env.pop("LD_PRELOAD", None)
+    env.pop("CONDA_PREFIX", None)
+    args = SimpleNamespace(
+        container_python=sys.executable,
+        cann_env_resolved=str(script) if selected else None,
+    )
+    argv = [
+        sys.executable,
+        "-c",
+        "import json,os,sys; print(json.dumps(dict(env=dict(os.environ), argv=sys.argv[1:], cwd=os.getcwd())))",
+        "literal;$(false)",
+    ]
+    flags = {"SGLANG_NPU_INDEXER_INT8": "case-value"}
+    result = subprocess.run(
+        ["bash", "-c", h.server_shell(args, str(worktree), flags, argv)],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=True,
+    )
+    captured = json.loads(result.stdout)
+    actual = captured["env"]
+    assert captured["argv"] == ["literal;$(false)"]
+    assert captured["cwd"] == str(worktree)
+    assert actual["SGLANG_NPU_INDEXER_INT8"] == "case-value"
+    assert "SGLANG_UNKNOWN_INHERITED" not in actual
+    assert "SGLANG_FROM_SETUP" not in actual
+    assert "HTTP_PROXY" not in actual and "https_proxy" not in actual
+    assert actual["NO_PROXY"] == h.BASE_ENV["NO_PROXY"]
+    assert actual["PYTHONPATH"].split(os.pathsep)[0] == str(worktree / "python")
+    assert str(unrelated) in actual["PYTHONPATH"].split(os.pathsep)
+    if selected:
+        for key in ("PATH", "PYTHONPATH", "LD_LIBRARY_PATH"):
+            assert str(old) + "/" not in actual[key]
+            assert str(alias) not in actual[key]
+        assert actual["ASCEND_HOME_PATH"] == str(current)
+        assert "CANN_HOME" not in actual and "ASCEND_TOOLKIT_HOME" not in actual
+        assert "ASCEND_OPP_PATH" not in actual and "TBE_IMPL_PATH" not in actual
+        assert str(binding) in actual["PYTHONPATH"].split(os.pathsep)
+    else:
+        assert actual["ASCEND_HOME_PATH"] == str(old)
+        assert str(alias / "python") in actual["PYTHONPATH"].split(os.pathsep)
+
+
+def test_server_environment_preload_parity(tmp_path):
+    library = next(
+        (
+            Path(path)
+            for path in (
+                "/usr/lib/x86_64-linux-gnu/libstdc++.so.6",
+                "/usr/lib/aarch64-linux-gnu/libstdc++.so.6",
+                "/usr/lib64/libstdc++.so.6",
+            )
+            if Path(path).is_file()
+        ),
+        None,
+    )
+    if library is None:
+        pytest.skip("a loadable libstdc++ is required for the exec regression")
+    old = tmp_path / "old"
+    old.mkdir()
+    old_library = old / "libstdc++.so.6"
+    # Keep this link inside the obsolete root so resolve() still sees it there.
+    old_library.write_bytes(library.read_bytes())
+    conda = tmp_path / "conda"
+    (conda / "lib").mkdir(parents=True)
+    conda_library = conda / "lib/libstdc++.so.6"
+    conda_library.symlink_to(library)
+    current = tmp_path / "current"
+    current.mkdir()
+    setup = current / "set_env.sh"
+    setup.write_text(f"export CANN_HOME={h.shlex.quote(str(current))}\n")
+    env = dict(
+        os.environ,
+        ASCEND_HOME_PATH=str(old),
+        CONDA_PREFIX=str(conda),
+        LD_PRELOAD=f"{old_library} {library}",
+    )
+    args = SimpleNamespace(
+        container_python=sys.executable, cann_env_resolved=str(setup)
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            h.server_shell(
+                args,
+                str(tmp_path),
+                {},
+                [sys.executable, "-c", "import os; print(os.environ['LD_PRELOAD'])"],
+            ),
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=15,
+    )
+    assert result.stdout.strip().split(":") == [str(library), str(conda_library)]
+
+
+@pytest.mark.parametrize("script", ["return 17\n", "export UNRELATED=value\n"])
+def test_selected_cann_environment_failure_prevents_server_exec(tmp_path, script):
+    setup = tmp_path / "set_env.sh"
+    setup.write_text(script)
+    marker = tmp_path / "server-started"
+    args = SimpleNamespace(
+        container_python=sys.executable, cann_env_resolved=str(setup)
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            h.server_shell(
+                args,
+                str(tmp_path),
+                {},
+                [
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                ],
+            ),
+        ],
+        text=True,
+        capture_output=True,
+        timeout=15,
+    )
+    assert result.returncode != 0
+    assert not marker.exists()

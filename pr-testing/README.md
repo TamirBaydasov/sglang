@@ -103,6 +103,14 @@ runtime; required operators are still probed in that exact environment. Use
 `--retry-oom` to opt into one separately recorded memory/graph fallback. These
 deviations suppress ratios against a differently configured baseline.
 
+When selecting a CANN setup script, the launcher removes inherited toolkit paths
+and root variables before sourcing it. It then retains the selected CANN Python
+bindings, conditionally preloads the active conda `libstdc++`, clears inherited
+`SGLANG_*` flags and proxy variables, and applies the explicit baseline/case
+settings. Runtime probes and servers use the same setup; their environment
+records include `LD_PRELOAD`. This matches the reference accuracy launcher's
+environment preparation; A3 accuracy must still be rerun.
+
 ## Baseline gibberish diagnosis
 
 ```bash
