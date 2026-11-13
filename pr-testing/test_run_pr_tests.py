@@ -1,0 +1,684 @@
+"""Regression checks using archived logs, local HTTP, and owned subprocesses."""
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+ROOT = Path(__file__).parent
+SPEC = importlib.util.spec_from_file_location("pr_harness", ROOT / "run_pr_tests.py")
+h = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(h)
+SPEC = importlib.util.spec_from_file_location("owned_remote", ROOT / "prtest_remote.py")
+remote = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(remote)
+ARCHIVE = ROOT / "prtest-results" / "20261112-232436"
+if not ARCHIVE.exists():
+    ARCHIVE = ROOT / "fixtures" / "20261112-232436"
+
+
+def args_for(*argv):
+    args = h.parser().parse_args(list(argv))
+    h.validate_args(args)
+    return args
+
+
+def test_archived_baseline_and_failure_placeholders():
+    text = (ARCHIVE / "00-baseline/ais.log").read_text()
+    data = h.validate_ais(text, 0, 16, 1000000)
+    assert data["status"] == "ok"
+    assert data["preparation"]["total_req"] == 1
+    assert data["metrics"]["TTFT avg"] == 36104.9553
+    assert data["metrics"]["TTFT P90"] == 60187.489
+    failed = h.validate_ais(
+        (ARCHIVE / "01-pr-e-chat-encode/ais.log").read_text(), 0, 16
+    )
+    assert failed["status"] == "failed"
+    assert failed["metrics"] is None
+    assert "request/tool failure" in failed["reason"]
+    assert h.validate_ais(text, 1, 16)["status"] == "failed"
+    assert h.validate_ais(text, 0, 8)["status"] == "failed"
+    assert h.validate_ais(text, 0, 16, 10000)["status"] == "failed"
+
+
+def test_safe_metric_parsing_and_partial_logs():
+    assert h.parse_ttft_lines("INFO {\"TTFT avg\": 12.3}\nINFO {'TTFT avg': 14.5}") == [
+        {"TTFT avg": 12.3},
+        {"TTFT avg": 14.5},
+    ]
+    assert h.parse_ttft_lines("INFO {'TTFT avg': __import__('os').getpid()}") == []
+    text = (ARCHIVE / "00-baseline/ais.log").read_text()
+    assert h.validate_ais(text[: text.index("'TTFT avg'")], 0, 16)["status"] == "failed"
+
+
+def test_summary_legacy_sha_and_partial_records(tmp_path):
+    records = [
+        {
+            "case": "00-baseline",
+            "ref": "base",
+            "status": "failed",
+            "accuracy": {"sha": {"a": "same"}},
+        },
+        {
+            "case": "01-pr-e-chat-encode",
+            "ref": "test",
+            "status": "failed",
+            "accuracy": {"sha": {"a": "same"}},
+        },
+        {"case": "02-pr-b-indexer-int8", "status": "pending"},
+    ]
+    h.summarize(records, tmp_path, SimpleNamespace())
+    assert "| 01-pr-e-chat-encode | 1/1 |" in (tmp_path / "SUMMARY.md").read_text()
+    assert "unavailable" in (tmp_path / "SUMMARY.md").read_text()
+
+
+def test_report_failure_keeps_results(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        h,
+        "summarize",
+        lambda *args: (_ for _ in ()).throw(ValueError("bad presentation")),
+    )
+    args = SimpleNamespace(report_failed=False)
+    h.checkpoint_results([{"case": "saved"}], tmp_path, args, lambda message: None)
+    assert json.loads((tmp_path / "results.json").read_text()) == [{"case": "saved"}]
+    assert args.report_failed
+
+
+def test_regenerate_preserves_original_evidence(tmp_path):
+    before = {path: path.read_bytes() for path in ARCHIVE.rglob("*") if path.is_file()}
+    assert (
+        h.main(["--regenerate", str(ARCHIVE), "--output", str(tmp_path / "report")])
+        == 0
+    )
+    summary = (tmp_path / "report/SUMMARY.md").read_text()
+    assert "36.105 / 60.187" in summary
+    assert "| 01-pr-e-chat-encode | failed" in summary
+    assert "99.999" not in summary
+    assert all(path.read_bytes() == content for path, content in before.items())
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--cases", "typo"],
+        ["--cases", "00-baseline,00-baseline"],
+        ["--hours", "nan"],
+        ["--case-minutes", "0"],
+        ["--requests", "-2"],
+        ["--memfrac", "nan"],
+        ["--flags-overrides", "00-baseline:X;bad=1"],
+        ["--extra-server-args=--model-path /wrong/model"],
+    ],
+)
+def test_invalid_arguments_fail_before_execution(argv):
+    assert h.main(argv + ["--dry-run"]) == 2
+
+
+def test_missing_gsm8k_fails_without_docker():
+    assert h.main(["--round", "accuracy"]) == 2
+
+
+def test_dry_run_uses_real_builders(capsys):
+    args = args_for(
+        "--round", "all", "--cases", "00-baseline", "--ais-conda-env", "custom"
+    )
+    h.dry_run(args, h.plan_cases(args))
+    output = capsys.readouterr().out
+    assert (
+        h.server_shell(
+            args, "<run-root>/worktrees/00-baseline", {}, h.server_argv(args, 0.7, True)
+        )
+        in output
+    )
+    assert h.shlex.join(h.ais_command(args)) in output
+    assert "accuracy: fresh server" in output and "speed: fresh server" in output
+
+
+def test_ais_preflight_and_runtime_share_custom_conda(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    tool = tmp_path / "tool"
+    tool.mkdir()
+    (tool / "config.py").write_text(
+        f'HOST_PORT=30000\nHOST_IP="127.0.0.1"\nMODEL_PATH={str(model)!r}\nWORK_PATH={str(work)!r}\n'
+    )
+    (tool / "aisbench_test.py").write_text(
+        'import os\nprint("ENV="+os.environ["ACTIVE_TEST_ENV"])\n'
+    )
+    binary = tmp_path / "ais_bench"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    env = tmp_path / "env.sh"
+    env.write_text(
+        f'export PATH={str(tmp_path)!r}:"$PATH"\nconda() {{ test "$1" = activate && export ACTIVE_TEST_ENV="$2"; }}\n'
+    )
+    args = args_for(
+        "--model",
+        str(model),
+        "--ais-dir",
+        str(tool),
+        "--ais-env",
+        str(env),
+        "--ais-conda-env",
+        "custom",
+    )
+    record = h.ais_preflight(args, time.monotonic() + 10)
+    assert record["ais_bench"] == str(binary)
+    result = h.execute(
+        h.ais_command(args), time.monotonic() + 10, env=h.ais_environment(args)
+    )
+    assert result.stdout.strip() == "ENV=custom"
+    (tool / "config.py").write_text('HOST_PORT=1234\nHOST_IP="127.0.0.1"\n')
+    with pytest.raises(RuntimeError, match="port mismatch"):
+        h.ais_preflight(args, time.monotonic() + 10)
+
+
+def test_gsm8k_records_responses_errors_and_truncation(tmp_path, monkeypatch):
+    args = args_for("--gsm8k-samples", "3")
+    args.dataset_sha256 = "dataset-hash"
+    rows = [
+        {"sample_id": n, "question": f"question {n}", "answer": "reason #### 42"}
+        for n in range(3)
+    ]
+    outputs = iter(
+        [
+            ("The answer is 42", {"finish_reason": "stop"}),
+            ("42", {"finish_reason": "length"}),
+            RuntimeError("HTTP failure"),
+        ]
+    )
+
+    def fake_chat(*args):
+        item = next(outputs)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr(h, "chat", fake_chat)
+    result = h.run_gsm8k(
+        rows, args, tmp_path, time.monotonic() + 10, lambda message: None
+    )
+    assert (result["correct"], result["errors"], result["truncated"]) == (1, 1, 1)
+    saved = json.loads((tmp_path / "gsm8k.json").read_text())
+    assert saved["details"][0]["output"] == "The answer is 42"
+    assert saved["details"][0]["prompt"].endswith("Question: question 0\nAnswer:")
+    assert saved["details"][2]["id"] == 2
+    assert saved["status"] == "failed"
+
+
+def test_error_strings_excluded_from_output_comparisons(tmp_path, monkeypatch):
+    args = args_for("--accuracy-requests", "2")
+    monkeypatch.setattr(
+        h, "chat", lambda *a: (_ for _ in ()).throw(RuntimeError("identical error"))
+    )
+    result = h.run_accuracy_prompts(
+        args, tmp_path, time.monotonic() + 10, lambda message: None
+    )
+    assert result["sha"] == {}
+    assert result["errors"] == 2
+
+
+def test_global_deadline_prevents_new_commands():
+    with pytest.raises(h.BudgetExpired):
+        h.execute(
+            [sys.executable, "-c", 'raise RuntimeError("must not execute")'],
+            time.monotonic() - 1,
+        )
+
+
+def test_http_deadline_with_trickled_body(monkeypatch):
+    class Slow(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            try:
+                for _ in range(100):
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                    time.sleep(0.02)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(h, "SERVER_PORT", server.server_port)
+    started = time.monotonic()
+    try:
+        with pytest.raises((h.BudgetExpired, TimeoutError)):
+            h.http_raw("/trickle", None, started + 0.15, 30)
+        assert time.monotonic() - started < 0.7
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def owned_launch(tmp_path, command):
+    state = tmp_path / "owner.json"
+    spec = {
+        "command": command,
+        "token": os.urandom(16).hex(),
+        "log": str(tmp_path / "server.log"),
+    }
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "prtest_remote.py"),
+            "launch",
+            str(state),
+            json.dumps(spec),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return state
+
+
+def owned_stop(state):
+    return subprocess.run(
+        [sys.executable, str(ROOT / "prtest_remote.py"), "stop", str(state)],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_owned_cleanup_kills_children_but_preserves_unrelated_process(tmp_path):
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    state = owned_launch(
+        tmp_path,
+        h.shlex.join(
+            [
+                sys.executable,
+                "-c",
+                'import subprocess,time; subprocess.Popen(["sleep","60"]); time.sleep(60)',
+            ]
+        ),
+    )
+    try:
+        identity = json.loads(state.read_text())
+        deadline = time.monotonic() + 5
+        while len(remote.members(identity)) < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert len(remote.members(identity)) >= 2
+        assert owned_stop(state).returncode == 0
+        assert remote.members(identity) == []
+        assert unrelated.poll() is None
+    finally:
+        owned_stop(state)
+        unrelated.terminate()
+        unrelated.wait()
+
+
+def test_reused_pid_is_never_signaled(tmp_path):
+    state = owned_launch(tmp_path, "sleep 60")
+    original = state.read_text()
+    try:
+        identity = json.loads(original)
+        identity["start"] = "wrong-start-time"
+        state.write_text(json.dumps(identity))
+        result = owned_stop(state)
+        assert result.returncode != 0 and "PID reused" in result.stderr
+        assert remote.proc_info(identity["pid"]) is not None
+    finally:
+        state.write_text(original)
+        owned_stop(state)
+
+
+def test_benchmark_timeout_kills_descendants(tmp_path):
+    pidfile = tmp_path / "child.pid"
+    script = (
+        "import subprocess,time,pathlib; "
+        'p=subprocess.Popen(["sleep","60"]); '
+        f"pathlib.Path({str(pidfile)!r}).write_text(str(p.pid)); time.sleep(60)"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        h.execute([sys.executable, "-c", script], time.monotonic() + 0.4)
+    info = remote.proc_info(pidfile.read_text())
+    assert info is None or info["state"] == "Z"
+
+
+def test_stop_only_reports_docker_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        h,
+        "run_capture",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("Docker offline")),
+    )
+    assert h.main(["--stop-only", "--state-dir", str(tmp_path)]) == 1
+
+
+def test_refs_are_pinned_once_with_same_baseline_bracket(monkeypatch):
+    args = args_for("--no-fetch")
+    calls = []
+
+    def fake_git(args, *argv, **kwargs):
+        calls.append(argv)
+        return "a" * 40
+
+    monkeypatch.setattr(h, "git", fake_git)
+    result = h.pin_refs(
+        [h.CASES[0], h.CASES[-1]], args, time.monotonic() + 10, lambda pins: None
+    )
+    assert len(calls) == 1
+    assert result["dcp_ascend_testing"]["commit"] == "a" * 40
+
+
+def test_ratio_refused_for_mismatched_configuration(tmp_path):
+    def record(name, config):
+        return {
+            "case": name,
+            "status": "ok",
+            "phases": {
+                "speed": {
+                    "attempts": [
+                        {
+                            "comparison_config": config,
+                            "speed": {
+                                "status": "ok",
+                                "metrics": {"TTFT avg": 1000, "TTFT P90": 1200},
+                            },
+                        }
+                    ]
+                }
+            },
+        }
+
+    h.summarize(
+        [
+            record("00-baseline", {"graph": True}),
+            record("01-pr-e-chat-encode", {"graph": False}),
+        ],
+        tmp_path,
+        SimpleNamespace(),
+    )
+    assert "configuration mismatch" in (tmp_path / "SUMMARY.md").read_text()
+
+
+def test_startup_exception_and_interrupt_always_cleanup(tmp_path, monkeypatch):
+    args = args_for("--round", "smoke")
+    args.remote_root = "/tmp/prtest-unit"
+    args.registry_path = tmp_path / "registry.json"
+    args.ais_preflight_record = None
+    record = {"case": "00-baseline", "case_env": {}, "phases": {}}
+    registry = {"processes": [{"state": "owned-id"}], "worktrees": []}
+    runtime = {"model_files_sha256": {}, "versions": {}, "environment": {}, "ops": {}}
+    monkeypatch.setattr(h, "require_free_port", lambda: None)
+    monkeypatch.setattr(h, "probe_runtime", lambda *a: runtime)
+    monkeypatch.setattr(h, "launch_server", lambda *a: ("owned-id", "server.log"))
+    stopped = []
+    monkeypatch.setattr(h, "stop_server", lambda *a: stopped.append(a[1]))
+    monkeypatch.setattr(h, "capture_server_log", lambda *a: "startup failed")
+    monkeypatch.setattr(
+        h,
+        "wait_health",
+        lambda *a: (_ for _ in ()).throw(RuntimeError("startup failed")),
+    )
+    h.run_phase(
+        args,
+        record,
+        "smoke",
+        "/tree",
+        tmp_path,
+        registry,
+        time.monotonic() + 10,
+        lambda message: None,
+        lambda: None,
+    )
+    assert stopped == ["owned-id"]
+    assert record["phases"]["smoke"]["status"] == "failed"
+    assert record["phases"]["smoke"]["attempts"][0]["cleanup"] == "ok"
+    registry["processes"][0]["cleaned"] = False
+    monkeypatch.setattr(
+        h, "wait_health", lambda *a: (_ for _ in ()).throw(KeyboardInterrupt())
+    )
+    with pytest.raises(KeyboardInterrupt):
+        h.run_phase(
+            args,
+            record,
+            "accuracy",
+            "/tree",
+            tmp_path,
+            registry,
+            time.monotonic() + 10,
+            lambda message: None,
+            lambda: None,
+        )
+    assert stopped == ["owned-id", "owned-id"]
+    assert record["phases"]["accuracy"]["status"] == "interrupted"
+
+
+def test_failed_accuracy_does_not_suppress_speed_or_later_cases(tmp_path, monkeypatch):
+    dataset = tmp_path / "gsm8k.jsonl"
+    dataset.write_text(
+        json.dumps({"question": "What is 2+2?", "answer": "#### 4"}) + "\n"
+    )
+    args = args_for(
+        "--round",
+        "all",
+        "--cases",
+        "00-baseline,01-pr-e-chat-encode",
+        "--gsm8k",
+        str(dataset),
+        "--gsm8k-samples",
+        "1",
+        "--no-fetch",
+        "--container-cann-env",
+        "",
+        "--output",
+        str(tmp_path / "out"),
+        "--state-dir",
+        str(tmp_path / "state"),
+    )
+    monkeypatch.setattr(h, "require_free_port", lambda: None)
+    monkeypatch.setattr(h, "ais_preflight", lambda *a: {"python": "/test/python"})
+    monkeypatch.setattr(h, "git", lambda *a, **kw: "a" * 40)
+    monkeypatch.setattr(h, "create_worktree", lambda *a: "/isolated-tree")
+    monkeypatch.setattr(h, "cleanup_registry", lambda *a: None)
+    calls = []
+
+    def run_phase(
+        args, record, phase, worktree, case_dir, registry, deadline, log, checkpoint
+    ):
+        calls.append((record["case"], phase))
+        record["phases"][phase] = {
+            "status": "failed" if phase == "accuracy" else "ok",
+            "reason": "request failure" if phase == "accuracy" else "",
+            "attempts": [],
+        }
+        checkpoint()
+
+    monkeypatch.setattr(h, "run_phase", run_phase)
+    assert (
+        h.main(
+            [
+                "--round",
+                "all",
+                "--cases",
+                args.cases,
+                "--gsm8k",
+                str(dataset),
+                "--gsm8k-samples",
+                "1",
+                "--no-fetch",
+                "--container-cann-env",
+                "",
+                "--output",
+                str(tmp_path / "out"),
+                "--state-dir",
+                str(tmp_path / "state"),
+            ]
+        )
+        == 1
+    )
+    assert calls == [
+        ("00-baseline", "accuracy"),
+        ("00-baseline", "speed"),
+        ("01-pr-e-chat-encode", "accuracy"),
+        ("01-pr-e-chat-encode", "speed"),
+    ]
+    rows = json.loads((tmp_path / "out/results.json").read_text())
+    assert len(rows) == 2 and all(row["status"] == "failed" for row in rows)
+
+
+def test_runtime_operator_absence_keeps_probe_evidence(tmp_path, monkeypatch):
+    args = args_for("--round", "smoke")
+    args.registry_path = tmp_path / "registry.json"
+    record = {
+        "case": "04-pr-f-sfa-kv-8bit",
+        "case_env": {"SGLANG_NPU_SFA_KV_QUANT_READ": "True"},
+        "phases": {},
+    }
+    registry = {"processes": [], "worktrees": []}
+    monkeypatch.setattr(h, "require_free_port", lambda: None)
+    monkeypatch.setattr(
+        h,
+        "probe_runtime",
+        lambda *a: {"ops": {"npu_sparse_flash_attention_lse": False}},
+    )
+    h.run_phase(
+        args,
+        record,
+        "smoke",
+        "/tree",
+        tmp_path,
+        registry,
+        time.monotonic() + 10,
+        lambda message: None,
+        lambda: None,
+    )
+    attempt = record["phases"]["smoke"]["attempts"][0]
+    assert "required torch.ops" in attempt["reason"]
+    assert attempt["runtime"]["ops"]["npu_sparse_flash_attention_lse"] is False
+
+
+def test_timeout_kills_child_that_ignores_term(tmp_path):
+    pidfile = tmp_path / "resistant-child.pid"
+    child = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    script = (
+        "import subprocess,time,pathlib; "
+        f'p=subprocess.Popen([{sys.executable!r},"-c",{child!r}]); '
+        f"pathlib.Path({str(pidfile)!r}).write_text(str(p.pid)); time.sleep(60)"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        h.execute([sys.executable, "-c", script], time.monotonic() + 0.5)
+    pid = pidfile.read_text()
+    deadline = time.monotonic() + 2
+    while (
+        (info := remote.proc_info(pid))
+        and info["state"] != "Z"
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+    assert info is None or info["state"] == "Z"
+
+
+def test_shared_case_deadline_skips_speed_and_records_every_remaining_case(
+    tmp_path, monkeypatch
+):
+    dataset = tmp_path / "gsm8k.jsonl"
+    dataset.write_text(
+        json.dumps({"question": "What is 2+2?", "answer": "#### 4"}) + "\n"
+    )
+    clock = [100.0]
+    monkeypatch.setattr(h, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(h, "require_free_port", lambda: None)
+    monkeypatch.setattr(h, "ais_preflight", lambda *a: {})
+    monkeypatch.setattr(h, "git", lambda *a, **kw: "a" * 40)
+    monkeypatch.setattr(h, "create_worktree", lambda *a: "/isolated-tree")
+    monkeypatch.setattr(h, "cleanup_registry", lambda *a: None)
+    calls = []
+
+    def run_phase(
+        args, record, phase, worktree, case_dir, registry, deadline, log, checkpoint
+    ):
+        calls.append(phase)
+        assert deadline == 160.0
+        record["phases"][phase] = {"status": "ok", "attempts": []}
+        clock[0] = 200.0
+
+    monkeypatch.setattr(h, "run_phase", run_phase)
+    assert (
+        h.main(
+            [
+                "--round",
+                "all",
+                "--cases",
+                "00-baseline,01-pr-e-chat-encode",
+                "--gsm8k",
+                str(dataset),
+                "--gsm8k-samples",
+                "1",
+                "--no-fetch",
+                "--container-cann-env",
+                "",
+                "--case-minutes",
+                "1",
+                "--hours",
+                ".02",
+                "--output",
+                str(tmp_path / "out"),
+                "--state-dir",
+                str(tmp_path / "state"),
+            ]
+        )
+        == 1
+    )
+    assert calls == ["accuracy"]
+    records = json.loads((tmp_path / "out/results.json").read_text())
+    assert len(records) == 2
+    assert records[0]["phases"]["speed"]["status"] == "skipped"
+    assert records[1]["status"] == "skipped"
+    assert all(phase["status"] == "skipped" for phase in records[1]["phases"].values())
+
+
+def test_resolved_runtime_changes_prevent_ratios(tmp_path):
+    common = dict(
+        model_path="/model",
+        load_format="auto",
+        dtype="bfloat16",
+        tp_size=16,
+        dcp_size=16,
+        attention_backend="ascend",
+        quantization="modelslim",
+    )
+    base = h.resolved_comparison({"requested": "same"}, {"server": common})
+    changed = h.resolved_comparison(
+        {"requested": "same"}, {"server": dict(common, dtype="float16")}
+    )
+    assert base != changed
+    assert h.resolved_comparison({"requested": "same"}, {"server": {}}) is None
+    records = []
+    for name, config in [("00-baseline", base), ("01-pr-e-chat-encode", changed)]:
+        records.append(
+            {
+                "case": name,
+                "status": "ok",
+                "phases": {
+                    "speed": {
+                        "attempts": [
+                            {
+                                "comparison_config": config,
+                                "speed": {
+                                    "status": "ok",
+                                    "metrics": {"TTFT avg": 1000, "TTFT P90": 1200},
+                                },
+                            }
+                        ]
+                    }
+                },
+            }
+        )
+    h.summarize(records, tmp_path, SimpleNamespace())
+    assert "configuration mismatch" in (tmp_path / "SUMMARY.md").read_text()

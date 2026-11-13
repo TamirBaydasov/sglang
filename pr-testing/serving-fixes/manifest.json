@@ -1,0 +1,14 @@
+[
+  {
+    "case": "01-pr-e-chat-encode",
+    "file": "pr2-chat-tokenizer.patch",
+    "base_commit": "2bf72a048a511085b9e407c720d244098d052532",
+    "sha256": "46ee325a6efa72a30a57d6c1b8499172372ae71a42ec6775a3f6c2bee0699215"
+  },
+  {
+    "case": "07-combined",
+    "file": "combined-chat-tokenizer.patch",
+    "base_commit": "d85051427547745a08f6c17776f09415840c75c3",
+    "sha256": "46ee325a6efa72a30a57d6c1b8499172372ae71a42ec6775a3f6c2bee0699215"
+  }
+]

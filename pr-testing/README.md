@@ -1,156 +1,221 @@
-# PR-series box tests (PRs #2–#7 on `dcp_ascend_testing`)
+# GLM PR accuracy and performance harness
 
-Automatic **speed** (AISBench 1M prefix-cache TTFT) and **accuracy** (paired
-greedy outputs + optional GSM8K) tests for the six draft PRs, following the
-established A3 nightly workflow (`run_a3_nightly.py` lineage):
+Run GSM8K accuracy, AISBench prefix-cache performance, or both for the six PRs,
+the combined branch, and the two baseline brackets. `all` starts separate fresh
+servers for accuracy and speed. The driver runs on the A3 **host**; serving runs
+inside `sglang-a3`. Python 3.9+ is required on both sides.
 
-- one **fresh server per case**, one **measured AISBench invocation per server**
-- baseline bracket (first + last case) to measure drift
-- host-side orchestration over `docker exec`; live per-case logs
-- honest `SUMMARY.md`: raw single samples, no speedup claims
+The serving recipe stays TP16/DCP16, context 1024000, chunk 16384, maximum 16
+running requests, one request per prefill batch, decode graphs on, static memory
+fraction 0.70, and TP-MoE. AISBench prepares a 99% shared prefix and measures
+16 concurrent 1M-token requests with one output token. A fixed server seed of 4
+is recorded. Each unique branch is resolved once; both baseline brackets use
+the same SHA. The driver's original checkout is never switched or reset.
 
-## Cases
+| Case | Branch | Enabled feature |
+|---|---|---|
+| 00-baseline | dcp_ascend_testing | baseline |
+| 01-pr-e-chat-encode | npu-chat-encode-pool | chat pool, memo, raw encoding |
+| 02-pr-b-indexer-int8 | npu-dsa-indexer-int8 | INT8 indexer |
+| 03-pr-prefetch-packed | npu-dcp-packed-read | packed read, gather prefetch, PG priority |
+| 04-pr-f-sfa-kv-8bit | npu-sfa-kv-8bit | 8-bit SFA KV and quantized read |
+| 05-pr-ts-token-sharded | npu-dsa-cp-token-sharded | token sharding and streamed projections |
+| 06-pr-moe-int8 | npu-dsa-cp-moe-int8 | token sharding with INT8 MoE input |
+| 07-combined | npu-bde-combined | combined deployment flags |
+| 08-baseline-repeat | dcp_ascend_testing | drift control |
 
-| Case | Branch (fork) | Flags on | PR |
-|---|---|---|---|
-| 00-baseline | `dcp_ascend_testing` (from the fork) | none (control) | — |
-| 01-pr-e-chat-encode | `npu-chat-encode-pool` | pool + memo + raw encode | #2 |
-| 02-pr-b-indexer-int8 | `npu-dsa-indexer-int8` | `INDEXER_INT8` | #3 |
-| 03-pr-prefetch-packed | `npu-dcp-packed-read` | packed read + packed gather prefetch + PG priority | #4 |
-| 04-pr-f-sfa-kv-8bit | `npu-sfa-kv-8bit` | `SFA_KV_8BIT` + `SFA_KV_QUANT_READ` | #5 |
-| 05-pr-ts-token-sharded | `npu-dsa-cp-token-sharded` | ts + Q_FULL_WIDTH + LOCAL_TOPK + DECODE_Q_PREISSUE + all four streamed weights + SFA gather overlap | #6 |
-| 06-pr-moe-int8 | `npu-dsa-cp-moe-int8` | ts (int8 MoE input is unconditional under it) | #7 |
-| 07-combined | `npu-bde-combined` | everything (SFA overlap off — superseded by the packed-read prime) | — |
-| 08-baseline-repeat | `dcp_ascend_testing` (from the fork) | none (control) | — |
+## Deploy the repairs
 
-Defaults follow the archived 1M baseline pairing
-(`CTX=1024000 CHUNK=16384 MAXREQ=16 CAPTURE=1 MEMFRAC=0.70 EXTRA_ARGS="--watchdog-timeout 7200"
-of `p4_exit1_serve_dcp.sh`): TP16 / DCP16, decode-graph capture ON at bs 16,
-prefill capture off, `--prefill-max-requests 1`, watchdog 7200 s, HCCL
-buffsize 1000/2500. **memfrac 0.70, not 0.76/0.88** — the first live run at
-0.88 OOM'd at KV-pool init (12.83 GiB `index_k_buffer` short); the archived
-recipe pairs the 1M workload with 0.70. If a case still OOMs at pool init,
-the runner retries **once** at memfrac − `--memfrac-step` (0.06, floor 0.55)
-and records both values. `--moe-a2a-backend` stays unset (TP-MoE): the
-token-sharded PR refuses a2a backends, and a paired A/B needs one config.
-Every per-case env is recorded in `results.json`.
-
-## Prerequisites (A3 host, one-time)
-
-1. The box repo can reach the fork. The branches were pushed to
-   `https://github.com/TamirBaydasov/sglang` (six PR branches). **Nothing is
-   pushed by the harness.**
-2. AISBench host client: `--ais-dir` must contain `aisbench_test.py`
-   (default `/home/tbaydasov/aisbench/aisbench_auto_tools_prefix`) and
-   `--ais-env` is the conda env file (default `/home/tbaydasov/set_env.sh`).
-3. The container (`sglang-a3`) is running with host networking.
-4. Port 30000 free — the runner refuses to start otherwise.
-5. The runner launches servers with `docker exec -d`, `PYTHONPATH=<repo>/python`
-   prepended and the pid captured for clean group stops — nothing to set up
-   by hand. If a case fails during startup, the full server log lands in
-   `<case>/server.log` and its last lines are echoed to the runner log.
-6. GitHub reachability: the runner applies the same `ghfast.top` insteadOf
-   rewrite your manual box commands use (`--git-proxy`, on by default; fetch
-   retries once on failure). Pass `--git-proxy ''` on networks with direct
-   GitHub access.
-7. CANN 9.2: the box image defaults to CANN 9.1.0, which does **not**
-   register `torch.ops.npu.npu_sparse_flash_attention_lse` — the one real
-   failure of the 2026-11-12 night run (case 04 crashed decode-graph
-   capture on the missing op). The runner sources a CANN 9.2 env before
-   every server launch: `--container-cann-env`
-   (default `/home/tbaydasov/Ascend/cann-9.2/set_env.sh`) is probed inside
-   the container, falling back to `/usr/local/Ascend/cann-9.2/set_env.sh`
-   and `/usr/local/Ascend/cann-9.2.0/set_env.sh`. The chosen file is logged
-   at startup and each case records `cann_9_2_in_server_env` (checked from
-   the server's own `LD_LIBRARY_PATH` log line) so results are attributable.
-   If no candidate exists in the container, the run continues on the image
-   default and says so loudly.
-
-### The `07-combined` branch
-
-`npu-bde-combined` is the clean squash of the verified six-PR series
-(d850514275); it is pushed to the fork so case 07 can fetch it. The six
-reviewable PRs remain the history of record.
-
-## Run
-
-Copy this directory to the A3 host (or run it from any host that can
-`docker exec` into the box container). Then:
+Copy `glm-pr-harness-repair.tar.gz` to the A3 host. Extract into a fresh directory:
 
 ```bash
-# stop anything already holding the port / a previous run
-python3 run_pr_tests.py --stop-only
-
-# full sweep (accuracy + speed per case), ~10 h budget
-python3 run_pr_tests.py --round all --hours 10 --case-minutes 60
-
-# speed only (AISBench per case, no accuracy prompts)
-python3 run_pr_tests.py --round speed --hours 8 --case-minutes 45
-
-# accuracy only
-python3 run_pr_tests.py --round accuracy --hours 6
-
-# smoke: server starts + one greedy generation per case (~fastest sanity loop)
-python3 run_pr_tests.py --round smoke
+mkdir -p /tmp/glm-pr-harness-repair
+tar -xzf /tmp/glm-pr-harness-repair.tar.gz -C /tmp/glm-pr-harness-repair
+cd /tmp/glm-pr-harness-repair
+sha256sum --check CHECKSUMS.sha256
+python3 run_pr_tests.py --round speed --cases 00-baseline --dry-run
 ```
 
-Useful variants:
+The archive contains the driver, process helper, this runbook, and two serving
+patches. `--case-patch` applies a patch only inside its isolated execution
+worktree and records its SHA-256. It checks applicability before applying it.
+`serving-fixes/manifest.json` records the inspected local base SHAs. The `pr-test-harness` branch includes the repaired driver and serving patches.
+The patches are applied through `--case-patch`; the feature branch heads are
+not changed by the driver.
+
+Before the first run, stop any old server using its original launch/session and
+verify that port 30000 is free. The old harness did not record trustworthy
+ownership. This runner will not adopt or sweep those processes. Inspect with
+`docker exec sglang-a3 ps -eo pid,ppid,pgid,args` if needed.
+
+## A3 commands
+
+Run these in Bash from the extracted directory. Set `GSM8K` to an existing
+**host-side** GSM8K test JSONL (`question` and `answer` with `####` final answers).
+No dataset path was present in the supplied evidence. At least 200 valid rows
+are required by default; validation happens before any server launch.
 
 ```bash
-# subset of cases
-python3 run_pr_tests.py --cases 00-baseline,05-pr-ts-token-sharded,07-combined
+export GSM8K=/absolute/path/to/gsm8k/test.jsonl
+COMMON=(
+  --container sglang-a3
+  --repo /home/swx1199799/megamoe_test/sglang
+  --model /home/weights/GLM5.2-w4a8-int
+  --container-cann-env /home/tbaydasov/Ascend/cann-9.2.0-beta.2/set_env.sh
+  --ais-env /home/tbaydasov/set_env.sh
+  --ais-dir /home/tbaydasov/aisbench/aisbench_auto_tools_prefix
+  --ais-conda-env tbay_sglang
+)
 
-# attribution A/B without editing the table
-python3 run_pr_tests.py --cases 03-pr-prefetch-packed \
-  --flags-overrides 03-pr-prefetch-packed:SGLANG_NPU_DCP_GATHER_CHUNKS=1
+# Baseline GSM8K: real weights, fixed 200-sample subset, seed 4.
+python3 -u run_pr_tests.py "${COMMON[@]}" \
+  --round accuracy --cases 00-baseline --gsm8k "$GSM8K" \
+  --gsm8k-samples 200 --gsm8k-seed 4 --hours 3 --case-minutes 150
 
-# GSM8K subset for each case (needs the test jsonl on the host)
-python3 run_pr_tests.py --round accuracy --gsm8k /path/to/gsm8k_test.jsonl --gsm8k-samples 200
+# Baseline AISBench plus the matching end bracket; no GSM8K required.
+python3 -u run_pr_tests.py "${COMMON[@]}" \
+  --round speed --cases 00-baseline,08-baseline-repeat \
+  --length 1000000 --requests 16 --hours 3 --case-minutes 75
 
-# point at a different model / container / repo
-python3 run_pr_tests.py --model /home/ckpt/GLM-5.2-Provide-0610-W4A8-crop-tiny \
-  --container sglang-a3 --repo /home/swx1199799/megamoe_test/sglang
+# PR #2 repair: independent accuracy/speed servers and baseline brackets.
+python3 -u run_pr_tests.py "${COMMON[@]}" \
+  --round all --cases 00-baseline,01-pr-e-chat-encode,08-baseline-repeat \
+  --gsm8k "$GSM8K" --hours 8 --case-minutes 150 \
+  --case-patch 01-pr-e-chat-encode:serving-fixes/pr2-chat-tokenizer.patch
 
-# preview the full command plan without touching the box
-python3 run_pr_tests.py --dry-run
+# Full nine-case sweep, including both uncommitted serving repairs.
+python3 -u run_pr_tests.py "${COMMON[@]}" \
+  --round all --gsm8k "$GSM8K" --hours 24 --case-minutes 150 \
+  --case-patch 01-pr-e-chat-encode:serving-fixes/pr2-chat-tokenizer.patch \
+  --case-patch 07-combined:serving-fixes/combined-chat-tokenizer.patch
 ```
 
-## What each round does
+To retain the full sweep inside screen, replace its `python3 -u` prefix with
+`screen -L -Logfile "$PWD/prtest-fixed-screen.log" -dmS prtest-fixed python3 -u`.
+The driver writes its own logs and exit status, so no `tee` pipeline is needed.
+The budgets above are caps, not duration predictions. The case cap includes
+both phases. Bounded process cleanup may extend a work deadline to safely stop
+owned processes. A smaller `--hours` budget records every remaining case as
+skipped and exits nonzero.
 
-- **smoke** — checkout case branch (fetched from the fork, `prtest/current`),
-  launch the server with the case env, wait for `/health`
-  (`--startup-timeout`, default 1800 s), one greedy generation, stop the
-  server (SIGTERM to the process group, SIGKILL fallback, survival halts the
-  run like the nightly does).
-- **accuracy** — `--accuracy-requests` greedy requests per case (default
-  **64**): 8 fixed + template-generated short/medium prompts + a long-prompt
-  pair (same body, different tails — the second request rides the cached
-  prefix; `--accuracy-long-tokens`, default 32 k tokens). SHA-256 of each
-  output is compared per tag against case `00-baseline`: exact matches are
-  counted raw — NPU serving is not bit-deterministic, so "differ" is
-  information, not an automatic failure. With `--gsm8k`, a seeded subset
-  (default 200 samples, 5-shot, greedy) gives an accuracy number per case.
-- **speed** — one AISBench `prefix_cache` invocation per fresh server
-  (`profile_aisbench.sh` with `PROFILE=0`): the prefix cache is flushed
-  (`/flush_cache`) first so the warm-up really prefills, then
-  `--input_len 1000000 --output_len 1 --data_num 16 --concurrency 16
-  --repeat_rate 0.99 --seed 4`. TTFT mean/P90 (ms→s), E2E, qps and prefill
-  throughput are parsed from the `'TTFT avg'` metric lines into
-  `results.json`. Queueing dominates per-request TTFT at concurrency 16
-  (prefill is serialised); read the mean/P90 with that in mind.
+Use `--round smoke` for streaming-chat transport checks. `--no-fetch` resolves
+local refs only. `--container-cann-env ''` retains the container's configured
+runtime; required operators are still probed in that exact environment. Use
+`--retry-oom` to opt into one separately recorded memory/graph fallback. These
+deviations suppress ratios against a differently configured baseline.
 
-## Output
+## Baseline gibberish diagnosis
 
-```
-prtest-results/<stamp>/
-  SUMMARY.md          # speed table + paired-accuracy table (with skip reasons)
-  results.json        # full records incl. per-case env + commit
-  runner.log
-  <case>/server.log   # full server log (captured on startup failure)
-  <case>/ais.log  accuracy.json  smoke.json
+```bash
+python3 -u run_pr_tests.py "${COMMON[@]}" \
+  --diagnose-baseline --hours 4 --case-minutes 210
 ```
 
-`SUMMARY.md` statuses: `ok` measured · `failed` see case dir (server log tail
-is captured) · `skipped` ref missing / fetch failed · `no-data` server ran but
-nothing measured. AISBench timings are diagnostic samples — numerical quality
-comes from the accuracy section, never from AISBench.
+This uses the same baseline SHA and seed on two fresh servers: decode graph on
+and eager. It saves tokenizer class, chat template, special tokens, rendered
+prompts, and token IDs. Each prompt is sent as raw text, rendered chat text,
+explicit token IDs, and a chat request. Inspect `diagnosis.json`, `tokenizer.json`,
+`smoke.json` (including resolved server configuration), and `server.log`.
+Compare rendered-text and token-ID generation with chat output; raw unformatted
+text is also retained to expose prompt-format effects. Confirm checkpoint,
+resolved quantization, full-model geometry, and loaded weights before assigning
+a cause. No baseline model-code change is claimed without this device evidence.
+
+## Accuracy and timing interpretation
+
+GSM8K uses a fixed five-shot prompt, 200 samples shuffled with seed 4, temperature
+0, and a 512-token completion cap. Dataset hash, original JSONL row IDs, complete
+prompts, responses, reasoning fields, finish reasons, extracted answers, request
+errors, and truncations are saved after each sample. Errors and truncated answers
+count as incorrect; incomplete or failed requests make the phase fail. If 512
+is insufficient for the checkpoint, increase `--gsm8k-max-tokens` consistently
+for both baseline and variants and rerun their comparisons.
+
+Use `--gsm8k-min-accuracy VALUE` only with a justified threshold for this exact
+checkpoint and workload. Without a threshold, the harness reports the measured
+score and leaves correctness acceptance unqualified. Zero-correct or incomplete
+runs are marked unresolved. Poor quality does not suppress diagnostic AISBench
+runs. The paired-output suite remains diagnostic and excludes errored/truncated
+outputs from its match counts.
+
+AISBench preflight and execution share environment initialization and the chosen
+Conda environment. The preflight requires a matching model, localhost endpoint,
+port, tool, and working directory. The model/tokenizer directory must also be
+accessible to the host client. Preflight failure prevents expensive speed-server
+launches; an independent accuracy phase can still run.
+
+Speed requires successful cache clearing, a preparation record, a measurement
+record, the expected request counts, zero failed requests, valid metrics, and a
+successful tool exit. Python-repr and JSON metrics are accepted. `99999` failure
+placeholders cannot become timings. JSON preserves TTFT in milliseconds; the
+summary converts it to seconds. Only matching effective configurations receive
+baseline/variant mean-TTFT ratios. These are single-run diagnostic comparisons,
+with baseline-repeat drift shown separately. Missing provenance or unresolved
+quality is never presented as an accepted performance improvement.
+
+A smoke response confirms endpoint availability. Empty, nonsensical, or wrong
+answers remain unresolved quality. Successful HTTP requests and exact-output
+matches do not establish full-model correctness.
+
+## Artifacts, stopping, and offline reports
+
+```
+/home/swx1199799/prtest-results/<UTC timestamp>-<id>/
+  settings.json, pinned-refs.json, results.json, SUMMARY.md
+  runner.log, run-status.json
+  <case>/<accuracy|speed|smoke|diagnostic-graph|diagnostic-eager>/attempt-N/
+    launch.json, process.json, smoke.json, server.log
+    gsm8k.json, accuracy.json                    # accuracy phase
+    ais-command.json, ais.log                   # speed phase
+    tokenizer.json, diagnosis.json              # diagnostic phase
+```
+
+Results default to `/home/swx1199799/prtest-results/<run-id>/`. Choose another
+parent with `--save-dir /path/to/save`; `--output /exact/run/directory` takes
+precedence when provided. This changes saved results and captured logs; ownership
+state and temporary container worktrees retain their separate locations.
+
+`results.json` is atomically checkpointed after each phase transition; GSM8K and
+paired diagnostics also checkpoint each request. A summary-rendering error keeps
+those records and makes the run fail. Every case and requested phase has a final
+status. Exit 0 means the requested benchmark execution completed; it does not
+mean quality acceptance. Failures/skips return 1, argument/prerequisite validation
+returns 2, and interruption returns 130.
+
+Interrupt an active runner with Ctrl-C (or SIGTERM) to trigger cleanup. The same
+host user can recover a dead runner using its state registry:
+
+```bash
+python3 run_pr_tests.py "${COMMON[@]}" --stop-only
+```
+
+The runner locks port 30000 across containers and stores ownership per container. `--stop-only` refuses to race an active
+runner, refuses PID reuse or missing ownership, checks Docker errors, and verifies
+that the port is free. It signals only processes carrying its unique ownership
+token. No process-name sweeps are used. Temporary execution worktrees are removed
+after verified process cleanup; original worktrees and archived logs are retained.
+
+Regenerate a historical or current report without Docker, NPU, or network access.
+The output directory must be new and outside the source evidence directory:
+
+```bash
+python3 run_pr_tests.py \
+  --regenerate prtest-results/20261112-232436 \
+  --output /tmp/prtest-recovered-20261112-232436
+```
+
+The archived baseline is recoverable at **36.105/60.187 seconds mean/P90**.
+The PR #2 run remains failed because the chat endpoint rejected `Encoding` objects;
+its placeholder metrics are not performance evidence. Historical recovery does
+not establish baseline numerical quality or fill missing runtime provenance.
+
+Host regression checks, from the development workspace:
+
+```bash
+python3 -m pytest -q test_run_pr_tests.py test_chat_encode_regressions.py
+```
+
+The tokenizer regressions require `transformers` and `tokenizers` and inspect both
+local serving worktrees. The HTTP/process regressions need local loopback and
+subprocess access. Host checks do not establish A3 numerical quality, graph
+correctness, HCCL stability, or performance; the A3 commands above remain required.

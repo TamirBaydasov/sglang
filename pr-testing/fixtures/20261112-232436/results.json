@@ -1,0 +1,16 @@
+[
+  {
+    "case": "00-baseline",
+    "ref": "dcp_ascend_testing",
+    "status": "failed",
+    "reason": "no TTFT metrics parsed from ais.log (rc=0)",
+    "ais_returncode": 0
+  },
+  {
+    "case": "01-pr-e-chat-encode",
+    "ref": "npu-chat-encode-pool",
+    "status": "failed",
+    "reason": "no TTFT metrics parsed from ais.log (rc=0)",
+    "ais_returncode": 0
+  }
+]
