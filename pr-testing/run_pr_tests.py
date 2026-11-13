@@ -63,64 +63,89 @@ AIS_ENV_CANDIDATES = ("/home/tbaydasov/set_env.sh", "/home/tbaydasovset_env.sh")
 AIS_DIR_DEFAULT = "/home/tbaydasov/aisbench/aisbench_auto_tools_prefix"
 FORK_URL_DEFAULT = "https://github.com/TamirBaydasov/sglang.git"
 
-# BDE serve recipe (archived p4_exit1_serve_dcp.sh via launch_bde_v2.py).
+# BDE serve recipe, brought to PARITY with the reference run that measured
+# 92% GSM8K / 42s TTFT on this box (test_pr1_megamoe_accuracy.py ENV dict +
+# test_pr1_megamoe.py command()): the archived BDE recipe alone generated
+# cross-lingual garbage on every branch (0/64 GSM8K, truncated-diagnostic),
+# so the serving profile itself was the suspect and the reference profile is
+# the only known-good configuration.
 BASE_ENV = {
-    "SGLANG_NPU_ENABLE_DSA_CP": "True",
+    # Reference ENV verbatim (test_pr1_megamoe_accuracy.py). DSA token-shard
+    # and indexer query sharding are EXPLICIT here: the reference does not
+    # trust code defaults.
+    "SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD": "True",
+    "SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_MULTI_REQUEST": "True",
+    "SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING": "True",
     "SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP": "True",
-    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-    "STREAMS_PER_DEVICE": "32",
-    "SGLANG_SET_CPU_AFFINITY": "1",
-    "HCCL_OP_EXPANSION_MODE": "AIV",
-    "HCCL_SOCKET_IFNAME": "lo",
-    "GLOO_SOCKET_IFNAME": "lo",
-    "HCCL_BUFFSIZE": "1000",
-    "DEEPEP_HCCL_BUFFSIZE": "2500",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_NPU_USE_MULTI_STREAM": "1",
+    "SGLANG_SET_CPU_AFFINITY": "1",
+    "SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY": "1",
+    "STREAMS_PER_DEVICE": "32",
+    "HCCL_BUFFSIZE": "768",
+    "DEEPEP_HCCL_BUFFSIZE": "768",
+    "HCCL_SOCKET_IFNAME": "lo",
+    "GLOO_SOCKET_IFNAME": "lo",
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "NO_PROXY": "localhost,127.0.0.1,::1",
+    "no_proxy": "localhost,127.0.0.1,::1",
 }
 
 SERVER_PORT = 30000
-# Baseline serving recipe = the archived 1M pairing of p4_exit1_serve_dcp.sh
-# and profile_aisbench.sh (PROFILE=0):
-#   CTX=1024000 CHUNK=16384 MAXREQ=16 CAPTURE=1 MEMFRAC=0.70 \
-#     EXTRA_ARGS="--watchdog-timeout 7200" bash p4_exit1_serve_dcp.sh 16
-# Decode graph capture ON at max-bs 16 (= MAXREQ, a multiple of TP=16; the
-# token-sharded PR refuses only EXTEND capture). Prefill capture stays
-# disabled (NPU forces it off anyway). memfrac is 0.70, NOT 0.76/0.88: the
-# first live run OOM'd at pool init at 0.88 (12.83 GiB index_k_buffer, 47.40
-# GiB already allocated of a 61.28 GiB die), and the archived 1M recipe pairs
-# this exact workload with 0.70. moe-a2a stays 'none' deliberately: the ts PR
-# refuses a2a backends and a paired A/B needs one config across all cases
-# (TP-MoE is what the series optimizes; the checkpoint loads fine on 'none').
+# Serving args = the reference command() profile (test_pr1_megamoe_accuracy.py
+# / test_pr1_megamoe.py) that measured 92% GSM8K and ~42s cached TTFT on this
+# box, with the harness's working substitutions (watchdog 7200, server seed,
+# port). ModelSlim/BF16/native-impl and shared-expert-fusion-off are EXPLICIT:
+# the baseline that generated garbage ran quantization=auto.
 BASE_SERVER_ARGS = [
     "--device",
     "npu",
     "--attention-backend",
     "ascend",
+    "--trust-remote-code",
+    "--quantization",
+    "modelslim",
+    "--dtype",
+    "bfloat16",
+    "--model-impl",
+    "sglang",
+    "--disable-shared-experts-fusion",
     "--tp-size",
     "16",
     "--dcp-size",
     "16",
-    "--trust-remote-code",
-    "--cuda-graph-backend-prefill",
-    "disabled",
+    "--page-size",
+    "128",
     "--context-length",
     "1024000",
     "--chunked-prefill-size",
     "16384",
+    "--max-prefill-tokens",
+    "16384",
     "--max-running-requests",
     "16",
+    "--prefill-max-requests",
+    "16",
+    # Reference accuracy/E2E both pin the KV pool (74,752 local rows); auto
+    # sizing produced 93,184 tokens and the memfrac-0.88 pool-init OOM history
+    # is avoided by the explicit cap + memfrac ladder below.
+    "--max-total-tokens",
+    "74752",
+    "--cuda-graph-backend-prefill",
+    "disabled",
+    "--cuda-graph-backend-decode",
+    "full",
     "--cuda-graph-max-bs-decode",
+    "16",
+    "--cuda-graph-bs-decode",
     "16",
     "--watchdog-timeout",
     "7200",
     "--mem-fraction-static",
-    "0.70",
+    "0.76",
     "--port",
     str(SERVER_PORT),
-    # Packed DCP reads require one request per prefill batch.
-    "--prefill-max-requests",
-    "1",
     "--enable-metrics",
 ]
 
@@ -128,7 +153,13 @@ BASE_SERVER_ARGS = [
 # Case table: (name, ref, env, note).  Baseline bracket = first + last.
 # --------------------------------------------------------------------------
 CASES = [
-    ("00-baseline", "dcp_ascend_testing", {}, "control, bracket start"),
+    (
+        "00-baseline",
+        "dcp_ascend_testing",
+        {},
+        "control, bracket start",
+        (),
+    ),
     (
         "01-pr-e-chat-encode",
         "npu-chat-encode-pool",
@@ -138,6 +169,7 @@ CASES = [
             "SGLANG_CHAT_ENCODE_RAW": "True",
         },
         "PR #2 (E): all three features - pool + memo + raw Rust encode",
+        (),
     ),
     (
         "02-pr-b-indexer-int8",
@@ -146,6 +178,7 @@ CASES = [
             "SGLANG_NPU_INDEXER_INT8": "True",
         },
         "PR #3 (B): int8 index-K + per-token fp16 scale",
+        (),
     ),
     (
         "03-pr-prefetch-packed",
@@ -157,6 +190,9 @@ CASES = [
         },
         "PR #4 (C1/D2p/D2v2): packed read + prime/prefetch + chunked gather "
         "(CHUNKS=8 and stream priority are the branch defaults)",
+        # Recorded deviation from the reference profile: packed DCP reads
+        # require one request per prefill batch.
+        ("--prefill-max-requests", "1"),
     ),
     (
         "04-pr-f-sfa-kv-8bit",
@@ -166,6 +202,7 @@ CASES = [
             "SGLANG_NPU_SFA_KV_QUANT_READ": "True",
         },
         "PR #5 (F): 656 B/row packed KV; F2 in-kernel dequant on",
+        (),
     ),
     (
         "05-pr-ts-token-sharded",
@@ -183,6 +220,7 @@ CASES = [
         },
         "PR #6 (D1v3) every feature: rebuild + all four streamed weights + "
         "SFA gather overlap (permuting-path flag; this branch has no packed read)",
+        (),
     ),
     (
         "06-pr-moe-int8",
@@ -191,6 +229,7 @@ CASES = [
             "SGLANG_NPU_DSA_CP_TOKEN_SHARDED": "True",
         },
         "PR #7 (M): int8 MoE input (unconditional under the ts flag)",
+        (),
     ),
     (
         "07-combined",
@@ -216,8 +255,37 @@ CASES = [
         },
         "full deployment configuration: every branch feature on (SFA overlap "
         "stays off - superseded by the packed-read prime in this tree)",
+        # Same packed-read deviation as case 03: this tree includes it.
+        ("--prefill-max-requests", "1"),
     ),
-    ("08-baseline-repeat", "dcp_ascend_testing", {}, "control, bracket end"),
+    (
+        "08-baseline-repeat",
+        "dcp_ascend_testing",
+        {},
+        "control, bracket end",
+        (),
+    ),
+    (
+        "09-pr1-megamoe",
+        "A3_megamoe_support",
+        {
+            # Reference ENV additions from test_pr1_megamoe_accuracy.py: the
+            # FuseEP mode-3 kernel needs the rank-sized dispatch capacity,
+            # and NPU_ENABLE_DSA_CP is not part of that branch's recipe.
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
+        },
+        "PR #1 (MegaMoE A3): --ep-size 16 --moe-a2a-backend ascend_fuseep "
+        "--fuseep-mode 3; paired against baseline for the ~15% TTFT claim",
+        # Reference megamoe launch args (test_pr1_megamoe.py command()).
+        (
+            "--ep-size",
+            "16",
+            "--moe-a2a-backend",
+            "ascend_fuseep",
+            "--fuseep-mode",
+            "3",
+        ),
+    ),
 ]
 
 # Attribution overrides: --flags-overrides 03:SGLANG_NPU_DCP_GATHER_CHUNKS=1,...
@@ -1174,7 +1242,7 @@ print('PRTEST_PROBE='+json.dumps({'versions': versions, 'ops':ops, 'model_config
 """
 
 
-def server_argv(args, memfrac, graph):
+def server_argv(args, memfrac, graph, case_args=()):
     values = list(BASE_SERVER_ARGS)
     for key, value in [
         ("--mem-fraction-static", memfrac),
@@ -1196,13 +1264,19 @@ def server_argv(args, memfrac, graph):
         "--random-seed",
         str(args.server_seed),
         *values,
+        # Per-case launch additions (e.g. the megamoe EP/FuseEP args) go
+        # BEFORE the user's --extra-server-args so the user always wins.
+        *case_args,
         *shlex.split(args.extra_server_args),
     ]
 
 
 def server_shell(args, worktree, env, argv):
     # Clear inherited feature toggles so the baseline is a real control.
-    keys = sorted({key for _, _, flags, _ in CASES for key in flags} | set(BASE_ENV))
+    # CASES rows are 5-tuples: (name, ref, env, note, extra_server_args).
+    keys = sorted(
+        {key for _, _, flags, _, _ in CASES for key in flags} | set(BASE_ENV)
+    )
     setup = "set -e; "
     if args.cann_env_resolved:
         setup += "source " + shlex.quote(args.cann_env_resolved) + "; "
@@ -1351,7 +1425,7 @@ def wait_health(args, state_path, deadline, log):
 
 def pin_refs(cases, args, deadline, checkpoint):
     pinned = {}
-    for _, ref, _, _ in cases:
+    for _, ref, _, _, _ in cases:
         if ref in pinned:
             continue
         try:
@@ -1581,7 +1655,12 @@ def run_phase(
                 raise RuntimeError(
                     "required torch.ops.npu.npu_sparse_flash_attention_lse is unavailable"
                 )
-            argv = server_argv(args, memfrac, graph)
+            argv = server_argv(
+                args,
+                memfrac,
+                graph,
+                record.get("case_server_args", ()),
+            )
             command = server_shell(args, worktree, record["case_env"], argv)
             attempt.update(
                 argv=argv,
@@ -2037,11 +2116,17 @@ def plan_cases(args):
         cases = [CASES[0]]
     if not cases:
         raise ValueError("no cases selected")
+    # Normalize to 5-tuples: (name, ref, env, note, extra_server_args). Older
+    # 4-tuples get an empty extra-args tail so all consumers see one shape.
+    cases = [tuple(case) if len(case) == 5 else (*case, ()) for case in cases]
     return cases
 
 
 def apply_overrides(cases, overrides):
-    table = {name: [name, ref, dict(env), note] for name, ref, env, note in cases}
+    table = {
+        name: [name, ref, dict(env), note, tuple(extra)]
+        for name, ref, env, note, extra in cases
+    }
     for item in overrides.split(",") if overrides else []:
         try:
             name, flag = item.split(":", 1)
@@ -2214,7 +2299,7 @@ def validate_args(args):
 
 
 def dry_run(args, cases):
-    for name, ref, env, _ in cases:
+    for name, ref, env, _, case_args in cases:
         worktree = "<run-root>/worktrees/" + name
         print(f"== {name}: pin {ref} once; isolated worktree {worktree}")
         for phase in phase_names(args):
@@ -2225,7 +2310,10 @@ def dry_run(args, cases):
             print(
                 "  "
                 + server_shell(
-                    args, worktree, env, server_argv(args, args.memfrac, graph)
+                    args,
+                    worktree,
+                    env,
+                    server_argv(args, args.memfrac, graph, case_args),
                 )
             )
             if phase == "speed":
@@ -2382,11 +2470,12 @@ def run(args, cases):
             "case_env": env,
             "env": dict(BASE_ENV, **env),
             "note": note,
+            "case_server_args": list(case_args),
             "status": "pending",
             "phases": {},
             "quality_threshold": args.gsm8k_min_accuracy,
         }
-        for name, ref, env, note in cases
+        for name, ref, env, note, case_args in cases
     ]
 
     def log(message):
