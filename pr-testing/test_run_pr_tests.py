@@ -144,6 +144,7 @@ def test_dry_run_uses_real_builders(capsys):
 
 def test_combined_phases_launch_and_stop_separate_servers(tmp_path, monkeypatch):
     args = args_for("--round", "all")
+    args.registry_path = tmp_path / "registry.json"
     args.ais_preflight_record = None
     args.ais_preflight_error = None
     args.gsm_rows = []
