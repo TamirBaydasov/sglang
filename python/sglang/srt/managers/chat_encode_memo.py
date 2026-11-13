@@ -1,27 +1,5 @@
-# E2a (branch E): the chat render+encode memo.
-#
-# Serves `_render_and_encode_chat_template` (serving_chat). Two layers:
-#
-# 1. An exact-repeat LRU keyed by the full request fingerprint (template,
-#    messages, tools, kwargs, add_generation_prompt): a repeat returns the
-#    stored ids with no render and no encode.
-# 2. A family prefix assembly keyed by the family shape (template, roles,
-#    every NON-anchor message, tools, kwargs): requests whose long anchor
-#    document differs but whose shape is the same reuse the family's rendered
-#    prefix and re-encode only the tail. The first request of a family renders
-#    in full and registers the family; concurrent first requests are
-#    serialized (one claims the creation, the rest wait, then assemble).
-#
-# The prefix split is character-exact by construction (the anchor content is
-# located verbatim inside the rendered prompt), but the ENCODE split at the
-# cut can skew by a few tokens at a BPE boundary -- the ids come from
-# `encode(prefix) + encode(tail)` instead of one `encode(all)`. This is
-# documented, accepted skew: prompt ids feed the model, not a byte contract,
-# and the family reuse exists to kill the 1M-token GIL-wave encode burst, not
-# to reproduce bit-identical tokenizations. Requests that need exact ids take
-# the full-render path (exact LRU or fallback).
-#
-# Host-side only (branch E); nothing here touches device state.
+# Exact-repeat chat encoding cache and legacy family metadata.
+# Token IDs must always come from encoding the complete rendered prompt.
 
 from __future__ import annotations
 
@@ -43,20 +21,21 @@ def encode_chat_text(
     encode_kwargs: Optional[Dict] = None,
     raw: bool = False,
 ) -> List[int]:
-    """Encode chat prompt text, optionally through the raw Rust tokenizer.
-
-    `raw` bypasses the HF wrapper and calls the underlying fast tokenizer's
-    Rust object directly (`tokenizer._tokenizer.encode`). The wrapper adds
-    Python-level pre/post-processing around the same GIL-released Rust call,
-    so the raw path saves wrapper overhead on very long prompts. Silently
-    falls back to the wrapper when the tokenizer has no Rust object (slow
-    tokenizers, fake tokenizers in tests).
-    """
+    """Use raw encoding only where the HF wrapper has identical semantics."""
     kwargs = dict(encode_kwargs or {})
-    if raw:
-        rust = getattr(tokenizer, "_tokenizer", None)
-        if rust is not None and hasattr(rust, "encode"):
-            return list(rust.encode(text, **kwargs))
+    if raw and set(kwargs) <= {"add_special_tokens"}:
+        # Custom tokenizer wrappers may transform text or special tokens.
+        try:
+            from transformers import PreTrainedTokenizerFast
+        except ImportError:
+            PreTrainedTokenizerFast = None
+        if (
+            PreTrainedTokenizerFast is not None
+            and type(tokenizer) is PreTrainedTokenizerFast
+        ):
+            rust = tokenizer.backend_tokenizer
+            if rust.truncation is None and rust.padding is None:
+                return list(rust.encode(text, **kwargs).ids)
     return list(tokenizer.encode(text, **kwargs))
 
 
@@ -99,7 +78,7 @@ class ChatEncodeMemo:
         self._full: OrderedDict = OrderedDict()
         self._full_lru_size = full_lru_size
         # shape_key -> _Family
-        self._families: "OrderedDict[bytes, _Family]" = OrderedDict()
+        self._families: OrderedDict[bytes, _Family] = OrderedDict()
         # shape_key -> Event set while the claiming thread renders
         self._creating: Dict[bytes, threading.Event] = {}
         # version -> (_Family, {encode_kwargs_key: ids})
@@ -115,7 +94,9 @@ class ChatEncodeMemo:
                 self._full.move_to_end(cache_key)
             return hit
 
-    def store_full(self, cache_key, rendered_prompt: str, prompt_ids: List[int]) -> None:
+    def store_full(
+        self, cache_key, rendered_prompt: str, prompt_ids: List[int]
+    ) -> None:
         with self._lock:
             self._full[cache_key] = (rendered_prompt, list(prompt_ids))
             self._full.move_to_end(cache_key)

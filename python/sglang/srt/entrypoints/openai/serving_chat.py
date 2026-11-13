@@ -112,8 +112,8 @@ from sglang.srt.function_call.utils import (
     strip_structural_tag_excludes,
 )
 from sglang.srt.managers.chat_encode_memo import (
-    ChatEncodeMemo,
     MIN_PREFIX_CHARS,
+    ChatEncodeMemo,
     encode_chat_text,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -2428,7 +2428,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
     @staticmethod
     def _memo_anchor(
-        messages: List[Dict[str, Any]]
+        messages: List[Dict[str, Any]],
     ) -> Tuple[Optional[int], Optional[str]]:
         """E2a (branch E): the family anchor -- the last message whose string
         content is long enough to be the shared-prefix carrier."""
@@ -2480,72 +2480,28 @@ class OpenAIServingChat(OpenAIServingBase):
         memo: ChatEncodeMemo,
         add_generation_prompt: bool = True,
     ) -> Tuple[str, List[int]]:
-        """E2a (branch E): render+encode with the ChatEncodeMemo. Exact
-        repeats return the stored ids; a request in the family is assembled
-        from the family's rendered prefix + its tail (no Jinja render) and
-        re-encodes only tail + postlude. First-family requests are
-        serialized: one claims the creation, siblings wait."""
-        tokenizer = self.tokenizer_manager.tokenizer
-
+        """Cache exact requests without changing template or token boundaries."""
         cached = memo.get_full(cache_key)
         if cached is not None:
             rendered_prompt, prompt_ids = cached
             return rendered_prompt, list(prompt_ids)
 
-        anchor_i, content = self._memo_anchor(messages)
-        shape_key = (
-            self._family_shape_key(
-                getattr(self.tokenizer_manager.tokenizer, "chat_template", None),
-                messages,
-                anchor_i,
-                tools,
-                template_kwargs,
-                encode_kwargs,
-            )
-            if anchor_i is not None
-            else None
+        tokenizer = self.tokenizer_manager.tokenizer
+        rendered_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+            return_dict=False,
+            **template_kwargs,
         )
-        encode_kwargs_key = orjson.dumps(encode_kwargs, option=orjson.OPT_SORT_KEYS)
-        raw_encode = envs.SGLANG_CHAT_ENCODE_RAW.get()
-        encode = lambda text: encode_chat_text(
-            tokenizer, text, encode_kwargs, raw_encode
+        # BPE merges and template rendering can depend on both sides of a cut.
+        prompt_ids = encode_chat_text(
+            tokenizer,
+            rendered_prompt,
+            encode_kwargs,
+            envs.SGLANG_CHAT_ENCODE_RAW.get(),
         )
-
-        rendered_prompt: Optional[str] = None
-        prompt_ids: Optional[List[int]] = None
-
-        assembled = memo.begin_assembly(shape_key, content)
-        if assembled is None and shape_key is not None:
-            if not memo.claim_creation(shape_key):
-                if memo.wait_family(shape_key, _MEMO_BOOTSTRAP_TIMEOUT_S):
-                    assembled = memo.begin_assembly(shape_key, content)
-
-        if assembled is not None:
-            rendered_prefix, cut, postlude, version = assembled
-            rendered_prompt = rendered_prefix + content[cut:] + postlude
-            prefix_ids = memo.prefix_ids(
-                version, encode_kwargs_key, lambda: encode(rendered_prefix)
-            )
-            if prefix_ids is not None:
-                prompt_ids = list(prefix_ids) + list(
-                    encode(rendered_prompt[len(rendered_prefix):])
-                )
-            else:
-                prompt_ids = list(encode(rendered_prompt))
-
-        if rendered_prompt is None:
-            rendered_prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-                tools=tools,
-                return_dict=False,
-                **template_kwargs,
-            )
-            prompt_ids, _ = memo.commit_full(
-                shape_key, content, rendered_prompt, encode_kwargs_key, encode
-            )
-
         memo.store_full(cache_key, rendered_prompt, prompt_ids)
         return rendered_prompt, prompt_ids
 
