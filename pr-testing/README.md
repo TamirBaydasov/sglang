@@ -36,12 +36,10 @@ sha256sum --check CHECKSUMS.sha256
 python3 run_pr_tests.py --round speed --cases 00-baseline --dry-run
 ```
 
-The archive contains the driver, process helper, this runbook, and two serving
-patches. `--case-patch` applies a patch only inside its isolated execution
-worktree and records its SHA-256. It checks applicability before applying it.
-`serving-fixes/manifest.json` records the inspected local base SHAs. The `pr-test-harness` branch includes the repaired driver and serving patches.
-The patches are applied through `--case-patch`; the feature branch heads are
-not changed by the driver.
+The archive contains the driver, process helper, and this runbook. Serving
+repairs are committed directly to `npu-chat-encode-pool` and `npu-bde-combined`.
+The driver fetches and pins those branch heads, then tests pristine isolated
+worktrees. No runtime patch files or overlay arguments are used.
 
 Before the first run, stop any old server using its original launch/session and
 verify that port 30000 is free. The old harness did not record trustworthy
@@ -80,14 +78,11 @@ python3 -u run_pr_tests.py "${COMMON[@]}" \
 # PR #2 repair: independent accuracy/speed servers and baseline brackets.
 python3 -u run_pr_tests.py "${COMMON[@]}" \
   --round all --cases 00-baseline,01-pr-e-chat-encode,08-baseline-repeat \
-  --gsm8k "$GSM8K" --hours 8 --case-minutes 150 \
-  --case-patch 01-pr-e-chat-encode:serving-fixes/pr2-chat-tokenizer.patch
+  --gsm8k "$GSM8K" --hours 8 --case-minutes 150
 
-# Full nine-case sweep, including both uncommitted serving repairs.
+# Full nine-case sweep using the repaired branch heads.
 python3 -u run_pr_tests.py "${COMMON[@]}" \
-  --round all --gsm8k "$GSM8K" --hours 24 --case-minutes 150 \
-  --case-patch 01-pr-e-chat-encode:serving-fixes/pr2-chat-tokenizer.patch \
-  --case-patch 07-combined:serving-fixes/combined-chat-tokenizer.patch
+  --round all --gsm8k "$GSM8K" --hours 24 --case-minutes 150
 ```
 
 To retain the full sweep inside screen, replace its `python3 -u` prefix with
@@ -194,8 +189,11 @@ python3 run_pr_tests.py "${COMMON[@]}" --stop-only
 
 The runner locks port 30000 across containers and stores ownership per container. `--stop-only` refuses to race an active
 runner, refuses PID reuse or missing ownership, checks Docker errors, and verifies
-that the port is free. It signals only processes carrying its unique ownership
-token. No process-name sweeps are used. Temporary execution worktrees are removed
+that the port is free. It verifies the recorded session and PID start time; workers in that session
+remain owned even if they clear their environment. The unique token also
+identifies descendants that start a separate session. A boot identifier guards
+new ownership records against reuse after a reboot. Existing records from the
+previous harness version remain usable for cleanup. No process-name sweeps are used. Temporary execution worktrees are removed
 after verified process cleanup; original worktrees and archived logs are retained.
 
 Regenerate a historical or current report without Docker, NPU, or network access.

@@ -35,25 +35,33 @@ def proc_info(pid):
         return None
 
 
+def owned_process(info, identity):
+    if not info or info["state"] == "Z":
+        return False
+    # Multiprocessing workers can clear their environment or rewrite argv/env.
+    in_session = info["session"] == identity["pid"]
+    has_token = info["token"] == identity["token"]
+    return (in_session or has_token) and int(info["start"]) >= int(identity["start"])
+
+
 def members(identity):
+    if identity.get("session", identity["pid"]) != identity["pid"]:
+        raise RuntimeError("invalid owned session identity")
+    if (
+        identity.get("boot_id")
+        and identity["boot_id"]
+        != Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    ):
+        raise RuntimeError("ownership record belongs to a different boot")
+    leader = proc_info(identity["pid"])
+    if leader and leader["start"] != identity["start"]:
+        raise RuntimeError("PID reused; refusing to signal it")
     found = []
     for path in Path("/proc").iterdir():
-        if not path.name.isdigit():
-            continue
-        info = proc_info(path.name)
-        if info and info["state"] != "Z":
-            if (
-                info["session"] == identity["pid"]
-                and info["token"] != identity["token"]
-            ):
-                raise RuntimeError(
-                    "session contains a process without the ownership token"
-                )
-            if info["token"] == identity["token"]:
+        if path.name.isdigit():
+            info = proc_info(path.name)
+            if owned_process(info, identity):
                 found.append(info)
-    leader = proc_info(identity["pid"])
-    if leader and leader["state"] != "Z" and leader["start"] != identity["start"]:
-        raise RuntimeError("PID reused; refusing to signal it")
     return found
 
 
@@ -80,7 +88,11 @@ def main():
         if not info:
             raise RuntimeError("server wrapper exited before ownership was recorded")
         identity = dict(
-            info, token=spec["token"], command=spec["command"], log=spec["log"]
+            info,
+            token=spec["token"],
+            command=spec["command"],
+            log=spec["log"],
+            boot_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
         )
         temporary = state.with_suffix(".tmp")
         temporary.write_text(json.dumps(identity))
@@ -99,7 +111,7 @@ def main():
                 if (
                     current
                     and current["start"] == info["start"]
-                    and current["token"] == identity["token"]
+                    and owned_process(current, identity)
                 ):
                     try:
                         os.kill(info["pid"], sig)

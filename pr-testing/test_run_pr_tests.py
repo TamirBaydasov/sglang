@@ -318,7 +318,10 @@ def owned_stop(state):
     )
 
 
-def test_owned_cleanup_kills_children_but_preserves_unrelated_process(tmp_path):
+@pytest.mark.parametrize("clear_worker_env", [False, True])
+def test_owned_cleanup_kills_children_but_preserves_unrelated_process(
+    tmp_path, clear_worker_env
+):
     unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     state = owned_launch(
         tmp_path,
@@ -326,7 +329,9 @@ def test_owned_cleanup_kills_children_but_preserves_unrelated_process(tmp_path):
             [
                 sys.executable,
                 "-c",
-                'import subprocess,time; subprocess.Popen(["sleep","60"]); time.sleep(60)',
+                "import os,subprocess,time; env=dict(os.environ); "
+                + ('env.pop("PRTEST_RUN_TOKEN",None); ' if clear_worker_env else "")
+                + 'subprocess.Popen(["sleep","60"],env=env); time.sleep(60)',
             ]
         ),
     )
@@ -335,7 +340,13 @@ def test_owned_cleanup_kills_children_but_preserves_unrelated_process(tmp_path):
         deadline = time.monotonic() + 5
         while len(remote.members(identity)) < 2 and time.monotonic() < deadline:
             time.sleep(0.02)
-        assert len(remote.members(identity)) >= 2
+        processes = remote.members(identity)
+        assert len(processes) >= 2
+        if clear_worker_env:
+            assert any(
+                info["token"] is None and info["session"] == identity["pid"]
+                for info in processes
+            )
         assert owned_stop(state).returncode == 0
         assert remote.members(identity) == []
         assert unrelated.poll() is None
@@ -705,3 +716,43 @@ def test_resolved_runtime_changes_prevent_ratios(tmp_path):
         )
     h.summarize(records, tmp_path, SimpleNamespace())
     assert "configuration mismatch" in (tmp_path / "SUMMARY.md").read_text()
+
+
+def test_legacy_registry_cleans_envless_worker_after_leader_exit(tmp_path):
+    script = (
+        "import os,subprocess,time; env=dict(os.environ); "
+        'env.pop("PRTEST_RUN_TOKEN",None); '
+        'subprocess.Popen(["sleep","60"],env=env); time.sleep(.3)'
+    )
+    state = owned_launch(tmp_path, h.shlex.join([sys.executable, "-c", script]))
+    identity = json.loads(state.read_text())
+    identity.pop("boot_id")
+    state.write_text(json.dumps(identity))
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            leader = remote.proc_info(identity["pid"])
+            if not leader or leader["state"] == "Z":
+                break
+            time.sleep(0.02)
+        workers = remote.members(identity)
+        assert workers and all(info["token"] is None for info in workers)
+        assert owned_stop(state).returncode == 0
+        assert remote.members(identity) == []
+    finally:
+        owned_stop(state)
+
+
+def test_previous_boot_identity_is_rejected(tmp_path):
+    state = owned_launch(tmp_path, "sleep 60")
+    original = state.read_text()
+    try:
+        identity = json.loads(original)
+        identity["boot_id"] = "different-boot"
+        state.write_text(json.dumps(identity))
+        result = owned_stop(state)
+        assert result.returncode != 0 and "different boot" in result.stderr
+        assert remote.proc_info(identity["pid"]) is not None
+    finally:
+        state.write_text(original)
+        owned_stop(state)

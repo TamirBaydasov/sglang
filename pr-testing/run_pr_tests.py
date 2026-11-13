@@ -1070,14 +1070,6 @@ def create_worktree(args, record, registry, deadline):
     registry["worktrees"].append(path)
     save(args.registry_path, registry)
     git(args, "worktree", "add", "--detach", path, record["commit"], deadline=deadline)
-    patch = args.patches.get(record["case"])
-    if patch:
-        text = Path(patch).read_text()
-        git(
-            args, "apply", "--check", "-", deadline=deadline, repo=path, input_text=text
-        )
-        git(args, "apply", "-", deadline=deadline, repo=path, input_text=text)
-        record["patch_sha256"] = hashlib.sha256(text.encode()).hexdigest()
     record["source_diff_sha256"] = hashlib.sha256(
         git(args, "diff", "--binary", deadline=deadline, repo=path).encode()
     ).hexdigest()
@@ -1336,6 +1328,7 @@ def run_phase(
             raise
         except Exception as exc:
             attempt.update(status="failed", reason=f"{type(exc).__name__}: {exc}")
+            log(f"{phase}: {attempt['reason']}")
         finally:
             if state_path:
                 try:
@@ -1769,13 +1762,6 @@ def parser():
     p.add_argument("--case-minutes", type=float, default=60)
     p.add_argument("--extra-server-args", default="")
     p.add_argument("--skip-baseline-bracket", action="store_true")
-    p.add_argument(
-        "--case-patch",
-        action="append",
-        default=[],
-        metavar="CASE:FILE",
-        help="apply an uncommitted host patch in an isolated case worktree",
-    )
     p.add_argument("--state-dir", default=f"/tmp/prtest-owned-{os.getuid()}")
     p.add_argument(
         "--save-dir",
@@ -1853,24 +1839,13 @@ def validate_args(args):
         AIS_ENV_CANDIDATES[0],
     )
     args.cann_env_resolved = args.container_cann_env
-    args.patches = {}
-    cases = apply_overrides(plan_cases(args), args.flags_overrides)
-    for spec in args.case_patch:
-        name, path = spec.split(":", 1)
-        if name not in {case[0] for case in cases} or name in args.patches:
-            raise ValueError("unknown or duplicate --case-patch case")
-        if not Path(path).is_file():
-            raise ValueError("patch file missing: " + path)
-        args.patches[name] = str(Path(path).resolve())
-    return cases
+    return apply_overrides(plan_cases(args), args.flags_overrides)
 
 
 def dry_run(args, cases):
     for name, ref, env, _ in cases:
         worktree = "<run-root>/worktrees/" + name
         print(f"== {name}: pin {ref} once; isolated worktree {worktree}")
-        if name in args.patches:
-            print("overlay patch: " + args.patches[name])
         for phase in phase_names(args):
             graph = args.decode_graph == "on" and phase != "diagnostic-eager"
             print(
