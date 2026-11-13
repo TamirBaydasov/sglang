@@ -52,11 +52,11 @@ ownership. This runner will not adopt or sweep those processes. Inspect with
 
 Run these in Bash from the extracted directory. Set `GSM8K` to an existing
 **host-side** GSM8K test JSONL (`question` and `answer` with `####` final answers).
-No dataset path was present in the supplied evidence. At least 200 valid rows
+The confirmed host path is shown below. At least 200 valid rows
 are required by default; validation happens before any server launch.
 
 ```bash
-export GSM8K=/absolute/path/to/gsm8k/test.jsonl
+export GSM8K=/home/tbaydasov/grade-school-math/grade_school_math/data/test.jsonl
 COMMON=(
   --container sglang-a3
   --repo /home/swx1199799/megamoe_test/sglang
@@ -138,8 +138,11 @@ runs are marked unresolved. Poor quality does not suppress diagnostic AISBench
 runs. The paired-output suite remains diagnostic and excludes errored/truncated
 outputs from its match counts.
 
-AISBench preflight and execution share environment initialization and the chosen
-Conda environment. The preflight requires a matching model, localhost endpoint,
+AISBench preflight and execution initialize the Conda Bash hook before sourcing
+`--ais-env`, because that file may itself call `conda activate`. The hook is
+resolved from `CONDA_EXE` or an executable on PATH, with the known
+`/home/miniconda3/etc/profile.d/conda.sh` as a fallback. Both phases then activate
+the chosen `--ais-conda-env`. The preflight requires a matching model, localhost endpoint,
 port, tool, and working directory. The model/tokenizer directory must also be
 accessible to the host client. Preflight failure prevents expensive speed-server
 launches; an independent accuracy phase can still run.

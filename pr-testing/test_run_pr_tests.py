@@ -142,7 +142,8 @@ def test_dry_run_uses_real_builders(capsys):
     assert "accuracy: fresh server" in output and "speed: fresh server" in output
 
 
-def test_ais_preflight_and_runtime_share_custom_conda(tmp_path):
+@pytest.mark.parametrize("discovery", ["exe", "path", "inherited_stub"])
+def test_ais_preflight_and_runtime_share_custom_conda(tmp_path, monkeypatch, discovery):
     model = tmp_path / "model"
     model.mkdir()
     work = tmp_path / "work"
@@ -159,9 +160,27 @@ def test_ais_preflight_and_runtime_share_custom_conda(tmp_path):
     binary.write_text("#!/bin/sh\nexit 0\n")
     binary.chmod(0o755)
     env = tmp_path / "env.sh"
-    env.write_text(
-        f'export PATH={str(tmp_path)!r}:"$PATH"\nconda() {{ test "$1" = activate && export ACTIVE_TEST_ENV="$2"; }}\n'
+    conda = tmp_path / "conda"
+    conda.write_text(
+        "#!/bin/bash\n"
+        'if [[ "$1" == shell.bash && "$2" == hook ]]; then\n'
+        '  echo \'conda() { test "$1" = activate && export ACTIVE_TEST_ENV="$2"; };\'\n'
+        "else\n"
+        '  echo "CondaError: Run conda init before conda activate" >&2; exit 1\n'
+        "fi\n"
     )
+    conda.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    monkeypatch.delenv("CONDA_EXE", raising=False)
+    monkeypatch.delenv("BASH_FUNC_conda%%", raising=False)
+    if discovery in ("exe", "inherited_stub"):
+        monkeypatch.setenv("CONDA_EXE", str(conda))
+    if discovery == "inherited_stub":
+        monkeypatch.setenv(
+            "BASH_FUNC_conda%%",
+            '() { echo "CondaError: uninitialized" >&2; return 1; }',
+        )
+    env.write_text("conda activate fixture\n")
     args = args_for(
         "--model",
         str(model),
@@ -178,6 +197,10 @@ def test_ais_preflight_and_runtime_share_custom_conda(tmp_path):
         h.ais_command(args), time.monotonic() + 10, env=h.ais_environment(args)
     )
     assert result.stdout.strip() == "ENV=custom"
+    env.write_text("conda activate fixture\nfalse\n")
+    with pytest.raises(RuntimeError, match="AIS preflight failed"):
+        h.ais_preflight(args, time.monotonic() + 10)
+    env.write_text("conda activate fixture\n")
     (tool / "config.py").write_text('HOST_PORT=1234\nHOST_IP="127.0.0.1"\n')
     with pytest.raises(RuntimeError, match="port mismatch"):
         h.ais_preflight(args, time.monotonic() + 10)

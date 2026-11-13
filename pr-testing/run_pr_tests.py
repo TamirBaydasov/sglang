@@ -723,12 +723,21 @@ def validate_ais(text, returncode, requests, length=None):
 
 AIS_SETUP = r"""
 set -e
-source "$1"
-if ! declare -F conda >/dev/null; then
-    conda_command=${CONDA_EXE:-conda}
+# set_env.sh may itself activate Conda; initialize before sourcing it.
+conda_command=${CONDA_EXE:-}
+if [ ! -x "$conda_command" ]; then
+    conda_command=$(type -P conda || true)
+fi
+if [ -n "$conda_command" ]; then
     conda_hook=$("$conda_command" shell.bash hook)
     eval "$conda_hook"
+elif [ -f /home/miniconda3/etc/profile.d/conda.sh ]; then
+    source /home/miniconda3/etc/profile.d/conda.sh
+elif ! declare -F conda >/dev/null; then
+    echo "prtest FATAL: cannot initialize Conda (CONDA_EXE, PATH, conda.sh unavailable)" >&2
+    exit 78
 fi
+source "$1"
 conda activate "$AIS_CONDA_ENV"
 command -v python3 >/dev/null
 command -v ais_bench >/dev/null
