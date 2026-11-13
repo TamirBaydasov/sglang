@@ -135,9 +135,9 @@ def test_dry_run_uses_real_builders(capsys):
     for phase, width in (("accuracy", "1"), ("speed", "16")):
         argv = h.server_argv(args, args.memfrac, True, phase=phase)
         assert argv[argv.index("--max-running-requests") + 1] == width
-        assert h.server_shell(
-            args, "<run-root>/worktrees/00-baseline", {}, argv
-        ) in output
+        assert (
+            h.server_shell(args, "<run-root>/worktrees/00-baseline", {}, argv) in output
+        )
     assert h.shlex.join(h.ais_command(args)) in output
     assert "accuracy: fresh server" in output and "speed: fresh server" in output
 
@@ -169,18 +169,33 @@ def test_combined_phases_launch_and_stop_separate_servers(tmp_path, monkeypatch)
     monkeypatch.setattr(h, "run_gsm8k", lambda *a: {"status": "ok", "accuracy": 1})
     monkeypatch.setattr(h, "run_accuracy_prompts", lambda *a: {"errors": 0})
     monkeypatch.setattr(h, "run_aisbench", lambda *a: {"status": "ok", "reason": ""})
-    monkeypatch.setattr(h, "stop_server", lambda args, state: events.append(("stop", state)))
+    monkeypatch.setattr(
+        h, "stop_server", lambda args, state: events.append(("stop", state))
+    )
     for phase, width in (("accuracy", "1"), ("speed", "16")):
-        h.run_phase(args, record, phase, "/tree", tmp_path, registry,
-                    time.monotonic() + 10, lambda message: None, lambda: None)
+        h.run_phase(
+            args,
+            record,
+            phase,
+            "/tree",
+            tmp_path,
+            registry,
+            time.monotonic() + 10,
+            lambda message: None,
+            lambda: None,
+        )
         attempt = record["phases"][phase]["attempts"][0]
         assert attempt["status"] == "ok"
         saved = json.loads((tmp_path / phase / "attempt-1" / "launch.json").read_text())
         argv = saved["argv"]
         assert argv[argv.index("--max-running-requests") + 1] == width
         assert saved["command"] == h.server_shell(args, "/tree", {}, argv)
-    assert events == [("launch", "accuracy"), ("stop", "accuracy-owned"),
-                      ("launch", "speed"), ("stop", "speed-owned")]
+    assert events == [
+        ("launch", "accuracy"),
+        ("stop", "accuracy-owned"),
+        ("launch", "speed"),
+        ("stop", "speed-owned"),
+    ]
 
 
 @pytest.mark.parametrize("discovery", ["exe", "path", "inherited_stub"])
@@ -1217,3 +1232,71 @@ def test_selected_cann_environment_failure_prevents_server_exec(tmp_path, script
     )
     assert result.returncode != 0
     assert not marker.exists()
+
+
+def test_ep_default_and_explicit_tp_diagnostic():
+    args = args_for("--round", "speed")
+    argv = h.server_argv(args, args.memfrac, True, phase="speed")
+    assert argv[argv.index("--moe-a2a-backend") + 1] == "deepep"
+    assert argv[argv.index("--ep-size") + 1] == "16"
+    tp = args_for("--round", "accuracy", "--moe-mode", "tp")
+    argv = h.server_argv(tp, tp.memfrac, True, phase="accuracy")
+    assert argv[argv.index("--moe-a2a-backend") + 1] == "none"
+    assert argv[argv.index("--ep-size") + 1] == "1"
+    mega = next(case for case in h.CASES if case[0] == "09-pr1-megamoe")
+    argv = h.server_argv(args, args.memfrac, True, mega[4], phase="speed")
+    assert argv.count("--moe-a2a-backend") == 1
+    assert argv[argv.index("--moe-a2a-backend") + 1] == "ascend_fuseep"
+
+
+def test_overnight_budget_brackets_and_isolated_diagnostics(capsys):
+    args = args_for("--suite", "overnight12")
+    cases = h.plan_cases(args)
+    assert args.hours == 12
+    assert cases[0][0] == "00-baseline"
+    assert cases[-1][0] == "08-baseline-repeat"
+    assert sum(h.case_settings(args, case[0]).case_minutes for case in cases) == 675
+    assert len(cases) == 13
+    h.dry_run(args, cases)
+    output = capsys.readouterr().out
+    for name, _, env, _, case_args in cases:
+        effective = h.case_settings(args, name)
+        if "tp-" in name:
+            assert effective.round == "accuracy"
+            assert effective.gsm8k_samples == 8
+            assert effective.case_minutes == 15
+        if name == "10-ep-p4-eager":
+            assert effective.round == "accuracy"
+            assert effective.chunk == -1
+            assert effective.context == 32768
+            assert effective.gsm8k_parallel == 64
+            assert effective.accuracy_server_requests == 64
+        for phase in h.phase_names(effective):
+            graph = effective.decode_graph == "on"
+            argv = h.server_argv(
+                effective, effective.memfrac, graph, case_args, phase=phase
+            )
+            assert argv.count("--moe-a2a-backend") == 1
+            assert argv.count("--cuda-graph-backend-decode") == 1
+            assert (
+                h.server_shell(args, "<run-root>/worktrees/" + name, env, argv)
+                in output
+            )
+    assert (
+        "speed: fresh server"
+        not in output.split("== 10-ep-p4-eager")[1].split("== 08-baseline-repeat")[0]
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--round", "accuracy"],
+        ["--moe-mode", "tp"],
+        ["--cases", "00-baseline"],
+        ["--hours", "13"],
+    ],
+)
+def test_overnight_rejects_incompatible_overrides(extra):
+    with pytest.raises(ValueError):
+        args_for("--suite", "overnight12", *extra)

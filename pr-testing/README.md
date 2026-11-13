@@ -128,6 +128,63 @@ text is also retained to expose prompt-format effects. Confirm checkpoint,
 resolved quantization, full-model geometry, and loaded weights before assigning
 a cause. No baseline model-code change is claimed without this device evidence.
 
+## Twelve-hour EP sweep
+
+Use the published harness directory on the A3 host:
+
+```bash
+bash run_12h.sh --gsm8k /home/tbaydasov/grade-school-math/grade_school_math/data/test.jsonl
+```
+
+`--suite overnight12` sets a 12-hour global work deadline. Cases finish early
+when measurements finish; it does not loop or wait to fill 12 hours. The maximum
+case allocations total 675 minutes, leaving 45 minutes for preflight and overhead.
+Each case includes worktree setup, server startup, clients, and retries within
+its cap. Owned cleanup still runs when a deadline or interruption is reached.
+Unfinished requested cases fail the run and remain visible in the report.
+
+| Order | Cases | Phases | Cap |
+|---|---|---|---|
+| 1 | Baseline on `dcp_ascend_testing` | Accuracy + speed | 60 min |
+| 2 | MegaMoE on `A3_megamoe_support` | Accuracy + speed | 60 min |
+| 3–9 | PR #2–#7 and combined | Accuracy + speed each | 7 × 60 min |
+| 10 | P4 DeepEP reference | Accuracy, 64 questions | 45 min |
+| 11–12 | TP/EP1 graph and eager diagnostics | Accuracy, same 8 questions each | 2 × 15 min |
+| 13 | Closing baseline, same pinned SHA | Accuracy + speed | 60 min |
+
+Regular EP cases use DeepEP `auto`, EP16/TP16/DCP16, 64 GSM8K questions,
+16 client workers, one active accuracy request, and fresh speed servers with
+16 active requests. AISBench remains 1M input tokens, one output token,
+16 requests/concurrency 16, seed 4. HCCL/DeepEP buffers are 1000/2500 MB.
+The launcher uses memory fraction 0.76. MegaMoE overrides the backend with
+`ascend_fuseep` mode 3, retaining EP16. The baseline branch is never replaced.
+
+The P4 reference case uses eager decode, unchunked prefill, 32K context, memory
+fraction 0.76, and 64 server/client requests. Quantization, dtype, model
+implementation, shared-expert fusion, KV capacity and prefill limits resolve
+from model/server defaults as in the supplied launcher. It retains the harness
+ownership, fixed seed, watchdog and explicit automatic weight loading.
+The actual resolved settings are saved in `smoke.json` and `launch.json`.
+This is an accuracy diagnostic, not a comparable 1M-token speed sample.
+
+TP diagnostics use the failed TP/EP1 recipe with graph/eager as the changed
+variable. Eight prompts limit wasted time; they cannot establish a 64-question
+accuracy score or a performance result. They never run AISBench. See
+[TP_W4A8_FINDINGS.md](TP_W4A8_FINDINGS.md) for the investigation and next cuts.
+
+The suite requires `--round all` and its complete case list. `--moe-mode tp`
+is available for separate diagnostic runs; the default for other runs is EP.
+Explicit `--cases` preserve the requested order. Lowering `--case-minutes` or
+`--hours` lowers caps; it may leave requested work incomplete. Fallback retries
+are disabled in this suite so memory/graph changes cannot replace its samples.
+
+Accept baseline quality only after reading the raw responses: 64 completed,
+zero request failures and truncations, and accuracy at the expected historical
+level (roughly 92–95%; five questions overlap shots). This remains a diagnostic
+score with overlap, not a held-out claim. Keep unresolved quality beside speed
+measurements. Ratios require matching resolved settings; MegaMoE's different
+backend is reported with raw timings when that prevents comparison.
+
 ## Accuracy and timing interpretation
 
 GSM8K uses the unmodified client extracted from `test_pr1_megamoe_accuracy.py`:

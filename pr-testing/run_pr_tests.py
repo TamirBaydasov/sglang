@@ -63,12 +63,7 @@ AIS_ENV_CANDIDATES = ("/home/tbaydasov/set_env.sh", "/home/tbaydasovset_env.sh")
 AIS_DIR_DEFAULT = "/home/tbaydasov/aisbench/aisbench_auto_tools_prefix"
 FORK_URL_DEFAULT = "https://github.com/TamirBaydasov/sglang.git"
 
-# BDE serve recipe, brought to PARITY with the reference run that measured
-# 92% GSM8K / 42s TTFT on this box (test_pr1_megamoe_accuracy.py ENV dict +
-# test_pr1_megamoe.py command()): the archived BDE recipe alone generated
-# cross-lingual garbage on every branch (0/64 GSM8K, truncated-diagnostic),
-# so the serving profile itself was the suspect and the reference profile is
-# the only known-good configuration.
+# DeepEP EP16 controls; inherit no unrecorded feature toggles.
 BASE_ENV = {
     # Reference ENV verbatim (test_pr1_megamoe_accuracy.py). DSA token-shard
     # and indexer query sharding are EXPLICIT here: the reference does not
@@ -82,8 +77,8 @@ BASE_ENV = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY": "1",
     "STREAMS_PER_DEVICE": "32",
-    "HCCL_BUFFSIZE": "768",
-    "DEEPEP_HCCL_BUFFSIZE": "768",
+    "HCCL_BUFFSIZE": "1000",
+    "DEEPEP_HCCL_BUFFSIZE": "2500",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
@@ -93,11 +88,7 @@ BASE_ENV = {
 }
 
 SERVER_PORT = 30000
-# Serving args = the reference command() profile (test_pr1_megamoe_accuracy.py
-# / test_pr1_megamoe.py) that measured 92% GSM8K and ~42s cached TTFT on this
-# box, with the harness's working substitutions (watchdog 7200, server seed,
-# port). ModelSlim/BF16/native-impl and shared-expert-fusion-off are EXPLICIT:
-# the baseline that generated garbage ran quantization=auto.
+# EP controls and PR variants share this recipe; case overrides are recorded.
 BASE_SERVER_ARGS = [
     "--device",
     "npu",
@@ -111,6 +102,12 @@ BASE_SERVER_ARGS = [
     "--model-impl",
     "sglang",
     "--disable-shared-experts-fusion",
+    "--ep-size",
+    "16",
+    "--moe-a2a-backend",
+    "deepep",
+    "--deepep-mode",
+    "auto",
     "--tp-size",
     "16",
     "--dcp-size",
@@ -150,7 +147,7 @@ BASE_SERVER_ARGS = [
 ]
 
 # --------------------------------------------------------------------------
-# Case table: (name, ref, env, note).  Baseline bracket = first + last.
+# Case table: (name, ref, env, note, server overrides).
 # --------------------------------------------------------------------------
 CASES = [
     (
@@ -287,6 +284,67 @@ CASES = [
         ),
     ),
 ]
+
+# Short TP probes retain the failed configuration as evidence.
+CASES.extend(
+    [
+        (
+            "10-ep-p4-eager",
+            "dcp_ascend_testing",
+            {},
+            "P4 DeepEP accuracy: eager, no chunking, 64 active requests",
+            (),
+        ),
+        (
+            "11-tp-graph-diagnostic",
+            "dcp_ascend_testing",
+            {},
+            "W4A8 TP/EP1 graph diagnostic; not a speed comparison",
+            ("--ep-size", "1", "--moe-a2a-backend", "none"),
+        ),
+        (
+            "12-tp-eager-diagnostic",
+            "dcp_ascend_testing",
+            {},
+            "W4A8 TP/EP1 eager diagnostic; same eight prompts as graph",
+            ("--ep-size", "1", "--moe-a2a-backend", "none"),
+        ),
+    ]
+)
+
+OVERNIGHT12_ORDER = [
+    "00-baseline",
+    "09-pr1-megamoe",
+    *[case[0] for case in CASES[1:8]],
+    "10-ep-p4-eager",
+    "11-tp-graph-diagnostic",
+    "12-tp-eager-diagnostic",
+    "08-baseline-repeat",
+]
+
+
+def case_settings(args, name):
+    result = argparse.Namespace(**vars(args))
+    if name == "10-ep-p4-eager":
+        result.round = "accuracy"
+        result.p4_reference = True
+        result.memfrac = 0.76
+        result.decode_graph = "off"
+        result.chunk = -1
+        result.context = 32768
+        result.gsm8k_parallel = 64
+        result.accuracy_server_requests = 64
+    elif name in ("11-tp-graph-diagnostic", "12-tp-eager-diagnostic"):
+        result.round = "accuracy"
+        result.decode_graph = "off" if name.startswith("12-") else "on"
+        result.gsm8k_samples = min(args.gsm8k_samples, 8)
+        result.gsm_rows = getattr(args, "gsm_rows", [])[: result.gsm8k_samples]
+    if args.suite == "overnight12":
+        cap = 45 if name == "10-ep-p4-eager" else 15 if "tp-" in name else 60
+        result.case_minutes = min(args.case_minutes, cap)
+        result.retry_oom = False
+    return result
+
 
 # Attribution overrides: --flags-overrides 03:SGLANG_NPU_DCP_GATHER_CHUNKS=1,...
 # applied AFTER the case env so any case can be re-pointed without editing.
@@ -1251,10 +1309,38 @@ def server_argv(args, memfrac, graph, case_args=(), *, phase=None):
     ]:
         values[values.index(key) + 1] = str(value)
     if phase == "accuracy":
-        values[values.index("--max-running-requests") + 1] = "1"
+        values[values.index("--max-running-requests") + 1] = str(
+            args.accuracy_server_requests
+        )
+    values[values.index("--ep-size") + 1] = "16" if args.moe_mode == "ep" else "1"
+    values[values.index("--moe-a2a-backend") + 1] = (
+        "deepep" if args.moe_mode == "ep" else "none"
+    )
     if not graph:
-        index = values.index("--cuda-graph-max-bs-decode")
-        values[index : index + 2] = ["--cuda-graph-backend-decode", "disabled"]
+        values[values.index("--cuda-graph-backend-decode") + 1] = "disabled"
+    if getattr(args, "p4_reference", False):
+        # Let the attached P4 recipe's model and memory defaults resolve normally.
+        for key in (
+            "--quantization",
+            "--dtype",
+            "--model-impl",
+            "--max-total-tokens",
+            "--max-prefill-tokens",
+            "--prefill-max-requests",
+            "--cuda-graph-max-bs-decode",
+            "--cuda-graph-bs-decode",
+        ):
+            index = values.index(key)
+            del values[index : index + 2]
+        values.remove("--disable-shared-experts-fusion")
+    # Replace controlled case values instead of emitting duplicate options.
+    extra = []
+    for index in range(0, len(case_args), 2):
+        key, value = case_args[index : index + 2]
+        if key in values:
+            values[values.index(key) + 1] = value
+        else:
+            extra.extend((key, value))
     return [
         args.container_python,
         "-m",
@@ -1268,7 +1354,7 @@ def server_argv(args, memfrac, graph, case_args=(), *, phase=None):
         *values,
         # Per-case launch additions (e.g. the megamoe EP/FuseEP args) go
         # BEFORE the user's --extra-server-args so the user always wins.
-        *case_args,
+        *extra,
         *shlex.split(args.extra_server_args),
     ]
 
@@ -1552,6 +1638,10 @@ def resolved_comparison(config, smoke_record):
         "kv_cache_dtype",
         "moe_runner_backend",
         "moe_a2a_backend",
+        "ep_size",
+        "deepep_mode",
+        "fuseep_mode",
+        "dcp_comm_backend",
         "mem_fraction_static",
         "context_length",
         "chunked_prefill_size",
@@ -2157,7 +2247,21 @@ def plan_cases(args):
         raise ValueError(
             "unknown or duplicate cases: " + ",".join(sorted(unknown or set(wanted)))
         )
-    cases = [case for case in CASES if case[0] in wanted]
+    if args.suite == "overnight12":
+        wanted = OVERNIGHT12_ORDER
+    elif not args.cases:
+        wanted = [
+            case[0]
+            for case in CASES
+            if case[0]
+            not in (
+                "10-ep-p4-eager",
+                "11-tp-graph-diagnostic",
+                "12-tp-eager-diagnostic",
+            )
+        ]
+    table = {case[0]: case for case in CASES}
+    cases = [table[name] for name in wanted]
     if args.skip_baseline_bracket:
         cases = [case for case in cases if "baseline" not in case[0]]
     if args.diagnose_baseline:
@@ -2197,6 +2301,14 @@ def parser():
         "--round", choices=("smoke", "accuracy", "speed", "all"), default="all"
     )
     p.add_argument("--cases", default="")
+    p.add_argument("--suite", choices=("overnight12",), default=None)
+    p.add_argument(
+        "--moe-mode",
+        choices=("ep", "tp"),
+        default="ep",
+        help="DeepEP EP16 by default; TP/EP1 is diagnostic",
+    )
+    p.add_argument("--accuracy-server-requests", type=int, default=1)
     p.add_argument("--flags-overrides", default="")
     p.add_argument("--container", default="sglang-a3")
     p.add_argument("--container-python", default="python3")
@@ -2255,7 +2367,7 @@ def parser():
     p.add_argument("--accuracy-long-tokens", type=int, default=32768)
     p.add_argument("--startup-timeout", type=float, default=1800)
     p.add_argument("--benchmark-timeout", type=float, default=14400)
-    p.add_argument("--hours", type=float, default=10)
+    p.add_argument("--hours", type=float, default=None)
     p.add_argument("--case-minutes", type=float, default=60)
     p.add_argument("--extra-server-args", default="")
     p.add_argument("--skip-baseline-bracket", action="store_true")
@@ -2286,8 +2398,23 @@ def parser():
 
 
 def validate_args(args):
+    if args.hours is None:
+        args.hours = 12 if args.suite else 10
+    if args.suite and (
+        args.cases
+        or args.round != "all"
+        or args.moe_mode != "ep"
+        or args.skip_baseline_bracket
+        or args.diagnose_baseline
+    ):
+        raise ValueError(
+            "--suite overnight12 requires --round all, EP, and its complete case list"
+        )
+    if args.suite and args.hours > 12:
+        raise ValueError("--suite overnight12 has a maximum global budget of 12 hours")
     for key in (
         "gsm8k_samples",
+        "accuracy_server_requests",
         "gsm8k_max_tokens",
         "gsm8k_parallel",
         "gsm8k_timeout",
@@ -2348,20 +2475,23 @@ def validate_args(args):
 
 def dry_run(args, cases):
     for name, ref, env, _, case_args in cases:
+        effective = case_settings(args, name)
         worktree = "<run-root>/worktrees/" + name
         print(f"== {name}: pin {ref} once; isolated worktree {worktree}")
-        for phase in phase_names(args):
-            graph = args.decode_graph == "on" and phase != "diagnostic-eager"
+        for phase in phase_names(effective):
+            graph = effective.decode_graph == "on" and phase != "diagnostic-eager"
             print(
-                f"  {phase}: fresh server, shared case cap={args.case_minutes} minutes"
+                f"  {phase}: fresh server, shared case cap={effective.case_minutes} minutes"
             )
             print(
                 "  "
                 + server_shell(
-                    args,
+                    effective,
                     worktree,
                     env,
-                    server_argv(args, args.memfrac, graph, case_args, phase=phase),
+                    server_argv(
+                        effective, effective.memfrac, graph, case_args, phase=phase
+                    ),
                 )
             )
             if phase == "speed":
@@ -2431,7 +2561,10 @@ def main(argv=None):
         if (
             not args.stop_only
             and not args.diagnose_baseline
-            and args.round in ("accuracy", "all")
+            and any(
+                "accuracy" in phase_names(case_settings(args, case[0]))
+                for case in cases
+            )
         ):
             if not args.gsm8k:
                 raise ValueError(
@@ -2519,6 +2652,11 @@ def run(args, cases):
             "env": dict(BASE_ENV, **env),
             "note": note,
             "case_server_args": list(case_args),
+            "schedule": {
+                "phases": phase_names(case_settings(args, name)),
+                "case_minutes": case_settings(args, name).case_minutes,
+                "gsm8k_samples": case_settings(args, name).gsm8k_samples,
+            },
             "status": "pending",
             "phases": {},
             "quality_threshold": args.gsm8k_min_accuracy,
@@ -2582,7 +2720,10 @@ def run(args, cases):
                 checkpoint()
                 continue
             record["commit"] = pin["commit"]
-            case_deadline = min(deadline, time.monotonic() + args.case_minutes * 60)
+            effective = case_settings(args, record["case"])
+            case_deadline = min(
+                deadline, time.monotonic() + effective.case_minutes * 60
+            )
             try:
                 remaining(case_deadline)
                 log(f"== {record['case']} {record['commit'][:12]}")
@@ -2590,7 +2731,7 @@ def run(args, cases):
                 case_dir.mkdir()
                 worktree = create_worktree(args, record, registry, case_deadline)
                 record["worktree"] = worktree
-                for phase in phase_names(args):
+                for phase in phase_names(effective):
                     if time.monotonic() >= case_deadline:
                         record["phases"][phase] = {
                             "status": "skipped",
@@ -2608,7 +2749,7 @@ def run(args, cases):
                         checkpoint()
                         continue
                     run_phase(
-                        args,
+                        effective,
                         record,
                         phase,
                         worktree,
@@ -2645,7 +2786,7 @@ def run(args, cases):
         for record in records:
             if record["status"] == "pending":
                 record.update(status="skipped", reason=fatal or "time budget exhausted")
-            for phase in phase_names(args):
+            for phase in phase_names(case_settings(args, record["case"])):
                 record["phases"].setdefault(
                     phase,
                     {
