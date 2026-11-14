@@ -1218,6 +1218,8 @@ class Envs:
     # DSA prefill: each attention-TP rank scores only its shard of the indexer
     # queries, and the top-k is all-gathered.
     SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
+    # B (branch B): store the DSA LightningIndexer index-K as int8 with a fp16
+    SGLANG_NPU_INDEXER_INT8 = EnvBool(False)
     # DSA prefill: each attention-TP rank computes every head for its slice of
     # the tokens. Consumes no ranks, so it composes with DCP.
     SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD = EnvBool(True)

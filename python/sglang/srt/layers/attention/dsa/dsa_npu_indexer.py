@@ -24,11 +24,6 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
 
 if is_npu():
-    # Registers the CANN ops-transformer kernels under
-    # torch.ops.cann_ops_transformer; without this import the
-    # torch.ops namespace is empty and op calls raise AttributeError.
-    # Optional: only the 950 MXFP8 quant indexer needs it, and a failed import
-    # here would drop every DSA model to the Transformers fallback on A3.
     try:
         import cann_ops_transformer  # noqa: F401
     except ImportError:
@@ -68,7 +63,21 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
     return (_create_hadamard_128_cpu().to(device=device) / (128**0.5)).contiguous()
 
 
-def _quantize_npu_indexer_activation(x, hadamard, dst_type):
+def _quantize_npu_indexer_activation(x, hadamard, dst_type, scale_type):
+    assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
+    if x.numel() == 0:
+        return (
+            torch.empty_like(x, dtype=dst_type),
+            torch.empty(x.shape[:-1], dtype=scale_type, device=x.device),
+        )
+    rotated = x @ hadamard
+    quantized, scale = torch_npu.npu_dynamic_quant(
+        rotated.reshape(-1, 128), dst_type=dst_type
+    )
+    return quantized.reshape(x.shape), scale.to(scale_type).reshape(x.shape[:-1])
+
+
+def _quantize_npu_indexer_activation_mxfp8(x, hadamard, dst_type):
     # Hadamard-rotate x and MX-quantize its 128-dim vectors.
     # Returns (quantized, scale): quantized has x's shape in dst_type (fp8)
     # and scale holds one E8M0 byte per 32-element block, shaped
@@ -93,6 +102,25 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type):
         scale = scale.view(torch.float8_e8m0fnu)
 
     return quantized.reshape(x.shape), scale
+
+def _quantize_npu_indexer_activation_int8(x, hadamard):
+    # B (branch B): Hadamard-rotate x and per-token int8-quantize its 128-dim
+    # vectors (npu_dynamic_quant). Returns (int8, fp16 per-token scale), the
+    # quant_mode 0 (per-token) layout the per-token quant op expects on A3.
+    assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
+    if x.numel() == 0:
+        return (
+            torch.empty_like(x, dtype=torch.int8),
+            torch.empty(x.shape[:-1], dtype=torch.float16, device=x.device),
+        )
+    rotated = x @ hadamard
+    quantized, scale = torch_npu.npu_dynamic_quant(
+        rotated.reshape(-1, 128), dst_type=torch.int8
+    )
+    return (
+        quantized.reshape(x.shape),
+        scale.to(torch.float16).reshape(x.shape[:-1]),
+    )
 
 
 def _check_quant_lightning_indexer_constraints(pool) -> None:
@@ -513,11 +541,20 @@ class DSANPUIndexerMixin:
             )
         pool = get_token_to_kv_pool()
         use_quant_indexer = pool.index_k_scale_buffer is not None
+        # B (branch B): per-token int8 index-K (A3); the MXFP8 path (A5) is the
+        # other quant mode. The pool builds exactly one, so int8 takes
+        # precedence when both flags are set.
+        use_int8_indexer = getattr(pool, "indexer_kv_store_int8", False)
         if use_quant_indexer:
-            _check_quant_lightning_indexer_constraints(pool)
-            k, k_scale = _quantize_npu_indexer_activation(
-                k, pool.indexer_hadamard_128, pool.dtype
-            )
+            if use_int8_indexer:
+                k, k_scale = _quantize_npu_indexer_activation_int8(
+                    k, pool.indexer_hadamard_128
+                )
+            else:
+                _check_quant_lightning_indexer_constraints(pool)
+                k, k_scale = _quantize_npu_indexer_activation_mxfp8(
+                    k, pool.indexer_hadamard_128, pool.dtype
+                )
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
@@ -574,6 +611,12 @@ class DSANPUIndexerMixin:
             and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
         ):
+            if use_int8_indexer:
+                raise RuntimeError(
+                    "SGLANG_NPU_INDEXER_INT8 is on together with prefill CP "
+                    "(attn_cp_size>1); the per-token int8 indexer is not "
+                    "supported on the CP-balance path."
+                )
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
                 past_key_states,
@@ -601,8 +644,45 @@ class DSANPUIndexerMixin:
                 actual_seq_lengths_q = shard.actual_seq_lengths_q
                 actual_seq_lengths_kv = shard.actual_seq_lengths_kv
 
-            if use_quant_indexer:
+            if use_int8_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(
+                    query,
+                    pool.indexer_hadamard_128,
+                    pool.index_k_store_dtype,
+                    pool.index_k_scale_dtype,
+                )
+                op_weights = (
+                    weights.to(torch.float16)
+                    if pool.index_k_store_dtype == torch.int8
+                    else weights
+                )
+                if pool.index_k_store_dtype == torch.int8:
+                    # torch_npu.npu_quant_lightning_indexer is not working
+                    # for int8 cache in case of custom_ops imported
+                    quant_lightning_indexer = torch.ops.npu.npu_quant_lightning_indexer
+                else:
+                    quant_lightning_indexer = torch_npu.npu_quant_lightning_indexer
+
+                topk_indices = quant_lightning_indexer(
+                    query=query,
+                    key=past_key_states,
+                    weights=op_weights,
+                    query_dequant_scale=query_scale,
+                    key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
+                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
+                    actual_seq_lengths_key=actual_seq_lengths_kv.to(
+                        device=k.device, dtype=torch.int32
+                    ),
+                    block_table=block_table,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                    query_quant_mode=0,
+                    key_quant_mode=0,
+                ).squeeze(1)
+            elif use_quant_indexer:
+                query, query_scale = _quantize_npu_indexer_activation_mxfp8(
                     query,
                     pool.indexer_hadamard_128,
                     pool.dtype,

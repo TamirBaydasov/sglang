@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -18,7 +19,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import is_npu
@@ -28,6 +29,8 @@ if TYPE_CHECKING:
 
 if is_npu():
     import torch_npu
+
+logger = logging.getLogger(__name__)
 
 
 def _mla_fia_nz_scatter_indices(
@@ -713,6 +716,44 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             requested_kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
+        # B (branch B): per-token int8 index-K store (A3). Sets the index-K
+        # store/scale dtypes so the buffer alloc and the set/get below are
+        # mode-aware. Two carve-outs keep the store in the KV dtype: under the
+        # MXFP8 path (dsa_kv_cache_store_fp8) the index-K never takes the int8
+        # store (it stays the KV dtype + uint8 E8M0 scale), and under
+        # hierarchical cache the NPU host mirror allocates the index-K in the
+        # KV dtype with an FP32 scale (pool_host/mla.py), so an int8 + FP16
+        # index-K would be copied to the host silently corrupted.
+        int8_requested = envs.SGLANG_NPU_INDEXER_INT8.get()
+        hicache_enabled = get_memory().enable_hierarchical_cache
+        if (
+            int8_requested
+            and not self.dsa_kv_cache_store_fp8
+            and index_head_dim is not None
+            and hicache_enabled
+        ):
+            logger.warning(
+                "SGLANG_NPU_INDEXER_INT8 is on but hierarchical cache is "
+                "enabled; the NPU host mirror cannot hold the int8 + FP16 "
+                "index-K store, so the index-K stays in the KV dtype."
+            )
+        self.indexer_kv_store_int8 = (
+            int8_requested
+            and not self.dsa_kv_cache_store_fp8
+            and index_head_dim is not None
+            and not hicache_enabled
+        )
+        # The index-K keeps its OWN store dtype, decoupled from the latent
+        # row's store dtype. int8 index-K (branch B) is independent of any
+        # latent packing: they use different buffers.
+        if self.indexer_kv_store_int8:
+            self.index_k_store_dtype = torch.int8
+            self.index_k_scale_dtype = torch.float16
+        else:
+            self.index_k_store_dtype = self.store_dtype
+            self.index_k_scale_dtype = (
+                torch.uint8 if self.dsa_kv_cache_store_fp8 else None
+            )
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
         self.index_page_size = page_size if index_page_size is None else index_page_size
@@ -780,10 +821,26 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         1,
                         self.index_head_dim,
                     ),
-                    dtype=self.store_dtype,
+                    dtype=self.index_k_store_dtype,
                     device=self.device,
                 )
-                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
+                if self.indexer_kv_store_int8 and self.num_indexer_layers > 0:
+                    # B (branch B): per-token fp16 int8 scale (one per token),
+                    # the layout the per-token quant op (quant_mode 0, layout_k
+                    # PA_BSND) reads back.
+                    from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
+                        create_npu_hadamard_128,
+                    )
+
+                    self.index_k_scale_buffer = torch.zeros(
+                        (*self.index_k_buffer.shape[:-2], 1),
+                        dtype=self.index_k_scale_dtype,
+                        device=self.device,
+                    )
+                    self.indexer_hadamard_128 = create_npu_hadamard_128(
+                        self.index_head_dim, self.device
+                    )
+                elif self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
@@ -979,6 +1036,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_index_k_scale_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        if self.indexer_kv_store_int8:
+            # B (branch B): per-token fp16 scale (no E8M0 view).
+            return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
         # E8M0 view of the raw byte storage: (block_num, block_size, k_n, d/64, 2),
         # the k_descale layout quant_lightning_indexer (v2) expects with
         # quant_mode 3 and layout_k PA_BBND.
@@ -987,18 +1047,32 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
-        # Scatter whole per-token scale rows (k_n, d/64, 2) so the MX block
-        # scales keep the layout quant_lightning_indexer (v2) reads back.
-        assert scale.element_size() == 1, (
-            f"index_k scale must be a 1-byte (E8M0) MX scale, got dtype {scale.dtype}"
-        )
         buf = self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
-        tail = buf.shape[2:]
-        torch_npu.npu_scatter_nd_update_(
-            buf.view(-1, *tail),
-            loc.view(-1, 1),
-            scale.reshape(-1, *tail).view(torch.uint8),
-        )
+        if self.indexer_kv_store_int8:
+            # B (branch B): per-token fp16 scale (one per token).
+            assert scale.dtype == self.index_k_scale_dtype, (
+                f"index_k scale has to be {self.index_k_scale_dtype=} but it is "
+                f"{scale.dtype=}"
+            )
+            tail = buf.shape[2:]
+            torch_npu.npu_scatter_nd_update_(
+                buf.view(-1, *tail),
+                loc.view(-1, 1),
+                scale.reshape(-1, *tail),
+            )
+        else:
+            # Scatter whole per-token scale rows (k_n, d/64, 2) so the MX block
+            # scales keep the layout quant_lightning_indexer (v2) reads back.
+            assert scale.element_size() == 1, (
+                f"index_k scale must be a 1-byte (E8M0) MX scale, "
+                f"got dtype {scale.dtype}"
+            )
+            tail = buf.shape[2:]
+            torch_npu.npu_scatter_nd_update_(
+                buf.view(-1, *tail),
+                loc.view(-1, 1),
+                scale.reshape(-1, *tail).view(torch.uint8),
+            )
 
     def _get_disagg_buffer_entries(self):
         """Return (buffer, uses_global_slots) entries in PD transfer order."""
@@ -1243,11 +1317,20 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             "indexer_layer_ids disagrees with the model's indexer layout"
         )
 
-        if index_k.dtype != self.dtype:
-            index_k = index_k.to(self.dtype)
+        if self.indexer_kv_store_int8:
+            # B (branch B): the indexer already produced int8 index-K; store it
+            # verbatim (no dtype cast / view).
+            assert index_k.dtype == self.index_k_store_dtype, (
+                f"index_k.dtype has to be {self.index_k_store_dtype=} but it is "
+                f"{index_k.dtype=}"
+            )
+        else:
+            if index_k.dtype != self.dtype:
+                index_k = index_k.to(self.dtype)
 
-        if self.store_dtype != self.dtype:
-            index_k = index_k.view(self.store_dtype)
+        # Bit-cast to the INDEX-K store dtype only where it differs.
+        if index_k.dtype != self.index_k_store_dtype:
+            index_k = index_k.view(self.index_k_store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
