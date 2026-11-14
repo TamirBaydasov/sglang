@@ -60,7 +60,7 @@ def forward_dcp_sparse_attention(
         actual_seq_lengths_query = actual_seq_lengths_query.to(
             device=q_nope.device, dtype=torch.int32
         )
-    attn_out, softmax_max, softmax_sum = torch.ops.npu.sgl_sparse_flash_attention(
+    attn_out, softmax_max, softmax_sum = torch.ops.npu.npu_sparse_flash_attention_lse(
         query=q_nope,
         key=k_nope,
         value=k_nope,
