@@ -296,6 +296,10 @@ class ExitPolicy:
             # A reduce-scatter completes the sum on its way back.
             owes_sum=steps.output.group is not None and not sum_in_reduce_scatter,
         )
+        if getattr(forward_batch, "npu_dsa_cp_token_sharded", False):
+            # Deferred sums and fused consumers retain full rows; the residual
+            # needs the reduce-scatter completed before its next update.
+            return ExitDecision(False, sum_in_reduce_scatter, complete_now)
         custom = steps.output.sum_impl
         custom_can_defer = (
             custom.can_defer(forward_batch)
@@ -592,9 +596,7 @@ class MixerExit:
             # padding), so == num_tokens_pad fails on non-divisible chunks.
             if residual is not None and residual.shape[0] != plan.rows:
                 self._stream.residual = dsa_token_shard_slice(residual, plan)
-            return self._stream.record(
-                hidden_states, self._update, declared_sum=None
-            )
+            return self._stream.record(hidden_states, self._update, declared_sum=None)
         if self._defers:
             hidden_states = UnreducedOutput(
                 hidden_states, group=get_parallel().tp_group

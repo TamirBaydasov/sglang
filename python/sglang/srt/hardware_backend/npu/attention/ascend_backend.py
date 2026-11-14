@@ -1612,11 +1612,6 @@ class AscendAttnBackend(AttentionBackend):
         # The token shard replaces both length vectors, built once per forward.
         dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
         dsa_token_shard_qlen = dsa_token_shard_kvlen = None
-        # BUG 5: branch on the per-forward decision, not plan presence.
-        if dsa_token_shard_plan is not None and not getattr(
-            forward_batch, "npu_dsa_cp_token_sharded", False
-        ):
-            dsa_token_shard_plan = None
         if dsa_token_shard_plan is not None:
             dsa_token_shard_qlen, dsa_token_shard_kvlen = (
                 dsa_token_shard_cumulative_lens(
