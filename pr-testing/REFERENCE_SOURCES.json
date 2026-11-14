@@ -4,8 +4,8 @@
     "source_sha256": "3fb8b761dc893471d7562a3708b0be171b723d9caa32fd94759bb4a1e387e7e9",
     "extracted_constant": "GSM8K_CLIENT",
     "file": "prtest_gsm8k.py",
-    "sha256": "63dff0fb73dfc727e52ddb889c1230bef15de8cd1dcbd1c885908066c67c1795",
-    "modifications": "none; launcher and server arguments are not imported"
+    "sha256": "eea3eacf934081d6c1f9396a9725e6a636cc0ead8e67006d338394aeaed43c82",
+    "modifications": "DeepEP server validation and exact saved-prompt replay; normal prompts, sampling and scorer preserved"
   },
   {
     "source": "test_pr1_megamoe.py",

@@ -326,6 +326,75 @@ CASES.extend(
     ]
 )
 
+CASES.extend(
+    [
+        (
+            "15-baseline-8k",
+            "dcp_ascend_testing",
+            {},
+            "TP control for 8K-prefill MegaMoE",
+            (),
+        ),
+        (
+            "16-megamoe-8k",
+            "A3_megamoe_support",
+            {"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024"},
+            "MegaMoE 8K-prefill memory diagnostic",
+            (
+                "--ep-size",
+                "16",
+                "--moe-a2a-backend",
+                "ascend_fuseep",
+                "--fuseep-mode",
+                "3",
+            ),
+        ),
+        (
+            "17-baseline-8k-repeat",
+            "dcp_ascend_testing",
+            {},
+            "8K-prefill closing TP control",
+            (),
+        ),
+        (
+            "18-baseline-prefill1",
+            "dcp_ascend_testing",
+            {},
+            "Matched packed-read TP control",
+            ("--prefill-max-requests", "1"),
+        ),
+        (
+            "19-baseline-prefill1-repeat",
+            "dcp_ascend_testing",
+            {},
+            "Packed-read closing TP control",
+            ("--prefill-max-requests", "1"),
+        ),
+        *[
+            (
+                f"{number}-moe-ts-{ts}-{graph}",
+                "npu-dsa-cp-moe-int8",
+                {"SGLANG_NPU_DSA_CP_TOKEN_SHARDED": "True" if ts == "on" else "False"},
+                "Exact-prompt graph/token-sharding diagnostic",
+                (),
+            )
+            for number, ts, graph in [
+                (20, "off", "eager"),
+                (21, "on", "eager"),
+                (22, "off", "graph"),
+                (23, "on", "graph"),
+            ]
+        ],
+    ]
+)
+
+MATCHED_BASELINES = {
+    "03-pr-prefetch-packed": "18-baseline-prefill1",
+    "16-megamoe-8k": "15-baseline-8k",
+    "17-baseline-8k-repeat": "15-baseline-8k",
+    "19-baseline-prefill1-repeat": "18-baseline-prefill1",
+}
+
 OVERNIGHT12_ORDER = [
     "00-baseline",
     "14-baseline-ep",
@@ -338,6 +407,13 @@ OVERNIGHT12_ORDER = [
 
 def case_settings(args, name):
     result = argparse.Namespace(**vars(args))
+    if name in ("15-baseline-8k", "16-megamoe-8k", "17-baseline-8k-repeat"):
+        result.chunk = 8192
+        result.max_prefill_tokens = 8192
+    if name.startswith(("20-", "21-", "22-", "23-")):
+        result.round = "accuracy"
+        result.decode_graph = "off" if name.endswith("eager") else "on"
+        result.retry_oom = False
     if name == "13-tp-bias-fix":
         result.round = "accuracy"
     elif name == "10-ep-p4-eager":
@@ -760,6 +836,7 @@ def gsm8k_snapshot(folder, args, complete=False, returncode=None):
     result = {
         "requested": args.gsm8k_samples,
         "completed": len(details),
+        "answered": sum(not row.get("error") for row in details),
         "details": details,
         "correct": sum(row["ok"] for row in details),
         "errors": sum(bool(row.get("error")) for row in details),
@@ -778,7 +855,10 @@ def gsm8k_snapshot(folder, args, complete=False, returncode=None):
         "parallel": args.gsm8k_parallel,
         "status": "running",
     }
-    result["accuracy"] = result["correct"] / args.gsm8k_samples
+    if getattr(args, "gsm8k_replay", None):
+        result["prompt_mode"] = "saved-prompt-replay"
+        result["question_selection"] = "saved prompts in prompt-ID order"
+    result["accuracy"] = result["correct"] / args.gsm8k_samples if details else None
     manifest = folder / "manifest.json"
     if manifest.exists():
         result["manifest"] = json.loads(manifest.read_text())
@@ -797,6 +877,8 @@ def gsm8k_snapshot(folder, args, complete=False, returncode=None):
             and summary.exists()
             else "failed"
         )
+    if complete and not details:
+        result["status"] = "not-evaluated"
     return result
 
 
@@ -834,12 +916,14 @@ def run_gsm8k(rows, args, case_dir, deadline, log, state_path=None, server=None)
     script = Path(__file__).with_name("prtest_gsm8k.py")
     resolved = (server or {}).get("server_args", server or {})
     variant = (
-        "megamoe"
+        "deepep"
+        if resolved.get("moe_a2a_backend") == "deepep"
+        else "megamoe"
         if resolved.get("moe_a2a_backend") == "ascend_fuseep"
         and resolved.get("fuseep_mode") == 3
         else "baseline"
     )
-    # Reuse the reference client verbatim; no server launch options are imported.
+    # Preserve the reference prompt/scoring protocol across backend variants.
     command = [
         sys.executable,
         "-u",
@@ -851,7 +935,7 @@ def run_gsm8k(rows, args, case_dir, deadline, log, state_path=None, server=None)
         "--variant",
         variant,
         "--data-path",
-        str(Path(args.gsm8k).resolve()),
+        str(Path(args.gsm8k or args.gsm8k_replay).resolve()),
         "--num-questions",
         str(args.gsm8k_samples),
         "--parallel",
@@ -863,6 +947,8 @@ def run_gsm8k(rows, args, case_dir, deadline, log, state_path=None, server=None)
         "--output",
         str(folder),
     ]
+    if args.gsm8k_replay:
+        command += ["--replay-jsonl", str(Path(args.gsm8k_replay).resolve())]
     if args.gsm8k_shots_data:
         command += ["--shots-data", str(Path(args.gsm8k_shots_data).resolve())]
     save(case_dir / "gsm8k-command.json", command)
@@ -887,6 +973,15 @@ def run_gsm8k(rows, args, case_dir, deadline, log, state_path=None, server=None)
         out = gsm8k_snapshot(folder, args, complete=True, returncode=code)
         if code is None:
             out["status"] = "incomplete"
+        if code != 0 and path.exists():
+            errors = [
+                line
+                for line in path.read_text(errors="replace").splitlines()
+                if line.startswith("ERROR:")
+            ]
+            out["reason"] = (
+                errors[-1] if errors else "GSM8K client failed or was interrupted"
+            )
         save(case_dir / "gsm8k.json", out)
     log(
         f"GSM8K {out['completed']}/{out['requested']} correct={out['correct']} "
@@ -1294,7 +1389,7 @@ CANN_ENV_FALLBACKS = (
 )
 
 PROBE = r"""
-import hashlib, importlib.metadata, json, os, sys
+import ast, hashlib, importlib.metadata, json, os, sys
 from pathlib import Path
 import torch, torch_npu
 model = Path(sys.argv[1])
@@ -1307,11 +1402,34 @@ versions = {}
 for name in ('torch','torch-npu','transformers','tokenizers','sgl-kernel-npu'):
  try: versions[name] = importlib.metadata.version(name)
  except importlib.metadata.PackageNotFoundError: versions[name] = None
-ops = {name: hasattr(torch.ops.npu, name) for name in ('npu_sparse_flash_attention_lse',)}
 backend = Path('python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py').read_text()
+registration_imports = []
+for node in ast.parse(backend).body:
+ if isinstance(node, ast.ImportFrom) and (node.module or '').startswith('sgl_kernel_npu'):
+  registration_imports.append(ast.unparse(node))
+  exec(compile(ast.Module(body=[node], type_ignores=[]), '<backend-registration>', 'exec'))
+ops = {}
+schemas = {}
+for name in ('npu_sparse_flash_attention_lse', 'npu_kv_quant_sparse_flash_attention'):
+ ops[name] = hasattr(torch.ops.npu, name)
+ if ops[name]:
+  packet = getattr(torch.ops.npu, name)
+  schemas[name] = {overload: str(getattr(packet, overload)._schema) for overload in packet.overloads()}
+schema_errors = {}
+for node in ast.walk(ast.parse(backend)):
+ if isinstance(node, ast.Call) and ast.unparse(node.func) == 'torch.ops.npu.npu_sparse_flash_attention_lse' and ops['npu_sparse_flash_attention_lse']:
+  required = {kw.arg for kw in node.keywords if kw.arg is not None}
+  packet = torch.ops.npu.npu_sparse_flash_attention_lse
+  supported = [{arg.name for arg in getattr(packet, overload)._schema.arguments} for overload in packet.overloads()]
+  if not any(required <= names for names in supported):
+   schema_errors['npu_sparse_flash_attention_lse'] = 'backend keywords unsupported: ' + ','.join(sorted(required))
+providers = {name: getattr(module, '__file__', None) for name, module in sys.modules.items()
+             if name.startswith(('sgl_kernel_npu', 'torch_npu', 'cann_ops_transformer'))}
 requires_lse = 'torch.ops.npu.npu_sparse_flash_attention_lse(' in backend
 print('PRTEST_PROBE='+json.dumps({'versions': versions, 'ops':ops, 'model_config':config,
- 'requires_sparse_fa_lse': requires_lse,
+ 'requires_sparse_fa_lse': requires_lse, 'operator_schemas': schemas, 'operator_schema_errors': schema_errors,
+ 'registration_imports': registration_imports, 'provider_modules': providers,
+ 'loaded_libraries': sorted(str(path) for path in torch.ops.loaded_libraries),
  'model_files_sha256':files, 'python':sys.executable, 'torch_path':torch.__file__,
  'environment':{k:v for k,v in os.environ.items() if k.startswith(('SGLANG_', 'ASCEND_', 'HCCL_', 'DEEPEP_')) or k in ('PYTHONPATH','LD_LIBRARY_PATH','LD_PRELOAD','PATH','CANN_HOME')}}))
 """
@@ -1322,6 +1440,7 @@ def server_argv(args, memfrac, graph, case_args=(), *, phase=None):
     for key, value in [
         ("--mem-fraction-static", memfrac),
         ("--chunked-prefill-size", args.chunk),
+        ("--max-prefill-tokens", getattr(args, "max_prefill_tokens", 16384)),
         ("--context-length", args.context),
     ]:
         values[values.index(key) + 1] = str(value)
@@ -1594,11 +1713,66 @@ def pin_refs(cases, args, deadline, checkpoint):
     return pinned
 
 
+def load_serving_overlay(path):
+    root = Path(path).resolve()
+    manifest = json.loads((root / "manifest.json").read_text())
+    for entry in manifest:
+        if not re.fullmatch(r"[0-9a-f]{40}", entry["base_commit"]):
+            raise ValueError("invalid serving overlay base commit")
+        for relative, expected in entry["files"].items():
+            target = Path(relative)
+            if (
+                target.is_absolute()
+                or ".." in target.parts
+                or not relative.startswith("python/")
+            ):
+                raise ValueError("invalid serving overlay path")
+            source = (root / entry["base_commit"] / target).resolve()
+            if (
+                root not in source.parents
+                or hashlib.sha256(source.read_bytes()).hexdigest() != expected
+            ):
+                raise ValueError("serving overlay checksum mismatch")
+    return root, manifest
+
+
+APPLY_SERVING_OVERLAY = r"""
+import hashlib, json, sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve()
+for relative, content in json.load(sys.stdin).items():
+ target = (root / relative).resolve()
+ if root not in target.parents or not target.is_file():
+  raise ValueError('overlay target is not a tracked source file inside the owned checkout')
+ target.write_text(content)
+ print(relative + ' ' + hashlib.sha256(target.read_bytes()).hexdigest())
+"""
+
+
 def create_worktree(args, record, registry, deadline):
     path = args.remote_root + "/worktrees/" + record["case"]
     registry["worktrees"].append(path)
     save(args.registry_path, registry)
     git(args, "worktree", "add", "--detach", path, record["commit"], deadline=deadline)
+    if getattr(args, "serving_overlay", None):
+        overlay_root, manifest = load_serving_overlay(args.serving_overlay)
+        matching = [entry for entry in manifest if entry["ref"] == record["ref"]]
+        for entry in matching:
+            if entry["base_commit"] != record["commit"]:
+                raise ValueError(
+                    "serving overlay base differs from pinned branch; rebase the local fix first"
+                )
+            contents = {
+                relative: (overlay_root / entry["base_commit"] / relative).read_text()
+                for relative in entry["files"]
+            }
+            run_capture(
+                args,
+                shlex.join([args.container_python, "-c", APPLY_SERVING_OVERLAY, path]),
+                deadline,
+                input_text=json.dumps(contents),
+            )
+            record["serving_overlay"] = entry
     record["source_diff_sha256"] = hashlib.sha256(
         git(args, "diff", "--binary", deadline=deadline, repo=path).encode()
     ).hexdigest()
@@ -1809,6 +1983,12 @@ def run_phase(
                 raise RuntimeError(
                     "required torch.ops.npu.npu_sparse_flash_attention_lse is unavailable"
                 )
+            if runtime.get("operator_schema_errors", {}).get(
+                "npu_sparse_flash_attention_lse"
+            ):
+                raise RuntimeError(
+                    runtime["operator_schema_errors"]["npu_sparse_flash_attention_lse"]
+                )
             argv = server_argv(
                 args,
                 memfrac,
@@ -1860,8 +2040,8 @@ def run_phase(
                         status="failed", reason="paired-output requests failed"
                     )
                 if gsm["status"] != "ok":
-                    attempt["reason"] = (
-                        "GSM8K reference client failed or did not complete"
+                    attempt["reason"] = gsm.get(
+                        "reason", "GSM8K reference client failed or did not complete"
                     )
                 elif (
                     args.gsm8k_min_accuracy is not None
@@ -2012,7 +2192,11 @@ def markdown(value):
 
 
 def backend_comparison_matches(case, candidate, baseline):
-    expected = {"14-baseline-ep": "deepep", "09-pr1-megamoe": "ascend_fuseep"}
+    expected = {
+        "14-baseline-ep": "deepep",
+        "09-pr1-megamoe": "ascend_fuseep",
+        "16-megamoe-8k": "ascend_fuseep",
+    }
     if case not in expected or not candidate or not baseline:
         return False
     left = candidate.get("resolved_server", {})
@@ -2024,7 +2208,7 @@ def backend_comparison_matches(case, candidate, baseline):
         or right.get("ep_size") != 1
     ):
         return False
-    if case == "09-pr1-megamoe" and left.get("fuseep_mode") != 3:
+    if expected[case] == "ascend_fuseep" and left.get("fuseep_mode") != 3:
         return False
     # Backend and expert partition are the declared experimental variables.
     ignored = {"moe_a2a_backend", "ep_size", "deepep_mode", "fuseep_mode"}
@@ -2043,7 +2227,15 @@ def backend_comparison_matches(case, candidate, baseline):
 
 
 def summarize(records, output, args):
-    base = next((r for r in records if r["case"] == "00-baseline"), {})
+    base = next(
+        (
+            r
+            for name in ("00-baseline", "15-baseline-8k", "18-baseline-prefill1")
+            for r in records
+            if r["case"] == name
+        ),
+        {},
+    )
     base_speed, base_attempt = speed_data(base)
     base_metrics = (
         base_speed.get("metrics") if base_speed.get("status") == "ok" else None
@@ -2062,8 +2254,16 @@ def summarize(records, output, args):
     for record in records:
         accuracy = selected_attempt(record, "accuracy")
         gsm = accuracy.get("gsm8k", {})
+        completed = gsm.get("completed", len(gsm.get("details", [])))
+        answered = gsm.get("answered", max(0, completed - gsm.get("errors", 0)))
         gsm_text = (
-            f"{gsm.get('correct', 0)}/{gsm['requested']} ({gsm.get('errors', 0)} errors, {gsm.get('truncated', 0)} truncated)"
+            (
+                "not evaluated"
+                if not completed
+                else f"{gsm.get('correct', 0)}/{gsm['requested']}"
+            )
+            + f"; requested={gsm['requested']}, completed={completed}, answered={answered}"
+            + f" ({gsm.get('errors', 0)} errors, {gsm.get('truncated', 0)} truncated)"
             if gsm.get("requested")
             else "unavailable"
         )
@@ -2071,6 +2271,24 @@ def summarize(records, output, args):
             overlap = gsm["manifest"].get("shot_overlap_question_ids", [])
             gsm_text += f"; shot/test overlap={len(overlap)}"
 
+        comparison_base = (
+            record
+            if record["case"] in ("15-baseline-8k", "18-baseline-prefill1")
+            else next(
+                (
+                    r
+                    for r in records
+                    if r["case"] == MATCHED_BASELINES.get(record["case"])
+                ),
+                base,
+            )
+        )
+        reference_speed, reference_attempt = speed_data(comparison_base)
+        reference_metrics = (
+            reference_speed.get("metrics")
+            if reference_speed.get("status") == "ok"
+            else None
+        )
         speed, attempt = speed_data(record)
         metrics = speed.get("metrics") if speed.get("status") == "ok" else None
         timing = (
@@ -2082,31 +2300,34 @@ def summarize(records, output, args):
         backend_comparison = backend_comparison_matches(
             record["case"],
             attempt.get("comparison_config"),
-            base_attempt.get("comparison_config"),
+            reference_attempt.get("comparison_config"),
         )
-        if record is base and metrics:
+        if record is comparison_base and metrics:
             ratio = "reference"
         elif (
             metrics
-            and base_metrics
+            and reference_metrics
             and attempt.get("comparison_config") is not None
             and (
                 attempt.get("comparison_config")
-                == base_attempt.get("comparison_config")
+                == reference_attempt.get("comparison_config")
                 or backend_comparison
             )
         ):
-            ratio = (
-                f"{float(base_metrics['TTFT avg']) / float(metrics['TTFT avg']):.3f}x"
-            )
+            ratio = f"{float(reference_metrics['TTFT avg']) / float(metrics['TTFT avg']):.3f}x"
             if backend_comparison:
                 ratio += " (backend comparison; single run)"
-            if quality(base) not in ("threshold met",) or quality(record) not in (
-                "threshold met",
-            ):
+            if quality(comparison_base) not in ("threshold met",) or quality(
+                record
+            ) not in ("threshold met",):
                 ratio += " (quality unqualified)"
-        elif metrics and base_metrics:
+        elif metrics and reference_metrics:
             ratio = "configuration mismatch"
+        if (
+            ratio not in ("unavailable", "configuration mismatch", "reference")
+            and comparison_base is not base
+        ):
+            ratio += f" vs {comparison_base['case']}"
         reasons = [record.get("reason", "")]
         reasons += [
             f"{name}: {phase.get('reason', phase.get('status'))}"
@@ -2149,6 +2370,33 @@ def summarize(records, output, args):
             "",
             "Baseline drift unavailable: both matching baseline measurements are required.",
         ]
+    for opening, closing in [
+        ("15-baseline-8k", "17-baseline-8k-repeat"),
+        ("18-baseline-prefill1", "19-baseline-prefill1-repeat"),
+    ]:
+        controls = [
+            next((r for r in records if r["case"] == name), {})
+            for name in (opening, closing)
+        ]
+        if not any(controls):
+            continue
+        left, right = [speed_data(record) for record in controls]
+        if (
+            left[0].get("status") == right[0].get("status") == "ok"
+            and left[1].get("comparison_config") is not None
+            and left[1].get("comparison_config") == right[1].get("comparison_config")
+            and controls[0].get("commit")
+            and controls[0].get("commit") == controls[1].get("commit")
+        ):
+            drift = (
+                right[0]["metrics"]["TTFT avg"] / left[0]["metrics"]["TTFT avg"] - 1
+            ) * 100
+            rows += ["", f"{opening} repeat mean TTFT drift: {drift:+.2f}%."]
+        else:
+            rows += [
+                "",
+                f"{opening} drift unavailable: both matching baseline measurements are required.",
+            ]
     rows += [
         "",
         "## Paired-output diagnostics",
@@ -2229,7 +2477,14 @@ def regenerate(args):
                     attempt["speed"] = speed
                     attempt["source_log"] = str(log_path)
                     if speed["status"] != "ok":
-                        phase.update(status="failed", reason=speed["reason"])
+                        phase.update(
+                            status="failed",
+                            reason="; ".join(
+                                dict.fromkeys(
+                                    filter(None, [phase.get("reason"), speed["reason"]])
+                                )
+                            ),
+                        )
                 for filename, key in [
                     ("gsm8k.json", "gsm8k"),
                     ("accuracy.json", "accuracy"),
@@ -2237,6 +2492,27 @@ def regenerate(args):
                     saved = attempt_dir / filename
                     if saved.exists():
                         attempt[key] = json.loads(saved.read_text())
+                        if key == "gsm8k":
+                            gsm = attempt[key]
+                            completed = gsm.get(
+                                "completed", len(gsm.get("details", []))
+                            )
+                            gsm["answered"] = max(0, completed - gsm.get("errors", 0))
+                            if not completed:
+                                gsm.update(status="not-evaluated", accuracy=None)
+                            client_log = attempt_dir / "gsm8k-client.log"
+                            if gsm.get("status") != "ok" and client_log.exists():
+                                errors = [
+                                    line
+                                    for line in client_log.read_text(
+                                        errors="replace"
+                                    ).splitlines()
+                                    if line.startswith("ERROR:")
+                                ]
+                                if errors:
+                                    gsm["reason"] = errors[-1]
+                                    attempt["reason"] = errors[-1]
+                                    phase["reason"] = errors[-1]
         path = directory / "ais.log"
         if path.exists():
             code = record.get("ais_returncode")
@@ -2395,12 +2671,20 @@ def parser():
         "--container-cann-env",
         default="/home/tbaydasov/Ascend/cann-9.2.0-beta.2/set_env.sh",
     )
+    p.add_argument(
+        "--serving-overlay",
+        help="local checksum-verified serving fixes for matching pinned base commits",
+    )
     p.add_argument("--no-fetch", action="store_true")
     p.add_argument("--ais-dir", default=AIS_DIR_DEFAULT)
     p.add_argument("--ais-env", default=None)
     p.add_argument("--ais-conda-env", default="tbay_sglang")
     p.add_argument(
         "--gsm8k", help="host path to GSM8K test JSONL; required for accuracy/all"
+    )
+    p.add_argument(
+        "--gsm8k-replay",
+        help="host path to archived raw.jsonl; replay exact prompts for diagnostics",
     )
     p.add_argument("--gsm8k-samples", type=int, default=64)
     p.add_argument(
@@ -2470,6 +2754,10 @@ def parser():
 
 
 def validate_args(args):
+    if args.serving_overlay:
+        load_serving_overlay(args.serving_overlay)
+    if args.gsm8k_replay and args.gsm8k_shots_data:
+        raise ValueError("saved-prompt replay cannot change five-shot examples")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]*", args.baseline_ref):
         raise ValueError("invalid baseline execution ref")
     if args.hours is None:
@@ -2552,6 +2840,14 @@ def dry_run(args, cases):
         effective = case_settings(args, name)
         worktree = "<run-root>/worktrees/" + name
         print(f"== {name}: pin {ref} once; isolated worktree {worktree}")
+        if args.serving_overlay:
+            _, manifest = load_serving_overlay(args.serving_overlay)
+            for entry in manifest:
+                if entry["ref"] == ref:
+                    print(
+                        "  apply verified serving overlay: "
+                        + json.dumps(entry, sort_keys=True)
+                    )
         for phase in phase_names(effective):
             graph = effective.decode_graph == "on" and phase != "diagnostic-eager"
             print(
@@ -2575,7 +2871,7 @@ def dry_run(args, cases):
                 )
             if phase == "accuracy":
                 print(
-                    f"  GSM8K reference: {effective.gsm8k_samples} samples in file order, parallel={effective.gsm8k_parallel}, max_new_tokens={effective.gsm8k_max_tokens}, dataset={effective.gsm8k or '<required at execution>'}"
+                    f"  GSM8K reference: {effective.gsm8k_samples} samples in file order, parallel={effective.gsm8k_parallel}, max_new_tokens={effective.gsm8k_max_tokens}, dataset={effective.gsm8k_replay or effective.gsm8k or '<required at execution>'}, replay={bool(effective.gsm8k_replay)}"
                 )
     return 0
 
@@ -2640,14 +2936,21 @@ def main(argv=None):
                 for case in cases
             )
         ):
-            if not args.gsm8k:
+            if not args.gsm8k and not args.gsm8k_replay:
                 raise ValueError(
                     "--gsm8k is required for accuracy/all; speed runs independently with --round speed"
                 )
-            args.gsm_rows = load_gsm8k(args.gsm8k, args.gsm8k_samples, args.gsm8k_seed)
-            load_gsm8k(args.gsm8k_shots_data or args.gsm8k, 5, args.gsm8k_seed)
+            if args.gsm8k_replay:
+                from prtest_gsm8k import replay_rows
+
+                args.gsm_rows = replay_rows(Path(args.gsm8k_replay), args.gsm8k_samples)
+            else:
+                args.gsm_rows = load_gsm8k(
+                    args.gsm8k, args.gsm8k_samples, args.gsm8k_seed
+                )
+                load_gsm8k(args.gsm8k_shots_data or args.gsm8k, 5, args.gsm8k_seed)
             args.dataset_sha256 = hashlib.sha256(
-                Path(args.gsm8k).read_bytes()
+                Path(args.gsm8k_replay or args.gsm8k).read_bytes()
             ).hexdigest()
     except (ValueError, OSError, KeyError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

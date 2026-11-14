@@ -2,13 +2,14 @@
 
 Run GSM8K accuracy, AISBench prefix-cache performance, or both for the six PRs,
 the combined branch, and the two baseline brackets. The GSM8K client and
-PROFILE=0 wrapper are extracted verbatim from the two PR #1 runbooks;
+PROFILE=0 wrapper originate from the two PR #1 runbooks; the client adds
+DeepEP validation and saved-prompt replay, recorded in its source manifest;
 `REFERENCE_SOURCES.json` records their source and extracted-content hashes. `all` starts separate fresh
 servers for accuracy and speed. The driver runs on the A3 **host**; serving runs
 inside `sglang-a3`. Python 3.9+ is required on both sides.
 
-The serving recipe stays TP16/DCP16, context 1024000, chunk 16384, maximum 16
-running requests, one request per prefill batch, decode graphs on, static memory
+The standard speed recipe uses TP16/DCP16, context 1024000, chunk 16384, maximum 16
+running requests and 16 requests per prefill batch (packed-read cases use one), decode graphs on, static memory
 fraction 0.70, and TP-MoE. AISBench prepares a 99% shared prefix and measures
 16 concurrent 1M-token requests with one output token. A fixed server seed of 4
 is recorded. Each unique branch is resolved once; both baseline brackets use
@@ -189,7 +190,7 @@ baseline drift requires matching settings and the same pinned source SHA.
 
 ## Accuracy and timing interpretation
 
-GSM8K uses the unmodified client extracted from `test_pr1_megamoe_accuracy.py`:
+GSM8K preserves the protocol extracted from `test_pr1_megamoe_accuracy.py`:
 raw `/generate`, the first 64 dataset questions in file order, the first five
 examples from that same dataset, 16 client workers, temperature 0, top-p 1,
 1,024 output tokens, and stops `Question`, `Assistant:`, `<|separator|>`.
@@ -349,3 +350,12 @@ configuration as the failed 0/64 test. Only compensation loading changes.
 Accept recovery only with 64 complete requests, zero failures/truncations, and
 at least 90% accuracy; keep raw responses for comparison. The score includes
 five shot/test overlaps. The standalone A3 test recovered 61/64 with no errors or truncations; the full sweep now includes the propagated fix.
+
+
+## November 14 repairs and reruns
+
+See [NIGHT_20261114.md](NIGHT_20261114.md) for failure analysis, repaired serving
+branch revisions, exact-prompt diagnostics, matched speed controls, and A3
+commands. Serving fixes execute from pinned feature-branch commits. Historical
+source overlays are excluded from this publication; explicit local overlays
+require exact base commits and checksums, and their effective diff is recorded.
