@@ -1265,6 +1265,10 @@ class ModelRunner:
         # locally and the per-layer Q all-to-all does not exist in steady state.
         # The group is the attention-TP group (the head sharding), unlike
         # _prepare_replicated_q_proj's DCP group, so the two cannot run together.
+        from sglang.srt.utils import is_npu
+
+        if not is_npu():
+            return
         if get_parallel().dcp_replicate_q_proj:
             raise ValueError(
                 "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH and --dcp-replicate-q-proj "
@@ -1280,15 +1284,7 @@ class ModelRunner:
             )
             return
         from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-        from sglang.srt.utils import is_npu
 
-        if not is_npu():
-            logger.warning(
-                "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH is set but this is not an NPU "
-                "process; the full-head weights are not prepared and the flag "
-                "is inert"
-            )
-            return
         tp_group = get_parallel().attn_tp_group
         if tp_group.world_size <= 1:
             logger.warning(
