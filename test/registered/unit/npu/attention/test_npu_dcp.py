@@ -226,22 +226,36 @@ class TestNpuDcpSparseIndexRemap(unittest.TestCase):
 class TestNpuDcpSparseAttentionContract(unittest.TestCase):
     def setUp(self):
         self.calls = []
+        capture = patch.object(
+            torch,
+            "npu",
+            SimpleNamespace(is_current_stream_capturing=lambda: False),
+            create=True,
+        )
+        capture.start()
+        self.addCleanup(capture.stop)
+        nz = patch(
+            "sglang.srt.hardware_backend.npu.attention.dsa_dcp.is_fia_nz",
+            return_value=False,
+        )
+        nz.start()
+        self.addCleanup(nz.stop)
 
         def fake_sparse_attention(**kwargs):
             self.calls.append(kwargs)
             rows, heads, dim = kwargs["query"].shape
-            out = torch.arange(rows * heads * dim, dtype=torch.float32).view(
+            out = torch.arange(rows * heads * dim, dtype=kwargs["query"].dtype).view(
                 rows, heads, dim
             )
-            softmax_max = torch.zeros(heads, rows, 1)
-            softmax_sum = torch.full((heads, rows, 1), 2.0)
+            softmax_max = torch.zeros(1, rows, heads)
+            softmax_sum = torch.full((1, rows, heads), 2.0)
             return out, softmax_max, softmax_sum
 
         self.fake_op = fake_sparse_attention
 
     def _metadata(self, rows=2):
         return SimpleNamespace(
-            dcp_block_tables=torch.tensor([[10, 11]] * rows, dtype=torch.int32),
+            dcp_block_tables=torch.tensor([[1, 0]] * rows, dtype=torch.int32),
             dcp_seq_lens=torch.arange(5, 5 + rows, dtype=torch.int32),
             dcp_spec_block_tables=torch.arange(rows * 2).view(rows, 2),
             dcp_spec_seq_lens=torch.arange(3, 3 + rows, dtype=torch.int32),
@@ -250,7 +264,7 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
     def _inputs(self, rows=2):
         q_nope = torch.ones(rows, 2, 4, dtype=torch.float16)
         q_rope = torch.zeros_like(q_nope)
-        k_nope = torch.ones(rows, 2, 4, dtype=torch.float16)
+        k_nope = torch.ones(max(rows * 2, 4), 16, 1, 4, dtype=torch.float16)
         k_rope = torch.zeros_like(k_nope)
         topk = torch.tensor([[0, 2, -1], [1, -1, -1]] * rows)[:rows]
         return q_nope, q_rope, k_nope, k_rope, topk
@@ -260,8 +274,8 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
         batch = SimpleNamespace(forward_mode=_Mode(False))
         metadata = self._metadata()
         with patch.object(
-            torch.ops.npu,
-            "sgl_sparse_flash_attention",
+            sys.modules["torch_npu"],
+            "npu_sparse_flash_attention",
             self.fake_op,
             create=True,
         ):
@@ -280,10 +294,12 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
         call = self.calls[0]
         self.assertEqual(call["actual_seq_lengths_query"].dtype, torch.int32)
         self.assertEqual(call["actual_seq_lengths_query"].tolist(), [1, 2])
-        self.assertIs(call["block_table"], metadata.dcp_block_tables)
+        self.assertNotIn("block_table", call)
+        self.assertEqual(call["actual_seq_lengths_kv"].tolist(), [3, 6])
         self.assertEqual(call["sparse_mode"], 0)
         self.assertEqual(call["attention_mode"], 2)
-        self.assertEqual(call["layout_kv"], "PA_BSND")
+        self.assertEqual(call["layout_kv"], "TND")
+        self.assertTrue(call["return_softmax_lse"])
         self.assertEqual(out.shape, q.shape)
         self.assertEqual(lse.shape, (2, 2))
         expected_lse = torch.full((2, 2), torch.log(torch.tensor(2.0)))
@@ -295,8 +311,8 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
         batch = SimpleNamespace(forward_mode=_Mode(True))
         metadata = self._metadata(rows=rows)
         with patch.object(
-            torch.ops.npu,
-            "sgl_sparse_flash_attention",
+            sys.modules["torch_npu"],
+            "npu_sparse_flash_attention",
             self.fake_op,
             create=True,
         ):
@@ -314,12 +330,8 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
             )
         call = self.calls[0]
         self.assertEqual(call["actual_seq_lengths_query"].tolist(), [1, 2, 3, 4])
-        self.assertTrue(
-            torch.equal(call["block_table"], metadata.dcp_spec_block_tables)
-        )
-        self.assertTrue(
-            torch.equal(call["actual_seq_lengths_kv"], metadata.dcp_spec_seq_lens)
-        )
+        self.assertNotIn("block_table", call)
+        self.assertEqual(call["actual_seq_lengths_kv"].tolist(), [3, 6, 9, 12])
 
     def test_missing_rank_local_metadata_fails_loudly(self):
         q, rope, _, _, topk = self._inputs()
