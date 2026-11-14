@@ -18,6 +18,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
 )
 from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
+    forward_tnd_sparse_attention,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
@@ -330,9 +331,8 @@ def _cp_allgather_and_save_kv_npu(
 
 
 _MISSING_SPARSE_FA_LSE = (
-    "DCP decode on Ascend needs torch.ops.npu.npu_sparse_flash_attention_lse, "
-    "the CANN sparse-attention-with-LSE port. It is not registered in this "
-    "install. Check the CANN/Ascend install, or run with --dcp-size 1."
+    "DCP decode requires npu_sparse_flash_attention with the return_softmax_lse "
+    "argument. Check the TorchNPU operator schema in the serving environment."
 )
 
 
@@ -498,14 +498,15 @@ class AscendAttnBackend(AttentionBackend):
 
         self.attn_cp_size = get_parallel().attn_cp_size
 
-        # sgl-kernel-npu's operator: CANN refuses return_softmax_lse under
-        # PA_BSND, so DCP decode has no other LSE source. Checked at startup so a
-        # stock install names the missing package rather than an AttributeError.
-        self.has_sparse_fa_lse = hasattr(
-            torch.ops.npu, "npu_sparse_flash_attention_lse"
+        operator = getattr(torch.ops.npu, "npu_sparse_flash_attention", None)
+        self.has_sparse_fa_lse = operator is not None and any(
+            any(
+                arg.name == "return_softmax_lse"
+                for arg in getattr(operator, name)._schema.arguments
+            )
+            for name in operator.overloads()
         )
-        if self.use_mla and get_parallel().dcp_enabled and not self.has_sparse_fa_lse:
-            # Not a raise: a prefill-only PD node never reaches DCP decode.
+        if self.use_dsa and get_parallel().dcp_enabled and not self.has_sparse_fa_lse:
             logger.warning(_MISSING_SPARSE_FA_LSE)
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
@@ -863,6 +864,11 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        if self.use_dsa and get_parallel().dcp_enabled:
+            raise RuntimeError(
+                "DCP sparse attention LSE requires eager execution; "
+                "set --cuda-graph-backend-decode disabled"
+            )
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
@@ -1592,28 +1598,6 @@ class AscendAttnBackend(AttentionBackend):
         """
         return getattr(self.token_to_kv_pool, "sfa_packed_kv_storage", False)
 
-    def _dcp_decode_packed_kv_lens(
-        self, forward_batch: ForwardBatch, k_width: int, device: torch.device
-    ) -> torch.Tensor:
-        """The operator's ``actual_seq_lengths_kv`` for the packed decode read.
-
-        Cumulative, per request, and every entry is the FULL top-k width: the
-        TND buffer holds one run of k_width rows per request and the -1 tail of
-        each run masks the slots the rank does not own. Cached on the batch
-        rather than built per layer: torch.tensor(list, device=npu) is a
-        blocking host-to-device copy, 78 of them a forward.
-        """
-        cached = getattr(forward_batch, "npu_dcp_decode_packed_kv_lens", None)
-        if cached is None or cached.numel() != forward_batch.batch_size:
-            cached = (
-                torch.arange(1, forward_batch.batch_size + 1, device=device).to(
-                    torch.int32
-                )
-                * k_width
-            )
-            forward_batch.npu_dcp_decode_packed_kv_lens = cached
-        return cached
-
     def _sfa_quant_read_enabled(self) -> bool:
         """Whether the DCP packed read should take the F2 in-kernel dequant
         (the quant operator reads the raw int8 rows) rather than the F1
@@ -1896,7 +1880,6 @@ class AscendAttnBackend(AttentionBackend):
                     # instead of the paged read. The top-k indices are already
                     # rank-local (remapped in the prepare phase); non-owned
                     # entries are -1.
-                    k_width = topk_indices.shape[-1]
                     gather_rows = torch.where(
                         topk_indices >= 0,
                         topk_indices,
@@ -1905,43 +1888,16 @@ class AscendAttnBackend(AttentionBackend):
                     key_nope, key_rope = self.token_to_kv_pool.get_mla_kv_buffer(
                         layer, gather_rows
                     )
-                    topk_indices = torch.where(
-                        topk_indices >= 0,
-                        torch.arange(
-                            k_width,
-                            device=topk_indices.device,
-                            dtype=topk_indices.dtype,
-                        ),
-                        topk_indices.new_full((), -1),
-                    )
-                    topk_indices = _expand_dsa_sparse_indices(topk_indices)
                     if not self.has_sparse_fa_lse:
                         raise RuntimeError(_MISSING_SPARSE_FA_LSE)
-                    attn_out, softmax_max, softmax_sum = (
-                        torch.ops.npu.npu_sparse_flash_attention_lse(
-                            query=q_nope,
-                            key=key_nope,
-                            value=key_nope,
-                            query_rope=q_pe,
-                            key_rope=key_rope,
-                            sparse_indices=topk_indices,
-                            scale_value=layer.scaling,
-                            actual_seq_lengths_query=actual_seq_qlen.to(
-                                device=q_nope.device, dtype=torch.int32
-                            ),
-                            actual_seq_lengths_kv=self._dcp_decode_packed_kv_lens(
-                                forward_batch, k_width, topk_indices.device
-                            ),
-                            sparse_block_size=1,
-                            layout_query="TND",
-                            layout_kv="TND",
-                            sparse_mode=0,
-                            attention_mode=2,
-                            return_softmax_lse=True,
-                        )
+                    return forward_tnd_sparse_attention(
+                        q_nope=q_nope,
+                        q_rope=q_pe,
+                        k_nope=key_nope,
+                        k_rope=key_rope,
+                        valid=topk_indices >= 0,
+                        scaling=layer.scaling,
                     )
-                    lse = softmax_max.float() + torch.log(softmax_sum.float())
-                    return attn_out, lse.permute(1, 0, 2).reshape(lse.shape[1], -1)
                 if self.kv_cache_dtype == torch.float8_e4m3fn:
                     raise NotImplementedError(
                         "FP8 KV cache with decode context parallelism is not "
@@ -2040,7 +1996,7 @@ class AscendAttnBackend(AttentionBackend):
                 # no merge, so it composes -- see below.
                 assert not dcp_decode, (
                     "FP8 KV cache with DCP decode is not supported: the merge "
-                    "needs a softmax LSE and npu_sparse_flash_attention_lse is "
+                    "needs a softmax LSE and the sparse attention LSE path is "
                     "bf16-only."
                 )
                 assert q_nope.dtype == q_pe.dtype == torch.bfloat16
