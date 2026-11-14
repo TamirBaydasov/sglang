@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import time
@@ -17,6 +18,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Tuple,
 )
 
 from sglang.srt.runtime_context import get_model, get_serving
@@ -109,6 +111,11 @@ from sglang.srt.function_call.utils import (
     normalize_json_schema_types,
     strip_structural_tag_excludes,
 )
+from sglang.srt.managers.chat_encode_memo import (
+    MIN_PREFIX_CHARS,
+    ChatEncodeMemo,
+    encode_chat_text,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
 from sglang.srt.parser.conversation import generate_chat_conv
@@ -151,6 +158,9 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+# E2a (branch E): how long a sibling may block on the in-flight family
+# creation before falling back to the exact full render+encode.
+_MEMO_BOOTSTRAP_TIMEOUT_S = 30.0
 
 
 def _incomplete_tool_call_indices(parser) -> set[int]:
@@ -2289,6 +2299,44 @@ class OpenAIServingChat(OpenAIServingBase):
         use_cache: bool,
         add_generation_prompt: bool = True,
     ) -> tuple[List[int], Optional[str]]:
+        # E2a (branch E): the render+encode memo is engaged when the
+        # chat-encode pool + memo are on; it bypasses the local template cache
+        # below (the memo keeps its own full-prompt LRU + family prefix
+        # assembly on the tokenizer manager).
+        memo = getattr(self.tokenizer_manager, "chat_encode_memo", None)
+        if memo is not None:
+            try:
+                memo_key = orjson.dumps(
+                    (
+                        getattr(
+                            self.tokenizer_manager.tokenizer,
+                            "chat_template",
+                            None,
+                        ),
+                        messages,
+                        tools,
+                        template_kwargs,
+                        encode_kwargs,
+                        add_generation_prompt,
+                    ),
+                    option=orjson.OPT_SORT_KEYS,
+                )
+            except TypeError:
+                memo_key = None
+            if memo_key is not None:
+                rendered_prompt, prompt_ids = self._memo_render_and_encode(
+                    messages,
+                    tools=tools,
+                    template_kwargs=template_kwargs,
+                    encode_kwargs=encode_kwargs,
+                    cache_key=memo_key,
+                    memo=memo,
+                    add_generation_prompt=add_generation_prompt,
+                )
+                # The memo returns fresh ids; decoded_prompt stays None on this
+                # text path (a multimodal caller decodes them on demand).
+                return prompt_ids, None
+
         cache_key = None
         if use_cache:
             try:
@@ -2351,9 +2399,20 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **template_kwargs,
                 )
-                prompt_ids = parallel_prompt_encode(
-                    self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
-                )
+                if envs.SGLANG_CHAT_ENCODE_RAW.get():
+                    # E2d (branch E): raw Rust encode bypassing the HF wrapper.
+                    prompt_ids = encode_chat_text(
+                        self.tokenizer_manager.tokenizer,
+                        rendered_prompt,
+                        encode_kwargs,
+                        True,
+                    )
+                else:
+                    prompt_ids = parallel_prompt_encode(
+                        self.tokenizer_manager.tokenizer,
+                        rendered_prompt,
+                        encode_kwargs,
+                    )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
             if cache_key is not None
@@ -2366,6 +2425,85 @@ class OpenAIServingChat(OpenAIServingBase):
                 self._chat_template_cache.popitem(last=False)
 
         return prompt_ids, decoded_prompt
+
+    @staticmethod
+    def _memo_anchor(
+        messages: List[Dict[str, Any]],
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """E2a (branch E): the family anchor -- the last message whose string
+        content is long enough to be the shared-prefix carrier."""
+        anchor_i: Optional[int] = None
+        for i, msg in enumerate(messages):
+            content = msg.get("content")
+            if isinstance(content, str) and len(content) >= MIN_PREFIX_CHARS:
+                anchor_i = i
+        if anchor_i is None:
+            return None, None
+        return anchor_i, messages[anchor_i]["content"]
+
+    @staticmethod
+    def _family_shape_key(
+        template: Any,
+        messages: List[Dict[str, Any]],
+        anchor_i: int,
+        tools: Optional[List[Dict]],
+        template_kwargs: Dict[str, Any],
+        encode_kwargs: Dict[str, Any],
+    ) -> Any:
+        """E2a (branch E): identity of everything that makes two prompts the
+        same family -- template, message roles, every non-anchor content
+        (hashed when long), tools, kwargs."""
+        parts = []
+        for i, msg in enumerate(messages):
+            content = msg.get("content")
+            if i == anchor_i:
+                parts.append((msg.get("role"), "<ANCHOR>"))
+            elif isinstance(content, str) and len(content) >= MIN_PREFIX_CHARS:
+                parts.append(
+                    (msg.get("role"), hashlib.sha256(content.encode()).hexdigest())
+                )
+            else:
+                parts.append((msg.get("role"), content))
+        return orjson.dumps(
+            (template, parts, tools, template_kwargs, encode_kwargs),
+            option=orjson.OPT_SORT_KEYS,
+        )
+
+    def _memo_render_and_encode(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[List[Dict]],
+        template_kwargs: Dict[str, Any],
+        encode_kwargs: Dict[str, Any],
+        cache_key: Any,
+        memo: ChatEncodeMemo,
+        add_generation_prompt: bool = True,
+    ) -> Tuple[str, List[int]]:
+        """Cache exact requests without changing template or token boundaries."""
+        cached = memo.get_full(cache_key)
+        if cached is not None:
+            rendered_prompt, prompt_ids = cached
+            return rendered_prompt, list(prompt_ids)
+
+        tokenizer = self.tokenizer_manager.tokenizer
+        rendered_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+            return_dict=False,
+            **template_kwargs,
+        )
+        # BPE merges and template rendering can depend on both sides of a cut.
+        prompt_ids = encode_chat_text(
+            tokenizer,
+            rendered_prompt,
+            encode_kwargs,
+            envs.SGLANG_CHAT_ENCODE_RAW.get(),
+        )
+        memo.store_full(cache_key, rendered_prompt, prompt_ids)
+        return rendered_prompt, prompt_ids
 
     def _apply_conversation_template(
         self,

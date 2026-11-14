@@ -29,6 +29,7 @@ import threading
 import time
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
@@ -78,6 +79,7 @@ from sglang.srt.layers.joint_schema_head import (
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.chat_encode_memo import ChatEncodeMemo
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
@@ -695,6 +697,41 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+        # E1 (branch E): dedicated off-loop pool for the blocking chat
+        # render+encode. The base already runs this conversion off the asyncio
+        # loop (OpenAIServingBase.handle_request -> run_in_executor(None, ...),
+        # the loop's default executor); this adds a named, size-bounded pool
+        # (min(8, cpu//2) workers) so the ~3.6 s-per-~1M-token-prompt
+        # render+encode (serving_chat._render_and_encode_chat_template) runs on
+        # a controlled set of workers instead of the shared default pool.
+        # handle_request routes _convert_to_internal_request to this pool when
+        # it is not None. Text-only models only: the multimodal processor path
+        # carries more shared mutable state than the text path.
+        self.chat_encode_executor = None
+        self.chat_encode_memo = None
+        if (
+            envs.SGLANG_ENABLE_CHAT_ENCODE_POOL.get()
+            and self.tokenizer is not None
+            and not self.model_config.is_multimodal
+        ):
+            _chat_encode_workers = max(1, min(8, (os.cpu_count() or 2) // 2))
+            self.chat_encode_executor = ThreadPoolExecutor(
+                max_workers=_chat_encode_workers,
+                thread_name_prefix="chat-encode",
+            )
+            logger.info(
+                "[chat-encode] pool engaged (branch E E1): %d workers, "
+                "chat render+encode runs on the dedicated pool",
+                _chat_encode_workers,
+            )
+            if envs.SGLANG_CHAT_ENCODE_MEMO.get():
+                self.chat_encode_memo = ChatEncodeMemo()
+                logger.info(
+                    "[chat-encode] memo engaged (branch E E2a): full-prompt "
+                    "dedup + verified rendered-prefix reuse, serialized "
+                    "family bootstrap",
+                )
 
     def _validate_cuda_vmm_feature_transport_support(self) -> None:
         if get_mm().mm_feature_transport != "cuda_vmm":
