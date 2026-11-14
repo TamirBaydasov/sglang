@@ -1227,6 +1227,56 @@ class Envs:
     # DSA token-shard: exchange 256-wide tensors instead of the 512-wide latent.
     # Slower below 3k tokens and costs 4 GiB of KV pool, hence off.
     SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD_NARROW_A2A = EnvBool(False)
+    # DSA-CP token sharding (D1v3, the full rebuild of the DSA-CP query swap):
+    # the residual stream becomes token-sharded across the attention-TP group
+    # (rank r owns rows [r*rows, (r+1)*rows)) and the head-sharded attention
+    # weights (q_b_proj, o_proj, w_vc, w_kc) become replicated, so every rank
+    # computes every head for its own token slice. Replaces the DSA-CP path's
+    # 3 allToAll + O-proj allReduce + topk allGather with 1 allGather (the MoE
+    # input) + 1 reduce-scatter (the MoE output). SparseFlashAttention is
+    # untouched (it already consumes this rank's queries + the rank-local top-k).
+    # OFF; requires NPU, a DSA model, attn TP size > 1, and MoE running TP.
+    SGLANG_NPU_DSA_CP_TOKEN_SHARDED = EnvBool(False)
+    # DSA-CP token sharding (D1v3): run q_b_proj at full width (every rank
+    # computes every query head) instead of the head-sharded projection.
+    # Version B of the DSA-CP Q all-to-all removal. Mutually exclusive with
+    # SGLANG_NPU_DSA_CP_Q_A2A_PREISSUE (version A); enabling both fails at
+    # startup.
+    SGLANG_NPU_DSA_CP_Q_FULL_WIDTH = EnvBool(True)
+    # DSA-CP Q all-to-all pre-issue (version A of the removal): issue the two Q
+    # head-redistribution all-to-alls in prepare, under the indexer, instead of
+    # in the core between the indexer and the sparse operator. Mutually
+    # exclusive with SGLANG_NPU_DSA_CP_Q_FULL_WIDTH.
+    SGLANG_NPU_DSA_CP_Q_A2A_PREISSUE = EnvBool(False)
+    # DSA-CP local top-k (D1v3): keep the indexer's top-k in this rank's query
+    # rows instead of gathering it back to full width; the sparse operator takes
+    # this rank's rows directly, dropping the round-trip all-gather (measured
+    # 8.42/15.83 ms, 100% exposed between the indexer and the next attention).
+    # Inert when the indexer query sharding is off or the plan declines.
+    SGLANG_NPU_DSA_CP_LOCAL_TOPK = EnvBool(True)
+    # DCP decode on NPU (D1v3): pre-issue the decode query all-gather before the
+    # indexer, so the SFA communication overlaps the top-k computation.
+    SGLANG_NPU_DCP_DECODE_Q_PREISSUE = EnvBool(True)
+    # DCP extend on NPU (D1v3): start the layer's prefix all-gather BEFORE the
+    # LightningIndexer runs, so the SFA KV communication overlaps the top-k
+    # computation, and wait for the gather only right before the sparse operator
+    # (the vLLM-Ascend pattern). OFF, pending box; costs ~+0.8-1.1 GiB at a ~1M
+    # context on the permuting path (one shared scratch becomes per-piece).
+    SGLANG_NPU_ENABLE_DCP_SFA_GATHER_OVERLAP = EnvBool(False)
+    # DSA-CP token sharding (D2v3): stream o_proj via all-gather instead of
+    # materializing the replicated weight. Requires DSA_CP_TOKEN_SHARDED.
+    SGLANG_NPU_STREAM_O_PROJ = EnvBool(True)
+    # DSA-CP token sharding (D2v4): stream q_b / w_kc / w_vc via all-gather
+    # instead of materializing the replicated weights. Requires
+    # DSA_CP_TOKEN_SHARDED.
+    SGLANG_NPU_STREAM_Q_B = EnvBool(False)
+    SGLANG_NPU_STREAM_W_KC = EnvBool(False)
+    SGLANG_NPU_STREAM_W_VC = EnvBool(False)
+    # DCP extend on NPU (D2v4): round the gather-buffer allocation to a grid to
+    # cut allocator fragmentation; 1 disables (the exact allocation).
+    SGLANG_NPU_DCP_GATHER_BUF_ROUND = EnvBool(True)
+    SGLANG_NPU_DCP_GATHER_BUF_GRID = EnvInt(131072)
+    SGLANG_NPU_DCP_GATHER_BUF_PREALLOC_ROWS = EnvInt(0)
     # DCP extend on NPU: log each extend forward's peak device memory, per rank.
     SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
     # DCP extend on NPU: log how much of a batch's gathered prefix is the same

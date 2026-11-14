@@ -948,6 +948,18 @@ def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     sequential ones, which also restores the invariant the fused residual+LN path
     depends on.
     """
+    from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+        dsa_cp_is_current_token_sharded,
+        dsa_cp_reduce_scatter_tokens,
+    )
+
+    if dsa_cp_is_current_token_sharded():
+        # D1v3: the residual is token-sharded, so each rank only needs its own
+        # rows of the summed MoE output. The reduce is the same sum the
+        # all-reduce computes; the scatter drops the other ranks' rows, which
+        # nobody consumes (the shared expert's partial was added before this
+        # point, so it is reduced in the same collective).
+        return dsa_cp_reduce_scatter_tokens(hidden_states)
     parallel = get_parallel()
     return _post_experts_sum(
         hidden_states,

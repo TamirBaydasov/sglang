@@ -1194,6 +1194,12 @@ class ModelRunner:
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
+        if envs.SGLANG_NPU_DSA_CP_Q_FULL_WIDTH.get():
+            self._prepare_dsa_cp_full_q_weights()
+
+        if envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get():
+            self._prepare_dsa_cp_token_sharded()
+
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
@@ -1251,6 +1257,327 @@ class ModelRunner:
             "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
             n_prepared,
         )
+
+    def _prepare_dsa_cp_full_q_weights(self) -> None:
+        # DSA-CP Q full width (version B): gather each rank's attn-TP head shard
+        # of q_b_proj / w_kc into full-head buffers once here (pre-capture), so
+        # the extend DSA-CP path computes every head for this rank's tokens
+        # locally and the per-layer Q all-to-all does not exist in steady state.
+        # The group is the attention-TP group (the head sharding), unlike
+        # _prepare_replicated_q_proj's DCP group, so the two cannot run together.
+        if get_parallel().dcp_replicate_q_proj:
+            raise ValueError(
+                "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH and --dcp-replicate-q-proj "
+                "both write q_b_proj_qrep_weight / w_kc_qrep, with different "
+                "group semantics (attention-TP vs DCP); enable one or the "
+                "other, not both"
+            )
+        if not get_parallel().dcp_enabled:
+            logger.warning(
+                "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH is set but DCP is not "
+                "enabled; the full-head weights are not prepared and the "
+                "flag is inert"
+            )
+            return
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+        from sglang.srt.utils import is_npu
+
+        if not is_npu():
+            logger.warning(
+                "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH is set but this is not an NPU "
+                "process; the full-head weights are not prepared and the flag "
+                "is inert"
+            )
+            return
+        tp_group = get_parallel().attn_tp_group
+        if tp_group.world_size <= 1:
+            logger.warning(
+                "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH is set but the attention-TP "
+                "size is 1; there is no head sharding to un-shard, so the flag "
+                "is inert"
+            )
+            return
+
+        def _fail(stage: str, m, detail: str, exc: BaseException) -> None:
+            raise ValueError(
+                "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH preparation failed at "
+                f"layer {getattr(m, 'layer_id', '?')} during {stage}: {detail}; "
+                f"underlying error: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        n_prepared = 0
+        total_bytes = 0
+        for m in self.model.modules():
+            if not isinstance(m, DeepseekV2AttentionMLA):
+                continue
+            if m.w_kc is None or not m.has_q_b_proj:
+                continue
+            try:
+                # Dequantized through an identity GEMM so W4A8-quantized
+                # checkpoints are supported (the bf16-only
+                # _prepare_replicated_q_proj above skips them).
+                w_r = m.q_b_proj(
+                    torch.eye(m.q_lora_rank, device=self.device, dtype=self.dtype)
+                )[0]
+                w_r = w_r.t().contiguous()
+            except BaseException as exc:
+                _fail(
+                    "q_b_proj identity GEMM",
+                    m,
+                    f"input [1, {m.q_lora_rank}] {self.dtype} through "
+                    f"{type(m.q_b_proj).__name__}",
+                    exc,
+                )
+            try:
+                m.q_b_proj_qrep_weight = tp_group.all_gather(w_r, dim=0)
+                m.w_kc_qrep = tp_group.all_gather(m.w_kc.contiguous(), dim=0)
+            except BaseException as exc:
+                _fail(
+                    "attn-TP all_gather",
+                    m,
+                    f"w_r {tuple(w_r.shape)}, w_kc {tuple(m.w_kc.shape)} over "
+                    f"world_size {tp_group.world_size}",
+                    exc,
+                )
+            total_bytes += m.q_b_proj_qrep_weight.numel() + m.w_kc_qrep.numel()
+            n_prepared += 1
+        logger.info(
+            "dsa_cp_q_full_width: prepared full-head q_b/w_kc for %d MLA layers, "
+            "%d bytes/rank (%.2f GiB), peak device memory %.2f GiB",
+            n_prepared,
+            total_bytes,
+            total_bytes / (1 << 30),
+            torch.npu.max_memory_allocated() / (1 << 30) if is_npu() else 0.0,
+        )
+
+    def _prepare_dsa_cp_token_sharded(self) -> None:
+        # DSA-CP token sharding (D1v3): the full rebuild. The gate is a hard
+        # refusal rather than a fallback because a half-enabled rebuild would
+        # not fail loudly -- it would produce plausible garbage.
+        from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+            register_o_proj_stream_shard,
+        )
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+        from sglang.srt.utils import is_npu
+
+        # D2v3: o_proj is the big one (192 MiB bf16 per DSA layer per rank on
+        # the full model, 14.1 GiB for 78 layers). By default it is NOT
+        # gathered here: only this rank's dequantized RowParallel shard is kept
+        # (24 MiB per layer), registered by layer id, and assembled on the DCP
+        # gather side stream right after the same layer's context-KV gather.
+        # SGLANG_NPU_STREAM_O_PROJ=0 restores the static full replica.
+        stream_o_proj = envs.SGLANG_NPU_STREAM_O_PROJ.get()
+
+        if not is_npu():
+            raise ValueError(
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is set but this is not an NPU "
+                "process; the rebuild's forward path exists only under "
+                "hardware_backend/npu"
+            )
+        parallel = get_parallel()
+        if parallel.attn_tp_size <= 1:
+            raise ValueError(
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is set but the attention-TP "
+                "size is 1; there is no token grid to shard"
+            )
+        if not get_moe_a2a_backend().is_none():
+            raise ValueError(
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED requires the MoE to run "
+                "tensor-parallel (a2a backend none/ascend_tp): the rebuild "
+                "gathers the quantized MoE input back to full width before "
+                "the dispatch, which expert parallelism replaces with a token "
+                "dispatch -- a different design"
+            )
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            raise ValueError(
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is set but speculative "
+                f"decoding is enabled ({self.spec_algorithm}); the draft path "
+                "consumes the full-width hidden states this rebuild does not "
+                "produce"
+            )
+        if is_dp_attention_enabled():
+            raise ValueError(
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is set but DP attention is "
+                "enabled; the token grid this rebuild uses (the attention-TP "
+                "group over the whole batch) is not the DP-attention grid"
+            )
+        if getattr(parallel, "enable_prefill_cp", False):
+            raise ValueError(
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is set but prefill context "
+                "parallelism is enabled; the prefill-CP communicator already "
+                "owns the hidden-state gather/scatter this rebuild replaces"
+            )
+        if envs.SGLANG_NPU_USE_MLAPO.get():
+            raise ValueError(
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED does not compose with "
+                "SGLANG_NPU_USE_MLAPO: the fused MLA preprocess runs the q "
+                "path this rebuild does not provide"
+            )
+        if envs.SGLANG_SHARED_EXPERT_TP1.get():
+            raise ValueError(
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is set but "
+                "SGLANG_SHARED_EXPERT_TP1 is on; the TP1 shared expert is "
+                "added full-width after the MoE reduce, which the rebuild "
+                "scatters first"
+            )
+        dsa_layers_all = [
+            m
+            for m in self.model.modules()
+            if isinstance(m, DeepseekV2AttentionMLA) and m.use_dsa
+        ]
+        if not dsa_layers_all:
+            raise ValueError(
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is set but this model has no "
+                "DSA layers to rebuild"
+            )
+        dsa_layers = [
+            m for m in dsa_layers_all if m.w_kc is not None and m.has_q_b_proj
+        ]
+        if len(dsa_layers) != len(dsa_layers_all):
+            raise ValueError(
+                "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is set but "
+                f"{len(dsa_layers_all) - len(dsa_layers)} of the "
+                f"{len(dsa_layers_all)} DSA layers lack the MLA q_b_proj / "
+                "kv_b_proj weights this rebuild replicates (a non-MLA "
+                "variant); the rebuild requires every DSA layer to be MLA, "
+                "because the token-sharded residual is per-forward, not "
+                "per-layer"
+            )
+        logger.warning(
+            "SGLANG_NPU_DSA_CP_TOKEN_SHARDED is on: the extend forward is "
+            "token-sharded across the %d attention-TP ranks. Graph capture of "
+            "an EXTEND forward is not supported and will raise on the first "
+            "extend capture; decode capture is unaffected (the rebuild is "
+            "extend-only).",
+            parallel.attn_tp_size,
+        )
+        # The replicated weights. q_b_proj / w_kc reuse whatever the version B
+        # preparation already gathered; when that ran without DCP it prepared
+        # nothing, so gather here. o_proj is dequantized through an identity
+        # GEMM, so W4A8-quantized checkpoints are supported.
+        # D2v4: this function only runs with token sharding on, so the stream
+        # flags need no extra gate here.
+        stream_q_b = envs.SGLANG_NPU_STREAM_Q_B.get()
+        stream_w_kc = envs.SGLANG_NPU_STREAM_W_KC.get()
+        stream_w_vc = envs.SGLANG_NPU_STREAM_W_VC.get()
+        tp_group = parallel.attn_tp_group
+        total_bytes = 0
+        for m in dsa_layers:
+            # D2v4: when a matrix is streamed, stand only this rank's shard
+            # (version B may already have set it); the forward all-gathers the
+            # full matrix on the fly, so the static qrep is never built.
+            if stream_q_b:
+                if getattr(m, "q_b_stream_shard", None) is None:
+                    w_r = m.q_b_proj(
+                        torch.eye(m.q_lora_rank, device=self.device, dtype=self.dtype)
+                    )[0]
+                    m.q_b_stream_shard = w_r.t().contiguous()
+                total_bytes += m.q_b_stream_shard.numel()
+            elif getattr(m, "q_b_proj_qrep_weight", None) is None:
+                w_r = m.q_b_proj(
+                    torch.eye(m.q_lora_rank, device=self.device, dtype=self.dtype)
+                )[0]
+                w_r = w_r.t().contiguous()
+                m.q_b_proj_qrep_weight = tp_group.all_gather(w_r, dim=0)
+                total_bytes += m.q_b_proj_qrep_weight.numel()
+            if stream_w_kc:
+                if getattr(m, "w_kc_stream_shard", None) is None:
+                    m.w_kc_stream_shard = m.w_kc.contiguous()
+                total_bytes += m.w_kc_stream_shard.numel()
+            elif getattr(m, "w_kc_qrep", None) is None:
+                m.w_kc_qrep = tp_group.all_gather(m.w_kc.contiguous(), dim=0)
+                total_bytes += m.w_kc_qrep.numel()
+            if stream_w_vc:
+                m.w_vc_stream_shard = m.w_vc.contiguous()
+                total_bytes += m.w_vc_stream_shard.numel()
+            elif getattr(m, "w_vc_qrep", None) is None:
+                m.w_vc_qrep = tp_group.all_gather(m.w_vc.contiguous(), dim=0)
+                total_bytes += m.w_vc_qrep.numel()
+            if stream_o_proj:
+                if getattr(m, "o_proj_stream_shard", None) is None:
+                    w_o = m.o_proj(
+                        torch.eye(
+                            m.o_proj.input_size_per_partition,
+                            device=self.device,
+                            dtype=self.dtype,
+                        )
+                    )[0]
+                    # [in_r, out] = W_r^T dequantized; the forward wants W_r.
+                    w_o = w_o.t().contiguous()
+                    # RowParallelLinear shards the INPUT dim (weight
+                    # [out, in_r]); the side stream gathers the full [out, in]
+                    # from these shards, rank r contributing columns
+                    # [r*in_r, (r+1)*in_r).
+                    m.o_proj_stream_shard = w_o
+                    register_o_proj_stream_shard(m.layer_id, w_o)
+                    total_bytes += w_o.numel()
+            elif getattr(m, "o_proj_qrep_weight", None) is None:
+                w_o = m.o_proj(
+                    torch.eye(
+                        m.o_proj.input_size_per_partition,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                )[0]
+                # [in_r, out] = W_r^T dequantized; the forward wants W_r.
+                w_o = w_o.t().contiguous()
+                # RowParallelLinear shards the INPUT dim (weight [out, in_r]),
+                # unlike the ColumnParallel q_b_proj above, so the gather is
+                # over dim 1, not dim 0.
+                m.o_proj_qrep_weight = tp_group.all_gather(w_o, dim=1)
+                total_bytes += m.o_proj_qrep_weight.numel()
+        logger.info(
+            "dsa_cp_token_sharded: prepared the token-sharded rebuild for %d "
+            "DSA layers, %d new elements/rank (%.2f GiB bf16-equivalent), "
+            "peak device memory %.2f GiB",
+            len(dsa_layers),
+            total_bytes,
+            total_bytes * 2 / (1 << 30),
+            torch.npu.max_memory_allocated() / (1 << 30) if is_npu() else 0.0,
+        )
+        m0 = dsa_layers[0]
+        _q_b_shape = (
+            tuple(m0.q_b_stream_shard.shape)
+            if getattr(m0, "q_b_stream_shard", None) is not None
+            else tuple(m0.q_b_proj_qrep_weight.shape)
+        )
+        _w_kc_shape = (
+            tuple(m0.w_kc_stream_shard.shape)
+            if getattr(m0, "w_kc_stream_shard", None) is not None
+            else tuple(m0.w_kc_qrep.shape)
+        )
+        _w_vc_shape = (
+            tuple(m0.w_vc_stream_shard.shape)
+            if getattr(m0, "w_vc_stream_shard", None) is not None
+            else tuple(m0.w_vc_qrep.shape)
+        )
+        if stream_o_proj:
+            logger.info(
+                "dsa_cp_token_sharded: replicated weights/rank shapes -> "
+                "q_b %s, w_kc %s, w_vc %s, o_proj STREAMED "
+                "(shard %s, full %s assembled on the gather side stream) "
+                "(first layer shown; all DSA layers share the same shapes)",
+                _q_b_shape,
+                _w_kc_shape,
+                _w_vc_shape,
+                tuple(m0.o_proj_stream_shard.shape),
+                (
+                    m0.o_proj_stream_shard.shape[0],
+                    m0.o_proj_stream_shard.shape[1] * parallel.attn_tp_size,
+                ),
+            )
+        else:
+            logger.info(
+                "dsa_cp_token_sharded: replicated weights/rank shapes -> "
+                "q_b %s, w_kc %s, w_vc %s, o_proj_qrep %s "
+                "(first layer shown; all DSA layers share the same shapes)",
+                _q_b_shape,
+                _w_kc_shape,
+                _w_vc_shape,
+                tuple(m0.o_proj_qrep_weight.shape),
+            )
 
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Warm the sampling path after graph initialization."""

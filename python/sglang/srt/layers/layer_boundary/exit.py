@@ -566,6 +566,35 @@ class MixerExit:
 
     def finish(self, hidden_states: torch.Tensor):
         """Hand the actual mixer result to the next boundary through the stream."""
+        if getattr(self._forward_batch, "npu_dsa_cp_token_sharded", False):
+            # D1v3: the attention output is already the COMPLETE result for
+            # this rank's row slice (o_proj ran on the full-width replicated
+            # W_O, there is no partial), so there is no all-reduce to do. The
+            # residual is still full width on the first layer and already
+            # sliced from the second on; take this rank's rows when needed.
+            # Lazy import: dsa_token_shard crosses the layer-boundary edge, so
+            # the import is done at call time only.
+            from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+                dsa_token_shard_slice,
+                get_dsa_token_shard_plan,
+            )
+            from sglang.srt.utils.common import print_info_once
+
+            print_info_once(
+                "D1v3: the attention boundary skips the all-reduce (the "
+                "o_proj output is already complete for this rank's rows) and "
+                "slices the residual to this rank's rows."
+            )
+            plan = get_dsa_token_shard_plan(self._forward_batch)
+            residual = self._stream.residual
+            # BUG 16: key off "not already this rank's rows" (same fix as
+            # stage.py) -- the first-layer residual is [num_tokens] (no
+            # padding), so == num_tokens_pad fails on non-divisible chunks.
+            if residual is not None and residual.shape[0] != plan.rows:
+                self._stream.residual = dsa_token_shard_slice(residual, plan)
+            return self._stream.record(
+                hidden_states, self._update, declared_sum=None
+            )
         if self._defers:
             hidden_states = UnreducedOutput(
                 hidden_states, group=get_parallel().tp_group
