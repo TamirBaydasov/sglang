@@ -356,6 +356,5 @@ five shot/test overlaps. The standalone A3 test recovered 61/64 with no errors o
 
 See [NIGHT_20261114.md](NIGHT_20261114.md) for failure analysis, repaired serving
 branch revisions, exact-prompt diagnostics, matched speed controls, and A3
-commands. Serving fixes execute from pinned feature-branch commits. Historical
-source overlays are excluded from this publication; explicit local overlays
-require exact base commits and checksums, and their effective diff is recorded.
+commands. Serving fixes execute from pinned feature-branch commits. The temporary local-overlay mechanism is removed; reruns use normal pinned
+feature-branch commits and record their effective source diff.

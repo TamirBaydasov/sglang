@@ -1713,66 +1713,11 @@ def pin_refs(cases, args, deadline, checkpoint):
     return pinned
 
 
-def load_serving_overlay(path):
-    root = Path(path).resolve()
-    manifest = json.loads((root / "manifest.json").read_text())
-    for entry in manifest:
-        if not re.fullmatch(r"[0-9a-f]{40}", entry["base_commit"]):
-            raise ValueError("invalid serving overlay base commit")
-        for relative, expected in entry["files"].items():
-            target = Path(relative)
-            if (
-                target.is_absolute()
-                or ".." in target.parts
-                or not relative.startswith("python/")
-            ):
-                raise ValueError("invalid serving overlay path")
-            source = (root / entry["base_commit"] / target).resolve()
-            if (
-                root not in source.parents
-                or hashlib.sha256(source.read_bytes()).hexdigest() != expected
-            ):
-                raise ValueError("serving overlay checksum mismatch")
-    return root, manifest
-
-
-APPLY_SERVING_OVERLAY = r"""
-import hashlib, json, sys
-from pathlib import Path
-root = Path(sys.argv[1]).resolve()
-for relative, content in json.load(sys.stdin).items():
- target = (root / relative).resolve()
- if root not in target.parents or not target.is_file():
-  raise ValueError('overlay target is not a tracked source file inside the owned checkout')
- target.write_text(content)
- print(relative + ' ' + hashlib.sha256(target.read_bytes()).hexdigest())
-"""
-
-
 def create_worktree(args, record, registry, deadline):
     path = args.remote_root + "/worktrees/" + record["case"]
     registry["worktrees"].append(path)
     save(args.registry_path, registry)
     git(args, "worktree", "add", "--detach", path, record["commit"], deadline=deadline)
-    if getattr(args, "serving_overlay", None):
-        overlay_root, manifest = load_serving_overlay(args.serving_overlay)
-        matching = [entry for entry in manifest if entry["ref"] == record["ref"]]
-        for entry in matching:
-            if entry["base_commit"] != record["commit"]:
-                raise ValueError(
-                    "serving overlay base differs from pinned branch; rebase the local fix first"
-                )
-            contents = {
-                relative: (overlay_root / entry["base_commit"] / relative).read_text()
-                for relative in entry["files"]
-            }
-            run_capture(
-                args,
-                shlex.join([args.container_python, "-c", APPLY_SERVING_OVERLAY, path]),
-                deadline,
-                input_text=json.dumps(contents),
-            )
-            record["serving_overlay"] = entry
     record["source_diff_sha256"] = hashlib.sha256(
         git(args, "diff", "--binary", deadline=deadline, repo=path).encode()
     ).hexdigest()
@@ -2671,10 +2616,6 @@ def parser():
         "--container-cann-env",
         default="/home/tbaydasov/Ascend/cann-9.2.0-beta.2/set_env.sh",
     )
-    p.add_argument(
-        "--serving-overlay",
-        help="local checksum-verified serving fixes for matching pinned base commits",
-    )
     p.add_argument("--no-fetch", action="store_true")
     p.add_argument("--ais-dir", default=AIS_DIR_DEFAULT)
     p.add_argument("--ais-env", default=None)
@@ -2754,8 +2695,6 @@ def parser():
 
 
 def validate_args(args):
-    if args.serving_overlay:
-        load_serving_overlay(args.serving_overlay)
     if args.gsm8k_replay and args.gsm8k_shots_data:
         raise ValueError("saved-prompt replay cannot change five-shot examples")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]*", args.baseline_ref):
@@ -2840,14 +2779,6 @@ def dry_run(args, cases):
         effective = case_settings(args, name)
         worktree = "<run-root>/worktrees/" + name
         print(f"== {name}: pin {ref} once; isolated worktree {worktree}")
-        if args.serving_overlay:
-            _, manifest = load_serving_overlay(args.serving_overlay)
-            for entry in manifest:
-                if entry["ref"] == ref:
-                    print(
-                        "  apply verified serving overlay: "
-                        + json.dumps(entry, sort_keys=True)
-                    )
         for phase in phase_names(effective):
             graph = effective.decode_graph == "on" and phase != "diagnostic-eager"
             print(
