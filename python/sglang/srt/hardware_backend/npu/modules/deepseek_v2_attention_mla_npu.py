@@ -893,7 +893,7 @@ def _dcp_gather_extend_kv_npu(
         release.record()
         state.release[slot] = release
         _issue_dcp_gather_prefetch(
-            state, pool, m, md, plan, parallel, layer_id, k_nope, k_pe, packed_kv
+            state, pool, m, md, plan, parallel, layer_id, k_nope, k_pe, packed_kv, f2=f2
         )
     return out_nope, out_rope
 
@@ -923,9 +923,7 @@ def _issue_dcp_gather_prefetch(
     with torch.npu.stream(state.stream):
         if release is not None:
             state.stream.wait_event(release)
-        sends = _dcp_extend_send_rows(
-            pool, m.attn_mqa, md, plan, nxt, packed_kv, f2
-        )
+        sends = _dcp_extend_send_rows(pool, m.attn_mqa, md, plan, nxt, packed_kv, f2)
         pairs = [(scratch, s) for (scratch, _), s in zip(scratches, sends)]
         for piece in plan.pieces:
             _dcp_extend_all_gather(parallel, piece, pairs)

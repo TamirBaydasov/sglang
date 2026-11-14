@@ -1606,8 +1606,9 @@ class AscendAttnBackend(AttentionBackend):
         cached = getattr(forward_batch, "npu_dcp_decode_packed_kv_lens", None)
         if cached is None or cached.numel() != forward_batch.batch_size:
             cached = (
-                torch.arange(1, forward_batch.batch_size + 1, device=device)
-                .to(torch.int32)
+                torch.arange(1, forward_batch.batch_size + 1, device=device).to(
+                    torch.int32
+                )
                 * k_width
             )
             forward_batch.npu_dcp_decode_packed_kv_lens = cached
@@ -1646,7 +1647,7 @@ class AscendAttnBackend(AttentionBackend):
             ok, msg = True, ""
             try:
                 names = {
-                    arg[0]
+                    arg.name
                     for arg in torch.ops.npu.npu_kv_quant_sparse_flash_attention.default._schema.arguments
                 }
             except Exception as e:  # op not registered in this torch_npu
@@ -1672,7 +1673,7 @@ class AscendAttnBackend(AttentionBackend):
         q_pe: torch.Tensor,
         rows: torch.Tensor,
         topk_indices: torch.Tensor,
-        layer: "RadixAttention",
+        layer: RadixAttention,
         actual_seq_qlen: torch.Tensor,
         seq_lengths_kv: torch.Tensor,
         sparse_mode: int,
@@ -1751,9 +1752,7 @@ class AscendAttnBackend(AttentionBackend):
 
     def _f2_dequant_rows(self, rows: torch.Tensor):
         """The F1 (nope, rope) halves of the F2 rows (see _dcp_packed_quant_sfa)."""
-        dequant = getattr(
-            self.token_to_kv_pool, "dequant_packed_sfa_rows", None
-        )
+        dequant = getattr(self.token_to_kv_pool, "dequant_packed_sfa_rows", None)
         if dequant is None:
             raise RuntimeError(
                 "F2 fallback: the pool stores the packed rows but has no "
@@ -1993,7 +1992,7 @@ class AscendAttnBackend(AttentionBackend):
                 # layout_kv must equal layout_query unless it is PA_BSND.
                 layout_kv = "TND"
             else:
-                assert not self._sfa_packed_kv(), (
+                assert not getattr(self.token_to_kv_pool, "sfa_kv_store_8bit", False), (
                     "packed 8-bit SFA KV reached the unsharded paged read: "
                     "F1's temporary read covers the DCP paths only. The pool "
                     "refuses the flag at init without DCP, so this is a wiring "
