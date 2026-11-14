@@ -2304,8 +2304,13 @@ class OpenAIServingChat(OpenAIServingBase):
         # below (the memo keeps its own full-prompt LRU + family prefix
         # assembly on the tokenizer manager).
         memo = getattr(self.tokenizer_manager, "chat_encode_memo", None)
-        if memo is not None:
+        if (
+            memo is not None
+            and not self._prompt_text_round_trip_is_lossy
+            and self.template_manager.python_chat_template is None
+        ):
             try:
+                # Templates can iterate dictionaries in insertion order.
                 memo_key = orjson.dumps(
                     (
                         getattr(
@@ -2319,7 +2324,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         encode_kwargs,
                         add_generation_prompt,
                     ),
-                    option=orjson.OPT_SORT_KEYS,
                 )
             except TypeError:
                 memo_key = None
