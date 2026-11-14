@@ -354,6 +354,15 @@ class DeepseekV2MLP(nn.Module):
         if self.is_replicated and x.shape[0] == 0:
             return x
 
+        if not self.is_replicated and getattr(
+            forward_batch, "npu_dsa_cp_token_sharded", False
+        ):
+            # TP weight shards must compute the same tokens before summing.
+            group = get_parallel().attn_tp_group
+            full = x.new_empty((x.shape[0] * group.world_size, *x.shape[1:]))
+            group.all_gather_into_tensor(full, x)
+            x = full
+
         if (
             getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False)
             and self.swiglu_limit is None

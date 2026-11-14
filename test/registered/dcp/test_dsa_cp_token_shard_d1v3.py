@@ -25,11 +25,11 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.dsa.dsa_token_shard import (
-    dsa_cp_reduce_scatter_tokens,  # noqa: F401  (import contract check)
-    dsa_token_shard_slice,
-)
+from sglang.srt.layers.attention.dsa.dsa_token_shard import dsa_token_shard_slice
 from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import DsaTokenShardPlan
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def make_plans(num_tokens, tp, seq_lens):
@@ -67,13 +67,17 @@ class TestRankSliceLayout(unittest.TestCase):
         slices = [dsa_token_shard_slice(full, p) for p in plans]
         self.assertEqual(slices[0].shape[0], plans[0].rows)
         # Unpadded values: the concatenated real rows rebuild the batch.
-        rebuilt = torch.cat([s[: p.local_end - p.local_start] for s, p in zip(slices, plans)])
+        rebuilt = torch.cat(
+            [s[: p.local_end - p.local_start] for s, p in zip(slices, plans)]
+        )
         self.assertTrue(torch.equal(rebuilt, full))
         # Padded slices concatenate to num_tokens_pad with zero pad at the tail.
         padded = torch.cat(slices)
         self.assertEqual(padded.shape[0], plans[0].num_tokens_pad)
         self.assertTrue(torch.equal(padded[:num_tokens], full))
-        self.assertTrue(torch.equal(padded[num_tokens:], torch.zeros_like(padded[num_tokens:])))
+        self.assertTrue(
+            torch.equal(padded[num_tokens:], torch.zeros_like(padded[num_tokens:]))
+        )
 
     def test_non_divisible_batch_has_pad_rows_bug16_premise(self):
         plans = make_plans(10, 4, [10])

@@ -616,6 +616,7 @@ def forward_dsa_prepare_npu(
             )
         return m.q_b_proj(q_in)[0].view(-1, m.num_local_heads, m.qk_head_dim)
 
+    indexer_runs = not m.skip_topk or (m.is_nextn and prev_topk_indices is None)
     if _enable_dcp_sfa_gather_overlap and _dcp_extend_active(forward_batch):
         if not indexer_runs:
             # Reuse layer: no indexer to hide behind, so the QKV is the window
@@ -1156,8 +1157,7 @@ _enable_dcp_decode_q_preissue = envs.SGLANG_NPU_DCP_DECODE_Q_PREISSUE.get()
 # o_proj_qrep_weight, byte for byte. It only takes effect under the D1v3
 # token-sharded rebuild, which is what makes the full matrix necessary.
 _stream_o_proj = (
-    envs.SGLANG_NPU_STREAM_O_PROJ.get()
-    and envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get()
+    envs.SGLANG_NPU_STREAM_O_PROJ.get() and envs.SGLANG_NPU_DSA_CP_TOKEN_SHARDED.get()
 )
 _dcp_o_proj_fallback_logged = False
 _eager_o_proj_slots: list = [None, None]
@@ -1835,8 +1835,8 @@ def _dcp_issue_gather_chunks(
     roughly 1-2 ms leave the inter-collective windows in which that work runs.
     See SGLANG_NPU_DCP_GATHER_CHUNKS for the measurement.
 
-    Returns the async work handles (empty when issued synchronously); the
-    prefetch and eager paths rely on stream ordering and drop them.
+    Order every chunk's completion before the caller consumes the prefix or
+    records its ready event; communication may use a separate backend stream.
     """
     c = plan.dcp_size
     if plan.chunks <= 1:
@@ -1854,6 +1854,9 @@ def _dcp_issue_gather_chunks(
             )
         )
         st += sz
+    for work in works:
+        if work is not None:
+            work.wait()
     return tuple(works)
 
 
@@ -2170,8 +2173,15 @@ def _dcp_start_extend_gather_permuting_npu(
                     )
                 )
     return _DcpSfaGatherPending(
-        "permuting", works, plan, out_nope, out_rope, k_nope, k_pe,
-        scratch_nope, scratch_rope,
+        "permuting",
+        works,
+        plan,
+        out_nope,
+        out_rope,
+        k_nope,
+        k_pe,
+        scratch_nope,
+        scratch_rope,
     )
 
 
@@ -2333,9 +2343,7 @@ def _dcp_finish_extend_gather_npu(
             (pending.out_nope, pending.scratch_nope[i], pending.k_nope),
             (pending.out_rope, pending.scratch_rope[i], pending.k_pe),
         ):
-            scratch = scratch[
-                : gathered + piece.extend_end - piece.extend_start
-            ]
+            scratch = scratch[: gathered + piece.extend_end - piece.extend_start]
             scratch[gathered:] = own[piece.extend_start : piece.extend_end]
             torch.index_select(
                 scratch, 0, piece.index, out=out[piece.out_start : piece.out_end]
@@ -2418,6 +2426,11 @@ def forward_dsa_core_npu(
             )
             forward_batch.npu_dsa_cp_chunk_kv_works = None
 
+        # Communication pads to the TP grid; cache locations contain real rows.
+        num_tokens = get_dsa_token_shard_plan(forward_batch).num_tokens
+        k_nope = k_nope[:num_tokens]
+        k_pe = k_pe[:num_tokens]
+
     dcp_extend = _dcp_extend_active(forward_batch)
     if (
         not dcp_extend
@@ -2494,12 +2507,8 @@ def forward_dsa_core_npu(
         # D1v3: the token-sharded rebuild + the version B full-width Q. Defined
         # here so the redistribute, the restore, and the o_proj all see them.
         token_sharded = dsa_cp_token_sharded(forward_batch)
-        # BUG 5: a plan can be cached for a forward the gate refused (e.g.
-        # logprob prefill). The core must branch on the per-forward decision,
-        # not plan presence: demote the plan when this forward is NOT
-        # token-sharded so every branch below falls through to base DCP.
-        if dsa_token_shard_plan is not None and not token_sharded:
-            dsa_token_shard_plan = None
+        # Query sharding also applies when the residual rebuild declines;
+        # that path restores the full token rows after sparse attention.
         # D2v4: the streamed q_b carries its shard, not the static qrep, so the
         # full-width presence check follows which one the preparation stood --
         # the same stream-aware expression the prepare's q_b_present uses, or
@@ -2565,8 +2574,10 @@ def forward_dsa_core_npu(
             # next layer, and rebinding it would hand that a slice of a slice.
             if (
                 token_sharded
-                or (_enable_dsa_cp_local_topk
-                    and getattr(forward_batch, "npu_dsa_topk_local", False))
+                or (
+                    _enable_dsa_cp_local_topk
+                    and getattr(forward_batch, "npu_dsa_topk_local", False)
+                )
                 or getattr(forward_batch, "npu_indexer_topk_is_local", False)
             ):
                 # The indexer kept its top-k in this rank's query rows (the plan's
@@ -2679,9 +2690,7 @@ def forward_dsa_core_npu(
                 "attention output is complete and the o_proj allReduce is "
                 "skipped, with no standing per-device replica."
             )
-            output = torch.nn.functional.linear(
-                attn_bmm_output, _dcp_o_proj_weight(m)
-            )
+            output = torch.nn.functional.linear(attn_bmm_output, _dcp_o_proj_weight(m))
         else:
             print_info_once(
                 "D1v3: o_proj runs the full replicated W_O (o_proj_qrep_weight) "

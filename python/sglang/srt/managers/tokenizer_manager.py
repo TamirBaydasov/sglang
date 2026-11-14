@@ -729,8 +729,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.chat_encode_memo = ChatEncodeMemo()
                 logger.info(
                     "[chat-encode] memo engaged (branch E E2a): full-prompt "
-                    "dedup + verified rendered-prefix reuse, serialized "
-                    "family bootstrap",
+                    "dedup with complete-prompt encoding",
                 )
 
     def _validate_cuda_vmm_feature_transport_support(self) -> None:

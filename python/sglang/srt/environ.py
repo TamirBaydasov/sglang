@@ -1300,7 +1300,7 @@ class Envs:
     # Version B of the DSA-CP Q all-to-all removal. Mutually exclusive with
     # SGLANG_NPU_DSA_CP_Q_A2A_PREISSUE (version A); enabling both fails at
     # startup.
-    SGLANG_NPU_DSA_CP_Q_FULL_WIDTH = EnvBool(True)
+    SGLANG_NPU_DSA_CP_Q_FULL_WIDTH = EnvBool(False)
     # DSA-CP Q all-to-all pre-issue (version A of the removal): issue the two Q
     # head-redistribution all-to-alls in prepare, under the indexer, instead of
     # in the core between the indexer and the sparse operator. Mutually

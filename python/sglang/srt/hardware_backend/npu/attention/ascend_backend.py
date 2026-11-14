@@ -1650,7 +1650,7 @@ class AscendAttnBackend(AttentionBackend):
             ok, msg = True, ""
             try:
                 names = {
-                    arg[0]
+                    arg.name
                     for arg in torch.ops.npu.npu_kv_quant_sparse_flash_attention.default._schema.arguments
                 }
             except Exception as e:  # op not registered in this torch_npu
@@ -1798,11 +1798,6 @@ class AscendAttnBackend(AttentionBackend):
         # The token shard replaces both length vectors, built once per forward.
         dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
         dsa_token_shard_qlen = dsa_token_shard_kvlen = None
-        # BUG 5: branch on the per-forward decision, not plan presence.
-        if dsa_token_shard_plan is not None and not getattr(
-            forward_batch, "npu_dsa_cp_token_sharded", False
-        ):
-            dsa_token_shard_plan = None
         if dsa_token_shard_plan is not None:
             dsa_token_shard_qlen, dsa_token_shard_kvlen = (
                 dsa_token_shard_cumulative_lens(
@@ -2022,7 +2017,7 @@ class AscendAttnBackend(AttentionBackend):
                 # layout_kv must equal layout_query unless it is PA_BSND.
                 layout_kv = "TND"
             else:
-                assert not self._sfa_packed_kv(), (
+                assert not getattr(self.token_to_kv_pool, "sfa_kv_store_8bit", False), (
                     "packed 8-bit SFA KV reached the unsharded paged read: "
                     "F1's temporary read covers the DCP paths only. The pool "
                     "refuses the flag at init without DCP, so this is a wiring "
