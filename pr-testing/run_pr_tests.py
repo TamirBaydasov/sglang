@@ -389,6 +389,7 @@ CASES.extend(
 )
 
 MATCHED_BASELINES = {
+    "07-combined": "18-baseline-prefill1",
     "03-pr-prefetch-packed": "18-baseline-prefill1",
     "16-megamoe-8k": "15-baseline-8k",
     "17-baseline-8k-repeat": "15-baseline-8k",
@@ -1410,24 +1411,28 @@ for node in ast.parse(backend).body:
   exec(compile(ast.Module(body=[node], type_ignores=[]), '<backend-registration>', 'exec'))
 ops = {}
 schemas = {}
-for name in ('npu_sparse_flash_attention_lse', 'npu_kv_quant_sparse_flash_attention'):
+for name in ('npu_sparse_flash_attention', 'npu_kv_quant_sparse_flash_attention'):
  ops[name] = hasattr(torch.ops.npu, name)
  if ops[name]:
   packet = getattr(torch.ops.npu, name)
   schemas[name] = {overload: str(getattr(packet, overload)._schema) for overload in packet.overloads()}
 schema_errors = {}
-for node in ast.walk(ast.parse(backend)):
- if isinstance(node, ast.Call) and ast.unparse(node.func) == 'torch.ops.npu.npu_sparse_flash_attention_lse' and ops['npu_sparse_flash_attention_lse']:
-  required = {kw.arg for kw in node.keywords if kw.arg is not None}
-  packet = torch.ops.npu.npu_sparse_flash_attention_lse
-  supported = [{arg.name for arg in getattr(packet, overload)._schema.arguments} for overload in packet.overloads()]
-  if not any(required <= names for names in supported):
-   schema_errors['npu_sparse_flash_attention_lse'] = 'backend keywords unsupported: ' + ','.join(sorted(required))
+dcp_path = Path('python/sglang/srt/hardware_backend/npu/attention/dsa_dcp.py')
+dcp_source = dcp_path.read_text() if dcp_path.exists() else ''
+requires_lse = 'forward_tnd_sparse_attention(' in backend
+if requires_lse and ops['npu_sparse_flash_attention']:
+ packet = torch.ops.npu.npu_sparse_flash_attention
+ supported = [{arg.name for arg in getattr(packet, overload)._schema.arguments} for overload in packet.overloads()]
+ required = {'return_softmax_lse'}
+ for node in ast.walk(ast.parse(dcp_source)):
+  if isinstance(node, ast.Call) and ast.unparse(node.func) == 'torch_npu.npu_sparse_flash_attention':
+   required.update(kw.arg for kw in node.keywords if kw.arg is not None)
+ if not any(required <= names for names in supported):
+  schema_errors['npu_sparse_flash_attention'] = 'backend keywords unsupported: ' + ','.join(sorted(required))
 providers = {name: getattr(module, '__file__', None) for name, module in sys.modules.items()
              if name.startswith(('sgl_kernel_npu', 'torch_npu', 'cann_ops_transformer'))}
-requires_lse = 'torch.ops.npu.npu_sparse_flash_attention_lse(' in backend
 print('PRTEST_PROBE='+json.dumps({'versions': versions, 'ops':ops, 'model_config':config,
- 'requires_sparse_fa_lse': requires_lse, 'operator_schemas': schemas, 'operator_schema_errors': schema_errors,
+ 'requires_sparse_fa_lse': requires_lse, 'sparse_fa_lse_eager_only': requires_lse, 'operator_schemas': schemas, 'operator_schema_errors': schema_errors,
  'registration_imports': registration_imports, 'provider_modules': providers,
  'loaded_libraries': sorted(str(path) for path in torch.ops.loaded_libraries),
  'model_files_sha256':files, 'python':sys.executable, 'torch_path':torch.__file__,
@@ -1923,16 +1928,16 @@ def run_phase(
                     "requires_sparse_fa_lse",
                     record["case"] in ("04-pr-f-sfa-kv-8bit", "07-combined"),
                 )
-                and not runtime["ops"]["npu_sparse_flash_attention_lse"]
+                and not runtime["ops"]["npu_sparse_flash_attention"]
             ):
                 raise RuntimeError(
-                    "required torch.ops.npu.npu_sparse_flash_attention_lse is unavailable"
+                    "required torch.ops.npu.npu_sparse_flash_attention is unavailable"
                 )
             if runtime.get("operator_schema_errors", {}).get(
-                "npu_sparse_flash_attention_lse"
+                "npu_sparse_flash_attention"
             ):
                 raise RuntimeError(
-                    runtime["operator_schema_errors"]["npu_sparse_flash_attention_lse"]
+                    runtime["operator_schema_errors"]["npu_sparse_flash_attention"]
                 )
             argv = server_argv(
                 args,
@@ -1941,6 +1946,13 @@ def run_phase(
                 record.get("case_server_args", ()),
                 phase=phase,
             )
+            if (
+                runtime.get("sparse_fa_lse_eager_only")
+                and argv[argv.index("--cuda-graph-backend-decode") + 1] != "disabled"
+            ):
+                raise RuntimeError(
+                    "Sparse attention LSE requires eager execution; rerun with --decode-graph off"
+                )
             command = server_shell(args, worktree, record["case_env"], argv)
             attempt.update(
                 argv=argv,

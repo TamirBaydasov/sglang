@@ -358,3 +358,38 @@ See [NIGHT_20261114.md](NIGHT_20261114.md) for failure analysis, repaired servin
 branch revisions, exact-prompt diagnostics, matched speed controls, and A3
 commands. Serving fixes execute from pinned feature-branch commits. The temporary local-overlay mechanism is removed; reruns use normal pinned
 feature-branch commits and record their effective source diff.
+
+### Sparse attention LSE prerequisite
+
+PR #5 and combined use `torch_npu.npu_sparse_flash_attention` with
+`return_softmax_lse=True`, gathering selected paged KV rows into TND for decode.
+They require an operator schema exposing that argument and an explicit
+`--decode-graph off` run. The launcher rejects graph execution before server
+startup; it does not silently change the comparison configuration. Use the
+same eager setting for baseline controls. All-masked rank contributions are
+zero output and negative-infinity LSE.
+
+[Ascend's API documentation](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_sparse_flash_attention.md)
+limits LSE output to non-paged layouts and documents no graph support. It
+also describes LSE as a training feature, so an eager A3 invocation must still
+verify that the installed CANN/TorchNPU pair executes it for this workload.
+Schema availability alone does not establish device support or correctness.
+
+### 16-hour follow-up
+
+Run `bash run_16h.sh --gsm8k /path/to/test.jsonl` on the host after deployment.
+This is a 16-hour maximum budget with 45-minute case deadlines, not a loop.
+It selects 21 cases (37 fresh servers), using eager decode for the main sweep
+and its baseline brackets. Only explicit MoE graph diagnostics 22/23 enable
+decode graphs. The original 1M-token, concurrency-16 AISBench workload is
+preserved; the named 8K diagnostics retain their smaller prefill settings.
+Combined and packed-read speed ratios use the prefill-limit-1 TP control.
+Accuracy uses 64 questions, 16 client workers, 1,024 output tokens and one
+server slot, except the existing P4 reproduction's explicit 64-slot recipe.
+
+Results require 64 completed accuracy requests, no failures or truncations and
+at least 90% accuracy, with five-shot overlap disclosed. Speed acceptance
+requires all 16 measured requests to succeed with valid timings and matching
+configuration. Failed or incomplete cases remain recorded and return nonzero.
+The sparse LSE eager path and the other repaired serving paths still require
+A3 validation. Missing prerequisites are reported as failures, not skipped.

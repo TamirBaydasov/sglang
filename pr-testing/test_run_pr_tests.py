@@ -692,7 +692,31 @@ def test_failed_accuracy_does_not_suppress_speed_or_later_cases(tmp_path, monkey
     assert len(rows) == 2 and all(row["status"] == "failed" for row in rows)
 
 
-def test_runtime_operator_absence_keeps_probe_evidence(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "runtime,reason",
+    [
+        ({"ops": {"npu_sparse_flash_attention": False}}, "required torch.ops"),
+        (
+            {
+                "ops": {"npu_sparse_flash_attention": True},
+                "operator_schema_errors": {
+                    "npu_sparse_flash_attention": "backend keywords unsupported: return_softmax_lse"
+                },
+            },
+            "return_softmax_lse",
+        ),
+        (
+            {
+                "ops": {"npu_sparse_flash_attention": True},
+                "sparse_fa_lse_eager_only": True,
+            },
+            "--decode-graph off",
+        ),
+    ],
+)
+def test_runtime_operator_absence_keeps_probe_evidence(
+    tmp_path, monkeypatch, runtime, reason
+):
     args = args_for("--round", "smoke")
     args.registry_path = tmp_path / "registry.json"
     record = {
@@ -705,7 +729,7 @@ def test_runtime_operator_absence_keeps_probe_evidence(tmp_path, monkeypatch):
     monkeypatch.setattr(
         h,
         "probe_runtime",
-        lambda *a: {"ops": {"npu_sparse_flash_attention_lse": False}},
+        lambda *a: runtime,
     )
     h.run_phase(
         args,
@@ -719,8 +743,8 @@ def test_runtime_operator_absence_keeps_probe_evidence(tmp_path, monkeypatch):
         lambda: None,
     )
     attempt = record["phases"]["smoke"]["attempts"][0]
-    assert "required torch.ops" in attempt["reason"]
-    assert attempt["runtime"]["ops"]["npu_sparse_flash_attention_lse"] is False
+    assert reason in attempt["reason"]
+    assert attempt["runtime"] == runtime
 
 
 def test_timeout_kills_child_that_ignores_term(tmp_path):
@@ -1379,3 +1403,81 @@ def test_backend_comparison_only_relaxes_declared_moe_variables(case, backend):
         assert not h.backend_comparison_matches(case, changed, base)
     changed = dict(variant, memfrac=0.76)
     assert not h.backend_comparison_matches(case, changed, base)
+
+
+def test_stock_sparse_probe_checks_lse_keyword(tmp_path, monkeypatch, capsys):
+    import types
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    backend = tmp_path / "python/sglang/srt/hardware_backend/npu/attention"
+    backend.mkdir(parents=True)
+    (backend / "ascend_backend.py").write_text("forward_tnd_sparse_attention()")
+    (backend / "dsa_dcp.py").write_text(
+        "torch_npu.npu_sparse_flash_attention(query=q, return_softmax_lse=True)"
+    )
+    packet = SimpleNamespace(overloads=lambda: ["default"])
+    fake_torch = types.ModuleType("torch")
+    fake_torch.__file__ = "/fake/torch/__init__.py"
+    fake_torch.ops = SimpleNamespace(
+        npu=SimpleNamespace(npu_sparse_flash_attention=packet), loaded_libraries=[]
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(sys, "argv", ["probe", str(model)])
+    monkeypatch.chdir(tmp_path)
+    for supported in (False, True):
+        names = ["query", "return_softmax_lse"] if supported else ["query"]
+        packet.default = SimpleNamespace(
+            _schema=SimpleNamespace(
+                arguments=[SimpleNamespace(name=name) for name in names]
+            )
+        )
+        exec(h.PROBE, {})
+        result = json.loads(capsys.readouterr().out.split("PRTEST_PROBE=", 1)[1])
+        assert result["requires_sparse_fa_lse"]
+        assert result["sparse_fa_lse_eager_only"]
+        assert bool(result["operator_schema_errors"]) != supported
+
+
+def test_combined_ratio_uses_matching_prefill_control(tmp_path):
+    def record(name, limit, ttft):
+        return {
+            "case": name,
+            "status": "ok",
+            "phases": {
+                "speed": {
+                    "attempts": [
+                        {
+                            "comparison_config": {
+                                "decode_graph": False,
+                                "prefill_max_requests": limit,
+                            },
+                            "speed": {
+                                "status": "ok",
+                                "metrics": {"TTFT avg": ttft, "TTFT P90": ttft},
+                            },
+                        }
+                    ]
+                }
+            },
+        }
+
+    h.summarize(
+        [
+            record("00-baseline", 16, 9000),
+            record("18-baseline-prefill1", 1, 4000),
+            record("07-combined", 1, 2000),
+        ],
+        tmp_path,
+        SimpleNamespace(),
+    )
+    row = next(
+        line
+        for line in (tmp_path / "SUMMARY.md").read_text().splitlines()
+        if line.startswith("| 07-combined |")
+    )
+    assert "2.000x" in row
+    assert "vs 18-baseline-prefill1" in row
+    assert "configuration mismatch" not in row
