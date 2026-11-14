@@ -1088,17 +1088,22 @@ class DeepseekV2MoE(nn.Module):
         )
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
-        # D1v3 (self-sufficient form, SGLANG_NPU_DSA_CP_TOKEN_SHARDED): the MoE
-        # input is this rank's row slice of the token-sharded residual. The
-        # TP-over-experts GEMM needs every token on every rank, so all-gather
-        # the slice back to full width in the compute dtype. Everything from
-        # here on (gate, topk, dispatch, GEMM, finalize) runs on the full tensor
-        # exactly as without the rebuild -- and the trailing reduce below
-        # becomes a reduce-scatter onto this rank's slice (layers/moe/utils.py
-        # + the layer_boundary sum_output hook), the inverse of this gather.
-        # (The int8 communication optimization on this same block lives in
-        # branch_moe; this form uses only standard collectives and is the
-        # functionally correct baseline.)
+        # D1v3 (branch_moe / M): the MoE input is this rank's row slice. The
+        # TP-over-experts GEMM needs every token on every rank, so quantize the
+        # slice (per-token int8), all-gather the quantized payload + per-token
+        # scale back to full width, and dequantize. Everything from here on
+        # (gate, topk, dispatch, GEMM, finalize) runs on the full tensor exactly
+        # as without the rebuild -- and the trailing reduce below becomes a
+        # reduce-scatter onto this rank's slice.
+        #
+        # This is the int8 communication optimization layered on top of
+        # branch_token_sharded's self-sufficient form (a plain compute-dtype
+        # all-gather of the same slice). The position (all-gather before the
+        # MoE) and the result (the MoE consumes the full-width tensor; the
+        # trailing reduce-scatter is unchanged) are identical to the
+        # self-sufficient form; only the operator (quantize + gather + dequant
+        # vs all-gather) and the input dtype (int8 + a per-token scale vs the
+        # compute dtype) differ, halving the MoE-input traffic.
         token_sharded = forward_batch is not None and getattr(
             forward_batch, "npu_dsa_cp_token_sharded", False
         )
@@ -1110,13 +1115,21 @@ class DeepseekV2MoE(nn.Module):
 
         dsa_cp_set_current_token_sharded(token_sharded)
         if token_sharded:
+            import torch_npu
+
             group = get_parallel().attn_tp_group
-            hidden_full = hidden_states.new_empty(
-                (hidden_states.shape[0] * group.world_size,)
-                + hidden_states.shape[1:]
+            x_q, x_scale = torch_npu.npu_dynamic_quant(
+                hidden_states, dst_type=torch.int8
             )
-            group.all_gather_into_tensor(hidden_full, hidden_states)
-            hidden_states = hidden_full
+            x_q_full = x_q.new_empty(
+                (x_q.shape[0] * group.world_size,) + x_q.shape[1:]
+            )
+            group.all_gather_into_tensor(x_q_full, x_q)
+            x_scale_full = x_scale.new_empty((x_scale.shape[0] * group.world_size,))
+            group.all_gather_into_tensor(x_scale_full, x_scale)
+            hidden_states = x_q_full.to(hidden_states.dtype) * x_scale_full.unsqueeze(
+                -1
+            ).to(hidden_states.dtype)
 
         num_token_non_padded = (
             forward_batch.moe_num_token_non_padded()
@@ -1483,7 +1496,6 @@ class DeepseekV2MoE(nn.Module):
             def _post_combine_hook(
                 dispatcher: BaseDispatcher, hidden_states: torch.Tensor
             ):
-                nonlocal shared_output
                 torch.cuda.current_stream().wait_stream(self.alt_stream)
                 post_combine_hook_handle.remove()
 
