@@ -45,7 +45,7 @@ not a claim that all #2–#7 feature paths support EP.
 | reserve | 60 | remaining global allowance; no automatic environment changes |
 | total | 960 | 16 hours including pinning, startup and cleanup |
 
-Unused block time carries forward, bounded by the global deadline. Cases outside
+Block durations are planning hints after the November 16 scheduler repair; only case/phase/global deadlines terminate requested work. Cases outside
 the remaining budget are recorded as skipped, not passed. Individual accuracy
 has a 60-minute cap and speed a separate 20-minute cap. Request timeout is 1800 s;
 all benchmark/startup calls remain bounded by case and global deadlines.
@@ -102,3 +102,10 @@ namespace. Run with `--no-fetch --source-prefix refs/remotes/<session>/` so the
 original repository branches are not switched or overwritten. The normal
 baseline-ref name is resolved in the same isolated namespace. Bundle verification
 fails explicitly if the container repository does not contain the prerequisite.
+
+## November 16 targeted rerun
+
+Use [FOLLOWUP_20261116.md](FOLLOWUP_20261116.md) and `run_followup_9h.sh` for
+the corrected 9-hour rerun, 90-minute accuracy caps, best-TTFT candidate and
+closer historical-feature ablation. The breakable case now uses a dedicated
+metadata-fix branch; the validated eager baseline SHA stays unchanged.

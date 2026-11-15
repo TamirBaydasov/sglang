@@ -70,7 +70,7 @@ def register_cases():
         ),
         (
             "29-tp-breakable",
-            "npu-w4a8-tp-bias-fix",
+            "npu-dcp-breakable-metadata-fix",
             common,
             historical + ("--cuda-graph-backend-prefill", "breakable"),
         ),
@@ -87,6 +87,44 @@ def register_cases():
             ("--prefill-max-requests", "1"),
         ),
     ]
+    best = dict(full, **common)
+    best.update(
+        {
+            "SGLANG_ENABLE_CHAT_ENCODE_POOL": "False",
+            "SGLANG_CHAT_ENCODE_MEMO": "False",
+            "SGLANG_CHAT_ENCODE_RAW": "False",
+            "SGLANG_NPU_SFA_KV_8BIT": "False",
+            "SGLANG_NPU_SFA_KV_QUANT_READ": "False",
+            "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH": "False",
+            "SGLANG_NPU_STREAM_Q_B": "False",
+            "SGLANG_NPU_STREAM_W_KC": "False",
+            "SGLANG_NPU_STREAM_W_VC": "False",
+            "SGLANG_NPU_STREAM_O_PROJ": "True",
+        }
+    )
+    historical_features = dict(full, **common)
+    historical_features.update(
+        {
+            "SGLANG_NPU_STREAM_Q_B": "False",
+            "SGLANG_NPU_STREAM_W_KC": "False",
+            "SGLANG_NPU_STREAM_W_VC": "False",
+        }
+    )
+    definitions += [
+        (
+            "32-tp-8k-control",
+            "npu-w4a8-tp-bias-fix",
+            {},
+            ("--prefill-max-requests", "1"),
+        ),
+        ("33-best-ttft", "npu-bde-combined-v2", best, historical),
+        (
+            "34-historical-feature-match",
+            "npu-bde-combined-v2",
+            historical_features,
+            historical,
+        ),
+    ]
     for name, ref, env, extra in definitions:
         table[name] = (
             name,
@@ -96,7 +134,7 @@ def register_cases():
             extra,
         )
         h.CASE_PROFILES[name] = {"decode_graph": "off"}
-        if name[:2] in ("24", "25", "26", "27", "28", "29"):
+        if name[:2] in ("24", "25", "26", "27", "28", "29", "33", "34"):
             h.CASE_PROFILES[name].update(
                 chunk=32768, context=1048576, memfrac=0.8, allow_server_queueing=True
             )
@@ -114,6 +152,12 @@ def register_cases():
         "chunk": 8192,
         "max_prefill_tokens": 8192,
     }
+    h.CASE_PROFILES["32-tp-8k-control"] = {
+        "chunk": 8192,
+        "max_prefill_tokens": 8192,
+        "decode_graph": "off",
+    }
+    h.MATCHED_BASELINES["05-pr-ts-token-sharded"] = "32-tp-8k-control"
     row = table["05-pr-ts-token-sharded"]
     table[row[0]] = (*row[:4], ("--prefill-max-requests", "1"))
     row = table["06-pr-moe-int8"]
@@ -129,6 +173,8 @@ def register_cases():
                 "27-combined-ep",
                 "28-combined-megamoe",
                 "29-tp-breakable",
+                "33-best-ttft",
+                "34-historical-feature-match",
             )
         }
     )
@@ -163,7 +209,14 @@ def select_tp(rows):
     choices = [
         r
         for r in rows
-        if r["case"] in ("25-combined-full", "26-combined-no-sfa") and quality_ok(r)
+        if r["case"]
+        in (
+            "25-combined-full",
+            "26-combined-no-sfa",
+            "33-best-ttft",
+            "34-historical-feature-match",
+        )
+        and quality_ok(r)
     ]
     return min(choices, key=mean_ttft) if choices else None
 
@@ -180,6 +233,8 @@ def target_report(output, rows, attempts):
     for name, target in [
         ("25-combined-full", 24),
         ("26-combined-no-sfa", 24),
+        ("33-best-ttft", 24),
+        ("34-historical-feature-match", 24),
         ("27-combined-ep", 20),
         ("28-combined-megamoe", 20),
     ]:
@@ -256,9 +311,36 @@ def task_plan():
     }
 
 
+def followup_plan():
+    # One global deadline: no intermediate block may steal a later case's accuracy.
+    return {
+        "followup": [
+            ("00-baseline", "all", 110),
+            ("18-baseline-prefill1", "all", 110),
+            ("24-historical-control", "all", 110),
+            ("30-sfa-f1-probe", "accuracy", 15),
+            ("04-pr-f-sfa-kv-8bit", "all", 110),
+            ("06-pr-moe-int8", "all", 110),
+            ("33-best-ttft", "all", 110),
+            ("34-historical-feature-match", "all", 110),
+            ("25-combined-full", "all", 110),
+            ("26-combined-no-sfa", "all", 110),
+            ("27-combined-ep", "all", 110),
+            ("28-combined-megamoe", "all", 110),
+            ("29-tp-breakable", "smoke", 15),
+            ("32-tp-8k-control", "all", 110),
+        ]
+    }
+
+
 def run(argv=None):
     outer = argparse.ArgumentParser(add_help=False)
     outer.add_argument("--only", default="")
+    outer.add_argument(
+        "--followup",
+        action="store_true",
+        help="Target incomplete work under the global deadline, without block clipping",
+    )
     outer.add_argument(
         "--source-prefix",
         default="",
@@ -298,22 +380,23 @@ def run(argv=None):
             (n, source_ref(r), e, note, extra) for n, r, e, note, extra in h.CASES
         ]
     table = {case[0]: case for case in h.CASES}
-    if args.hours > 16:
-        raise ValueError("session16 has a 16-hour maximum")
+    maximum_hours = 9 if special.followup else 16
+    if args.hours > maximum_hours:
+        raise ValueError(f"session has a {maximum_hours}-hour maximum")
     only = set(special.only.split(",")) if special.only else set()
     if only - set(table):
         raise ValueError("unknown --only case")
     if special.resume:
         args.reuse_results.append(str(Path(special.resume) / "results.json"))
-    plan = task_plan()
+    plan = followup_plan() if special.followup else task_plan()
     if only:
         plan = {"combined": [(name, "all", 80) for name in sorted(only)]}
     if args.dry_run:
         print(
             json.dumps(
                 {
-                    "block_minutes": dict(BLOCKS),
-                    "total_minutes": sum(x[1] for x in BLOCKS),
+                    "block_minutes": {} if special.followup else dict(BLOCKS),
+                    "total_minutes": args.hours * 60,
                     "tasks": plan,
                     "accuracy_minutes": args.accuracy_minutes,
                     "speed_minutes": args.speed_minutes,
@@ -397,6 +480,8 @@ def run(argv=None):
             )
             checkpoint()
             return None
+        if phase == "all":
+            cap = max(cap, (args.accuracy_minutes or 60) + (args.speed_minutes or 20))
         cap = min(cap, left / 60)
         child_dir = output / "runs" / (f"{len(attempts):02d}-" + name + suffix)
         command = list(common)
@@ -411,9 +496,9 @@ def run(argv=None):
             "--case-minutes",
             str(cap),
             "--accuracy-minutes",
-            "60",
+            str(args.accuracy_minutes or 60),
             "--speed-minutes",
-            "20",
+            str(args.speed_minutes or 20),
             "--no-fetch",
             "--baseline-ref",
             base_ref,
@@ -447,6 +532,8 @@ def run(argv=None):
         else:
             result = json.loads(result_path.read_text())[0]
             reused.append(str(result_path))
+        result["comparison_baseline"] = h.MATCHED_BASELINES.get(name)
+        result["comparison_reference"] = name in set(h.MATCHED_BASELINES.values())
         result["session_name"] = name + suffix
         result["session_command"] = command
         attempts.append(copy.deepcopy(result))
@@ -473,13 +560,20 @@ def run(argv=None):
             raise RuntimeError("cleanup failed; session halted")
         return result
 
-    carry = 0.0
     try:
-        for block, minutes in BLOCKS:
+        schedule = (
+            [("combined", args.hours * 60)]
+            if only
+            else (
+                [("followup", args.hours * 60), ("confirmation", 0)]
+                if special.followup
+                else BLOCKS
+            )
+        )
+        for block, minutes in schedule:
             if only and block != "combined":
                 continue
-            start = time.monotonic()
-            block_deadline = min(deadline, start + minutes * 60 + carry)
+            block_deadline = deadline
             tasks = list(plan.get(block, []))
             if block == "confirmation":
                 best_tp = select_tp(rows)
@@ -513,6 +607,11 @@ def run(argv=None):
                         checkpoint()
                         continue
                     env = table[name][2]
+                    dispatch = env.get("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK")
+                    env.update(table[best["case"]][2])
+                    if dispatch is not None:
+                        env["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = dispatch
+                    h.MATCHED_BASELINES[name] = best["case"]
                     env["SGLANG_NPU_SFA_KV_8BIT"] = table[best["case"]][2].get(
                         "SGLANG_NPU_SFA_KV_8BIT", "False"
                     )
@@ -560,7 +659,6 @@ def run(argv=None):
                 if any(r.get("status") == "interrupted" for r in rows):
                     interrupted = True
                     break
-            carry = max(0.0, block_deadline - time.monotonic())
             if interrupted:
                 break
     except (KeyboardInterrupt, SystemExit):

@@ -113,3 +113,93 @@ def test_offline_session_pins_once_and_uses_qualified_tp_for_ep(tmp_path, monkey
         assert table[name][2]["SGLANG_NPU_DSA_CP_TOKEN_SHARDED"] == "False"
     results = json.loads((out / "results.json").read_text())
     assert any(r["case"].startswith("25-combined-full-repeat-") for r in results)
+
+
+def test_followup_does_not_clip_accuracy_at_the_old_block_boundary(
+    tmp_path, monkeypatch
+):
+    h = session.h
+    monkeypatch.setattr(h, "CASES", copy.deepcopy(h.CASES))
+    monkeypatch.setattr(h, "CASE_PROFILES", {})
+    monkeypatch.setattr(h, "load_gsm8k", lambda *args: [{}] * 64)
+    monkeypatch.setattr(
+        h, "pin_refs", lambda cases, *args: {c[1]: {"commit": "a" * 40} for c in cases}
+    )
+    clock = [1000.0]
+    monkeypatch.setattr(h.time, "monotonic", lambda: clock[0])
+    calls = []
+
+    def main(argv):
+        args = h.parser().parse_args(argv)
+        calls.append(args)
+        if args.cases == "04-pr-f-sfa-kv-8bit":
+            clock[0] += 4 * 3600
+        else:
+            clock[0] += 5
+        n = 4 if args.cases == "30-sfa-f1-probe" else 64
+        attempt = {
+            "status": "ok",
+            "comparison_config": {"same": True},
+            "gsm8k": {
+                "requested": n,
+                "completed": n,
+                "correct": n,
+                "details": [{"correct": True} for _ in range(n)],
+            },
+            "speed": {
+                "status": "ok",
+                "metrics": {"TTFT avg": 20000, "TTFT P90": 30000},
+            },
+        }
+        phases = {
+            k: {"status": "ok", "attempts": [copy.deepcopy(attempt)]}
+            for k in (["accuracy", "speed"] if args.round == "all" else [args.round])
+        }
+        out = Path(args.output)
+        out.mkdir(parents=True)
+        (out / "results.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "case": args.cases,
+                        "commit": "a" * 40,
+                        "status": "ok",
+                        "phases": phases,
+                    }
+                ]
+            )
+        )
+        return 0
+
+    monkeypatch.setattr(h, "main", main)
+    assert (
+        session.run(
+            [
+                "--followup",
+                "--hours",
+                "9",
+                "--accuracy-minutes",
+                "90",
+                "--speed-minutes",
+                "20",
+                "--gsm8k",
+                str(tmp_path / "data"),
+                "--output",
+                str(tmp_path / "followup"),
+                "--baseline-ref",
+                "npu-w4a8-tp-bias-fix",
+            ]
+        )
+        == 0
+    )
+    moe = next(a for a in calls if a.cases == "06-pr-moe-int8")
+    assert moe.accuracy_minutes == 90
+    assert moe.case_minutes == 110
+    assert any(a.cases == "33-best-ttft" for a in calls)
+    assert any(a.cases == "34-historical-feature-match" for a in calls)
+    table = {c[0]: c for c in h.CASES}
+    best = table["33-best-ttft"][2]
+    assert best["SGLANG_NPU_INDEXER_INT8"] == "True"
+    assert best["SGLANG_NPU_SFA_KV_8BIT"] == "False"
+    assert best["SGLANG_NPU_STREAM_Q_B"] == "False"
+    assert best["SGLANG_ENABLE_CHAT_ENCODE_POOL"] == "False"

@@ -401,3 +401,11 @@ budgets, validated evidence reuse, combined TP/EP/MegaMoE candidates, and the
 TP breakable-prefill diagnostic. See [SESSION16.md](SESSION16.md) for recipes,
 source-port provenance, case budgets and acceptance criteria. The older
 `run_16h.sh` remains the previous fixed case sweep.
+
+### November 16 follow-up
+
+`run_followup_9h.sh` targets incomplete work from the November 15 session with
+independent 90/20-minute accuracy/speed caps and a 9-hour global deadline.
+See [FOLLOWUP_20261116.md](FOLLOWUP_20261116.md) for the confirmed failures,
+best-TTFT candidate and why the historical 24-second run was not a matched
+plain-baseline comparison.

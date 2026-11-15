@@ -1568,3 +1568,68 @@ def test_historical_queueing_is_explicit_and_capacity_uses_admission_width():
     assert result["queueing_allowed"]
     assert result["client_concurrency"] == 16
     assert result["server_running_limit"] == 1
+
+
+def test_historical_control_reports_itself_as_reference(tmp_path):
+    records = [
+        {
+            "case": "24-historical-control",
+            "status": "ok",
+            "phases": {
+                "speed": {
+                    "status": "ok",
+                    "attempts": [
+                        {
+                            "comparison_config": {"width": 1},
+                            "speed": {
+                                "status": "ok",
+                                "metrics": {"TTFT avg": 35000, "TTFT P90": 59000},
+                            },
+                        }
+                    ],
+                }
+            },
+        }
+    ]
+    h.summarize(records, tmp_path, SimpleNamespace())
+    row = next(
+        line
+        for line in (tmp_path / "SUMMARY.md").read_text().splitlines()
+        if line.startswith("| 24-historical-control |")
+    )
+    assert "| reference |" in row
+    assert "configuration mismatch" not in row
+
+
+def test_recorded_comparison_baseline_survives_offline_reporting(tmp_path):
+    def record(name, value, reference=None):
+        return {
+            "case": name,
+            "comparison_baseline": reference,
+            "phases": {
+                "speed": {
+                    "status": "ok",
+                    "attempts": [
+                        {
+                            "comparison_config": {"same": True},
+                            "speed": {
+                                "status": "ok",
+                                "metrics": {"TTFT avg": value, "TTFT P90": value},
+                            },
+                        }
+                    ],
+                }
+            },
+        }
+
+    h.summarize(
+        [record("33-best-ttft", 24000), record("custom-repeat", 12000, "33-best-ttft")],
+        tmp_path,
+        SimpleNamespace(),
+    )
+    row = next(
+        line
+        for line in (tmp_path / "SUMMARY.md").read_text().splitlines()
+        if line.startswith("| custom-repeat |")
+    )
+    assert "2.000x" in row and "vs 33-best-ttft" in row

@@ -2167,6 +2167,8 @@ def backend_comparison_matches(case, candidate, baseline):
         "14-baseline-ep": "deepep",
         "09-pr1-megamoe": "ascend_fuseep",
         "16-megamoe-8k": "ascend_fuseep",
+        "27-combined-ep": "deepep",
+        "28-combined-megamoe": "ascend_fuseep",
     }
     if case not in expected or not candidate or not baseline:
         return False
@@ -2201,7 +2203,13 @@ def summarize(records, output, args):
     base = next(
         (
             r
-            for name in ("00-baseline", "15-baseline-8k", "18-baseline-prefill1")
+            for name in (
+                "00-baseline",
+                "24-historical-control",
+                "15-baseline-8k",
+                "18-baseline-prefill1",
+                "32-tp-8k-control",
+            )
             for r in records
             if r["case"] == name
         ),
@@ -2244,12 +2252,23 @@ def summarize(records, output, args):
 
         comparison_base = (
             record
-            if record["case"] in ("15-baseline-8k", "18-baseline-prefill1")
+            if record.get("comparison_reference")
+            or record["case"]
+            in (
+                "15-baseline-8k",
+                "18-baseline-prefill1",
+                "24-historical-control",
+                "32-tp-8k-control",
+            )
             else next(
                 (
                     r
                     for r in records
-                    if r["case"] == MATCHED_BASELINES.get(record["case"])
+                    if r["case"]
+                    == (
+                        record.get("comparison_baseline")
+                        or MATCHED_BASELINES.get(record["case"])
+                    )
                 ),
                 base,
             )
@@ -2287,7 +2306,11 @@ def summarize(records, output, args):
         ):
             ratio = f"{float(reference_metrics['TTFT avg']) / float(metrics['TTFT avg']):.3f}x"
             if backend_comparison:
-                ratio += " (backend comparison; single run)"
+                ratio += (
+                    " (compatible subset/backend comparison; single run)"
+                    if record["case"] in ("27-combined-ep", "28-combined-megamoe")
+                    else " (backend comparison; single run)"
+                )
             if quality(comparison_base) not in ("threshold met",) or quality(
                 record
             ) not in ("threshold met",):
