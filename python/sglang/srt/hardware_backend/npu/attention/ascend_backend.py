@@ -18,6 +18,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
 )
 from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
+    forward_dcp_packed_sparse_attention,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
@@ -56,6 +57,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     next_power_of_2,
 )
+from sglang.srt.utils.common import print_info_once
 
 # Read once, as dsa_npu_indexer does: the indexer owns this switch, and the
 # quant-indexer pre-plan below has to agree with it.
@@ -329,10 +331,8 @@ def _cp_allgather_and_save_kv_npu(
 
 
 _MISSING_SPARSE_FA_LSE = (
-    "DCP decode on Ascend needs torch.ops.npu.sgl_sparse_flash_attention, "
-    "which ships in sgl-kernel-npu and is not part of CANN. It is not "
-    "registered in this install. Install or rebuild sgl-kernel-npu, or run with "
-    "--dcp-size 1."
+    "DCP decode requires npu_sparse_flash_attention with the return_softmax_lse "
+    "argument. Check the TorchNPU operator schema in the serving environment."
 )
 
 
@@ -498,12 +498,15 @@ class AscendAttnBackend(AttentionBackend):
 
         self.attn_cp_size = get_parallel().attn_cp_size
 
-        # sgl-kernel-npu's operator: CANN refuses return_softmax_lse under
-        # PA_BSND, so DCP decode has no other LSE source. Checked at startup so a
-        # stock install names the missing package rather than an AttributeError.
-        self.has_sparse_fa_lse = hasattr(torch.ops.npu, "sgl_sparse_flash_attention")
-        if self.use_mla and get_parallel().dcp_enabled and not self.has_sparse_fa_lse:
-            # Not a raise: a prefill-only PD node never reaches DCP decode.
+        operator = getattr(torch.ops.npu, "npu_sparse_flash_attention", None)
+        self.has_sparse_fa_lse = operator is not None and any(
+            any(
+                arg.name == "return_softmax_lse"
+                for arg in getattr(operator, name)._schema.arguments
+            )
+            for name in operator.overloads()
+        )
+        if self.use_dsa and get_parallel().dcp_enabled and not self.has_sparse_fa_lse:
             logger.warning(_MISSING_SPARSE_FA_LSE)
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
@@ -861,6 +864,11 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        if self.use_dsa and get_parallel().dcp_enabled:
+            raise RuntimeError(
+                "DCP sparse attention LSE requires eager execution; "
+                "set --cuda-graph-backend-decode disabled"
+            )
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
@@ -1580,6 +1588,163 @@ class AscendAttnBackend(AttentionBackend):
         )
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _sfa_packed_kv(self) -> bool:
+        """Whether the serving pool stores the SFA latent KV packed 8-bit.
+
+        True under SGLANG_NPU_SFA_KV_8BIT (the bf16-compute flag, int8 on
+        A2/A3) and under the in-tree packed-fp8 DSA mode. getattr, because a
+        wrapper pool (SWA, hybrid) may not know the attribute; declining there
+        is the bf16 behaviour.
+        """
+        return getattr(self.token_to_kv_pool, "sfa_packed_kv_storage", False)
+
+    def _sfa_quant_read_enabled(self) -> bool:
+        """Whether the DCP packed read should take the F2 in-kernel dequant
+        (the quant operator reads the raw int8 rows) rather than the F1
+        dequant-on-read. Gated on the flag, the pool's packed SFA storage, and
+        the INT8 store dtype (the in-tree packed-FP8 mode's rows hold f8 latent
+        bytes, which this read and the quant call's int8 view must not touch).
+        All three are per-process static, so the model side (which decides to
+        gather raw rows) and the backend side cannot disagree.
+        """
+        pool = self.token_to_kv_pool
+        return (
+            envs.SGLANG_NPU_SFA_KV_QUANT_READ.get()
+            and getattr(pool, "sfa_packed_kv_storage", False)
+            and getattr(pool, "store_dtype", None) == torch.int8
+        )
+
+    def _f2_quant_sfa_api_ok(self):
+        """Does the box's npu_kv_quant_sparse_flash_attention take the F2 form?
+
+        F2 calls the operator with a TND non-paged key of int8 latent rows plus
+        explicit per-128-tile dequant scales and a separate bf16 key_rope --
+        none of which the in-tree FP8 call site ever passes (its rope comes from
+        the paged row, its scales from the repo). The exact INT8 conventions of
+        the local CANN build are therefore checked against the installed op
+        schema once, at first use, rather than assumed: a missing argument is a
+        process-wide, logged decline to the F1 dequant read, not a per-call
+        crash deep in a forward.
+        """
+        cached = getattr(self, "_f2_quant_sfa_api", None)
+        if cached is None:
+            ok, msg = True, ""
+            try:
+                names = {
+                    arg.name
+                    for arg in torch.ops.npu.npu_kv_quant_sparse_flash_attention.default._schema.arguments
+                }
+            except Exception as e:  # op not registered in this torch_npu
+                ok, msg = False, f"op schema unreadable ({type(e).__name__})"
+            else:
+                missing = [
+                    name
+                    for name in (
+                        "key_rope",
+                        "key_dequant_scale",
+                        "value_dequant_scale",
+                    )
+                    if name not in names
+                ]
+                if missing:
+                    ok, msg = False, "op is missing " + ", ".join(missing)
+            self._f2_quant_sfa_api = (ok, msg)
+        return self._f2_quant_sfa_api
+
+    def _dcp_packed_quant_sfa(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        rows: torch.Tensor,
+        topk_indices: torch.Tensor,
+        layer: RadixAttention,
+        actual_seq_qlen: torch.Tensor,
+        seq_lengths_kv: torch.Tensor,
+        sparse_mode: int,
+    ):
+        """F2: the DCP packed read through the quant operator.
+
+        ``rows`` is the raw uint8 ``[n, 1, 656]`` row buffer the model gathered
+        (one opaque key); the operator gets the int8 latent, the per-128-tile
+        fp32 scale and the bf16 rope, viewed out of it and dequantised in-kernel.
+        Returns the attention output on success; on any CANN disagreement (the
+        schema probe above, or a runtime refusal of an argument the local build
+        does not take) it returns the dequantised bf16 (nope, rope) halves
+        instead, and the caller feeds them to the plain sparse flash attention
+        -- the F1 behaviour, from the F2 buffer, for the rest of the process.
+        """
+        ok, msg = self._f2_quant_sfa_api_ok()
+        pool = self.token_to_kv_pool
+        if not ok:
+            print_info_once(
+                "F2 KV_QUANT_SFA read declined on this box: "
+                f"{msg}. The DCP packed read dequantises the raw rows "
+                "to bf16 and uses the plain sparse flash attention (F1)."
+            )
+            return self._f2_dequant_rows(rows)
+        latent, rope, scale = pool.view_packed_sfa_rows(rows)
+        # The views out of the 656-wide row are strided; the operator's TND
+        # contract (the gathered bf16 path passes contiguous [T, 1, D] keys,
+        # and the in-tree call contiguous keys) is met with a local copy --
+        # HBM traffic on this rank, not HCCS, so the F2 wire saving stands.
+        key = latent.unsqueeze(1).contiguous()
+        key_rope = rope.unsqueeze(1).contiguous()
+        key_scale = scale.contiguous()
+        try:
+            return torch_npu.npu_kv_quant_sparse_flash_attention(
+                query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
+                key=key,
+                value=key,
+                key_rope=key_rope,
+                sparse_indices=topk_indices,
+                scale_value=layer.scaling,
+                key_dequant_scale=key_scale,
+                value_dequant_scale=key_scale,
+                # 2 is the in-tree FP8 mode; INT8 is the other quant this op
+                # documents (the A2/A3-only one, which is why the pool stores
+                # int8 here). If the box numbers them differently the call
+                # below fails and the process falls back, loudly.
+                key_quant_mode=1,
+                value_quant_mode=1,
+                # Explicit scales come straight from the rows, not the repo.
+                quant_scale_repo_mode=0,
+                actual_seq_lengths_query=actual_seq_qlen.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_kv=seq_lengths_kv.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                # Non-paged TND, like the gathered bf16 path: no block_table
+                # (omitted, not None -- see that call above). The same
+                # sparse_mode/seq_lengths_kv the FP8 path (this same operator)
+                # uses for the DCP extend, so F2 and the verified FP8 read agree.
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="TND",
+                sparse_mode=sparse_mode,
+                attention_mode=2,
+                tile_size=128,
+                rope_head_dim=self.qk_rope_head_dim,
+            )
+        except Exception as e:
+            print_info_once(
+                "F2 KV_QUANT_SFA read failed on this box's CANN "
+                f"({type(e).__name__}: {e}); the DCP packed read "
+                "falls back to the F1 dequant-on-read for this process."
+            )
+            return self._f2_dequant_rows(rows)
+
+    def _f2_dequant_rows(self, rows: torch.Tensor):
+        """The F1 (nope, rope) halves of the F2 rows (see _dcp_packed_quant_sfa)."""
+        dequant = getattr(self.token_to_kv_pool, "dequant_packed_sfa_rows", None)
+        if dequant is None:
+            raise RuntimeError(
+                "F2 fallback: the pool stores the packed rows but has no "
+                "dequant_packed_sfa_rows; a wrapper pool in front of the "
+                "packed NPU pool must forward it."
+            )
+        return dequant(rows)
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1661,6 +1826,17 @@ class AscendAttnBackend(AttentionBackend):
             and is_dsa_enable_prefill_cp()
             and forward_batch.attn_cp_metadata is not None
         ):
+            if self._sfa_packed_kv():
+                # The CP-strategy balance read is a paged bf16 read of the raw
+                # pool; it cannot address a packed 8-bit row. F1's temporary
+                # read covers the DCP gather paths; the paged quant read lands
+                # in F2.
+                raise NotImplementedError(
+                    "SGLANG_NPU_SFA_KV_8BIT with the CP-strategy balance "
+                    "attention read: the paged read of packed rows is the F2 "
+                    "quant sparse-attention path; F1's temporary read covers "
+                    "the DCP decode/extend gathers only."
+                )
             attn_out = self.do_cp_balance_attn(
                 q_nope,
                 k_nope,
@@ -1697,6 +1873,21 @@ class AscendAttnBackend(AttentionBackend):
             if dcp_decode:
                 # #37787's decode reads its own rank-local metadata, so it
                 # returns before the branches below.
+                if self._sfa_packed_kv():
+                    if not self.has_sparse_fa_lse:
+                        raise RuntimeError(_MISSING_SPARSE_FA_LSE)
+                    return forward_dcp_packed_sparse_attention(
+                        q_nope=q_nope,
+                        q_rope=q_pe,
+                        topk_indices=topk_indices,
+                        forward_metadata=self.forward_metadata,
+                        forward_batch=forward_batch,
+                        page_size=k_nope.shape[1],
+                        read_rows=lambda rows: self.token_to_kv_pool.get_mla_kv_buffer(
+                            layer, rows
+                        ),
+                        scaling=layer.scaling,
+                    )
                 if self.kv_cache_dtype == torch.float8_e4m3fn:
                     raise NotImplementedError(
                         "FP8 KV cache with decode context parallelism is not "
@@ -1747,6 +1938,12 @@ class AscendAttnBackend(AttentionBackend):
                 # layout_kv must equal layout_query unless it is PA_BSND.
                 layout_kv = "TND"
             else:
+                assert not getattr(self.token_to_kv_pool, "sfa_kv_store_8bit", False), (
+                    "packed 8-bit SFA KV reached the unsharded paged read: "
+                    "F1's temporary read covers the DCP paths only. The pool "
+                    "refuses the flag at init without DCP, so this is a wiring "
+                    "error -- the paged quant read lands in F2."
+                )
                 block_table = self.forward_metadata.block_tables
                 seq_lengths_kv = actual_seq_lengths_kv
                 sparse_mode = 3
@@ -1761,13 +1958,35 @@ class AscendAttnBackend(AttentionBackend):
                         )
 
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
+            if dcp_extend and self._sfa_quant_read_enabled():
+                # F2: the model gathered the raw 656 B int8 SFA rows (one opaque
+                # uint8 key, key_rope None), so the dequant is fused into the
+                # quant operator instead of the F1 dequant-on-read's bf16 halves.
+                # _dcp_packed_quant_sfa returns the attention output on success,
+                # or the F1 (nope, rope) halves if this box's CANN op does not
+                # take the INT8 form -- in which case fall through to the plain
+                # bf16 read below with those halves.
+                f2_result = self._dcp_packed_quant_sfa(
+                    q_nope,
+                    q_pe,
+                    key_nope,
+                    topk_indices,
+                    layer,
+                    actual_seq_qlen,
+                    seq_lengths_kv,
+                    sparse_mode,
+                )
+                if isinstance(f2_result, tuple):
+                    key_nope, key_rope = f2_result
+                else:
+                    return f2_result
             if self.kv_cache_dtype == torch.float8_e4m3fn:
                 # DCP decode still has no quant form: its merge is LSE-weighted
                 # and the operator P3b vendored for it is bf16-only. Extend has
                 # no merge, so it composes -- see below.
                 assert not dcp_decode, (
                     "FP8 KV cache with DCP decode is not supported: the merge "
-                    "needs a softmax LSE and npu_sparse_flash_attention_lse is "
+                    "needs a softmax LSE and the sparse attention LSE path is "
                     "bf16-only."
                 )
                 assert q_nope.dtype == q_pe.dtype == torch.bfloat16

@@ -378,16 +378,27 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
+                sfa_packed_kv_cache_row_bytes,
             )
 
-            cell_size = (
-                calculate_mla_kv_cache_dim(
-                    model_config=model_config,
-                    kv_cache_dtype=kv_cache_dtype,
-                )
-                * effective_num_layers
-                * kv_size
+            packed_row_bytes = sfa_packed_kv_cache_row_bytes(
+                model_config=model_config, kv_cache_dtype=kv_cache_dtype
             )
+            if packed_row_bytes is not None:
+                # The packed 8-bit SFA row is already in bytes (one-byte
+                # storage): no kv_size factor. Sizing from the bf16 dim would
+                # undercount the pool by ~44% and waste the capacity the flag
+                # exists to buy.
+                cell_size = packed_row_bytes * effective_num_layers
+            else:
+                cell_size = (
+                    calculate_mla_kv_cache_dim(
+                        model_config=model_config,
+                        kv_cache_dtype=kv_cache_dtype,
+                    )
+                    * effective_num_layers
+                    * kv_size
+                )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16

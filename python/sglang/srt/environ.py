@@ -1218,6 +1218,9 @@ class Envs:
     # DSA prefill: each attention-TP rank scores only its shard of the indexer
     # queries, and the top-k is all-gathered.
     SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
+    SGLANG_NPU_SFA_KV_8BIT = EnvBool(False)
+    # F2 (under SGLANG_NPU_SFA_KV_8BIT): fuse the dequant into the quant
+    SGLANG_NPU_SFA_KV_QUANT_READ = EnvBool(True)
     # DSA prefill: each attention-TP rank computes every head for its slice of
     # the tokens. Consumes no ranks, so it composes with DCP.
     SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD = EnvBool(True)

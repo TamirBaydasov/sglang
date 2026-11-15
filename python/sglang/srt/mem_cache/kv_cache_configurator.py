@@ -2144,6 +2144,12 @@ class KVCacheConfigurator:
         use_dsa_fp8_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
+        # The 8-bit SFA flag stores the same packed row from a bf16 compute
+        # dtype; the row width it needs here is in store elements (one byte
+        # each), which is the byte count itself. None with the flag off.
+        sfa_packed_row = sfa_packed_kv_cache_row_bytes(
+            model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
+        )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=get_schedule().page_size,
@@ -2159,7 +2165,7 @@ class KVCacheConfigurator:
                     model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
                 )
                 if use_dsa_fp8_kv_cache_storage
-                else None
+                else sfa_packed_row
             ),
             is_draft_worker=self.is_draft_worker,
             layer_num=self.layer_info.num_effective_layers,
@@ -3315,6 +3321,31 @@ class KVCacheConfigurator:
             + replayssm_fixed_bytes
         ) / (1 << 30)
         return total_rest_memory - mamba_state_memory
+
+
+def sfa_packed_kv_cache_row_bytes(
+    *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
+) -> Optional[int]:
+    """One packed 8-bit SFA row in BYTES, or None when the switch is off.
+
+    SGLANG_NPU_SFA_KV_8BIT stores the DSA latent KV at latent 8-bit + rope BF16
+    + per-128-tile FP32 scales (656 B on a 512-rank / 64-rope MLA model vs 1152
+    B bf16) regardless of --kv-cache-dtype, which stays the compute dtype. The
+    storage is one byte per element, so the byte count equals the element count
+    the pool asserts: kv_lora_rank + qk_rope_head_dim * 2 + kv_lora_rank // 128 *
+    4. A mismatch between this and the pool's row width surfaces as the pool-init
+    assert, not as a silent sizing error.
+    """
+    if not (
+        envs.SGLANG_NPU_SFA_KV_8BIT.get()
+        and is_deepseek_dsa(model_config.hf_config)
+    ):
+        return None
+    return (
+        model_config.kv_lora_rank
+        + model_config.qk_rope_head_dim * 2
+        + model_config.kv_lora_rank // DSATokenToKVPool.quant_block_size * 4
+    )
 
 
 def calculate_mla_kv_cache_dim(

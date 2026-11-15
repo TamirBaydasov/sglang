@@ -397,7 +397,22 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         return cos, sin
 
     def get_kv_cache_and_cache_idx(self, forward_batch):
-        k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.layer_id)
+        pool = get_token_to_kv_pool()
+        if getattr(pool, "sfa_packed_kv_storage", False):
+            # The prolog/absorb vendor ops write the KV pool at the row widths
+            # they are tiled for (bf16, or the A5 packed-fp8 mode); none can
+            # address the 656 B packed row of the bf16-compute 8-bit SFA flag,
+            # and writing bf16 into it would corrupt the pool silently. This
+            # path is not on the grid (SGLANG_NPU_USE_MLAPO is off); refuse
+            # loudly until the packed prolog path lands with F2.
+            raise RuntimeError(
+                "MLA preprocess (SGLANG_NPU_USE_MLAPO) writes the KV pool "
+                "directly with a vendor op that cannot address the packed "
+                "8-bit SFA row (SGLANG_NPU_SFA_KV_8BIT); run with "
+                "SGLANG_NPU_USE_MLAPO=0 until the packed prolog path lands "
+                "in F2."
+            )
+        k_cache, v_cache = pool.get_kv_buffer(self.layer_id)
         slot_mapping = forward_batch.out_cache_loc.to(dtype=torch.int32)
         return k_cache, v_cache, slot_mapping
 
