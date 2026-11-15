@@ -393,3 +393,11 @@ requires all 16 measured requests to succeed with valid timings and matching
 configuration. Failed or incomplete cases remain recorded and return nonzero.
 The sparse LSE eager path and the other repaired serving paths still require
 A3 validation. Missing prerequisites are reported as failures, not skipped.
+
+### November 15 session
+
+Use `run_16h_session.sh` for the current 16-hour follow-up, independent phase
+budgets, validated evidence reuse, combined TP/EP/MegaMoE candidates, and the
+TP breakable-prefill diagnostic. See [SESSION16.md](SESSION16.md) for recipes,
+source-port provenance, case budgets and acceptance criteria. The older
+`run_16h.sh` remains the previous fixed case sweep.

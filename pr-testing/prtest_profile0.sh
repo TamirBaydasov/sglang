@@ -214,7 +214,7 @@ BENCH_CC=16
 for ((i=0; i<${#BENCH[@]}; i++)); do
   if [ "${BENCH[$i]}" = "--concurrency" ]; then BENCH_CC="${BENCH[$((i+1))]}"; fi
 done
-if [[ "${SMAX}" =~ ^[0-9]+$ ]] && [[ "${BENCH_CC}" =~ ^[0-9]+$ ]] && (( SMAX < BENCH_CC )); then
+if [[ "${ALLOW_SERVER_QUEUEING:-0}" != "1" ]] && [[ "${SMAX}" =~ ^[0-9]+$ ]] && [[ "${BENCH_CC}" =~ ^[0-9]+$ ]] && (( SMAX < BENCH_CC )); then
   echo "ERROR: max_running_requests=${SMAX} is below client concurrency=${BENCH_CC}" >&2
   exit 2
 fi

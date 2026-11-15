@@ -388,6 +388,8 @@ CASES.extend(
     ]
 )
 
+CASE_PROFILES = {}
+
 MATCHED_BASELINES = {
     "07-combined": "18-baseline-prefill1",
     "03-pr-prefetch-packed": "18-baseline-prefill1",
@@ -437,6 +439,7 @@ def case_settings(args, name):
         result.retry_oom = False
         if result.gsm8k_min_accuracy is None:
             result.gsm8k_min_accuracy = 0.90
+    result.__dict__.update(CASE_PROFILES.get(name, {}))
     return result
 
 
@@ -1196,7 +1199,11 @@ def speed_capacity(server, server_log, args):
     if server.get("disable_radix_cache"):
         raise RuntimeError("prefix-cache benchmark requires radix caching")
     width = server.get("max_running_requests")
-    if not isinstance(width, int) or width < args.requests:
+    if (
+        not isinstance(width, int)
+        or width < 1
+        or (width < args.requests and not getattr(args, "allow_server_queueing", False))
+    ):
         raise RuntimeError(
             f"server max_running_requests={width} is below concurrency {args.requests}"
         )
@@ -1214,7 +1221,8 @@ def speed_capacity(server, server_log, args):
     suffix = (args.length + 1 - cached + page - 1) // page * page
     required = (
         max(
-            (args.length + 1 + page - 1) // page * page, cached + args.requests * suffix
+            (args.length + 1 + page - 1) // page * page,
+            cached + min(width, args.requests) * suffix,
         )
         + 4096
     )
@@ -1222,6 +1230,9 @@ def speed_capacity(server, server_log, args):
         int(value) for value in re.findall(r"max_total_num_tokens=(\d+)", server_log)
     ]
     return {
+        "server_running_limit": width,
+        "client_concurrency": args.requests,
+        "queueing_allowed": getattr(args, "allow_server_queueing", False),
         "actual": min(capacities) if capacities else None,
         "required": required,
         "page_size": page_size,
@@ -1283,6 +1294,9 @@ def run_aisbench(
     env = dict(
         ais_environment(args),
         PROFILE="0",
+        ALLOW_SERVER_QUEUEING="1"
+        if getattr(args, "allow_server_queueing", False)
+        else "0",
         PROFILE_PHASE="",
         PROFILE_DELAY="0",
         PROFILE_STEPS="",
@@ -1419,7 +1433,7 @@ for name in ('npu_sparse_flash_attention', 'npu_kv_quant_sparse_flash_attention'
 schema_errors = {}
 dcp_path = Path('python/sglang/srt/hardware_backend/npu/attention/dsa_dcp.py')
 dcp_source = dcp_path.read_text() if dcp_path.exists() else ''
-requires_lse = 'forward_tnd_sparse_attention(' in backend
+requires_lse = any(name in backend for name in ('forward_tnd_sparse_attention(', 'forward_dcp_packed_sparse_attention('))
 if requires_lse and ops['npu_sparse_flash_attention']:
  packet = torch.ops.npu.npu_sparse_flash_attention
  supported = [{arg.name for arg in getattr(packet, overload)._schema.arguments} for overload in packet.overloads()]
@@ -2656,6 +2670,11 @@ def parser():
     p.add_argument("--gsm8k-min-accuracy", type=float, default=None)
     p.add_argument("--length", type=int, default=1000000)
     p.add_argument("--requests", type=int, default=16)
+    p.add_argument(
+        "--allow-server-queueing",
+        action="store_true",
+        help="Explicit historical recipe: client concurrency may exceed server admission width",
+    )
     p.add_argument("--chunk", type=int, default=16384)
     p.add_argument("--context", type=int, default=1024000)
     p.add_argument("--memfrac", type=float, default=0.70)
@@ -2678,6 +2697,14 @@ def parser():
     p.add_argument("--benchmark-timeout", type=float, default=14400)
     p.add_argument("--hours", type=float, default=None)
     p.add_argument("--case-minutes", type=float, default=60)
+    p.add_argument("--accuracy-minutes", type=float, default=None)
+    p.add_argument("--speed-minutes", type=float, default=None)
+    p.add_argument(
+        "--reuse-results",
+        action="append",
+        default=[],
+        help="Reuse matching validated phase evidence from results.json",
+    )
     p.add_argument("--extra-server-args", default="")
     p.add_argument("--skip-baseline-bracket", action="store_true")
     p.add_argument("--state-dir", default=f"/tmp/prtest-owned-{os.getuid()}")
@@ -2707,6 +2734,13 @@ def parser():
 
 
 def validate_args(args):
+    for key in ("accuracy_minutes", "speed_minutes"):
+        value = getattr(args, key)
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError(f"--{key.replace('_', '-')} must be positive and finite")
+    for source in args.reuse_results:
+        if not Path(source).is_file():
+            raise ValueError("reuse results file missing: " + source)
     if args.gsm8k_replay and args.gsm8k_shots_data:
         raise ValueError("saved-prompt replay cannot change five-shot examples")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]*", args.baseline_ref):
@@ -2859,6 +2893,122 @@ def cleanup_registry(args, registry, log):
         save(args.registry_path, registry)
     require_free_port()
     log("owned processes stopped; port free")
+
+
+def phase_budget_deadline(args, phase, case_deadline):
+    now = time.monotonic()
+    limit = getattr(args, phase + "_minutes", None)
+    deadline = min(case_deadline, now + limit * 60) if limit else case_deadline
+    if phase == "accuracy" and "speed" in phase_names(args) and args.speed_minutes:
+        deadline = min(deadline, case_deadline - args.speed_minutes * 60)
+    return deadline
+
+
+def reusable_phase(candidate, record, phase, args, runtime, argv):
+    if candidate.get("commit") != record.get("commit"):
+        return False
+    old = candidate.get("phases", {}).get(phase, {})
+    if old.get("status") != "ok" or not old.get("attempts"):
+        return False
+    attempt = old["attempts"][-1]
+    if attempt.get("status") != "ok" or attempt.get("argv") != argv:
+        return False
+    previous = attempt.get("runtime", {})
+    for key in ("versions", "model_files_sha256", "operator_schemas"):
+        if not runtime.get(key) or runtime.get(key) != previous.get(key):
+            return False
+
+    def environment(value):
+        return {
+            k: v
+            for k, v in value.get("environment", {}).items()
+            if k not in ("PATH", "PYTHONPATH")
+        }
+
+    if environment(runtime) != environment(previous):
+        return False
+    gsm = attempt.get("gsm8k", {})
+    if phase == "accuracy":
+        details = gsm.get("details", [])
+        threshold = max(0.9, args.gsm8k_min_accuracy or 0)
+        if (
+            gsm.get("dataset_sha256") != args.dataset_sha256
+            or gsm.get("requested") != args.gsm8k_samples
+            or gsm.get("completed") != args.gsm8k_samples
+            or len(details) != args.gsm8k_samples
+            or any(row.get("error") or row.get("truncated") for row in details)
+            or sum(bool(row.get("correct")) for row in details) / len(details)
+            < threshold
+            or gsm.get("parallel") != args.gsm8k_parallel
+            or gsm.get("manifest", {}).get("script_sha256")
+            != hashlib.sha256(
+                Path(__file__).with_name("prtest_gsm8k.py").read_bytes()
+            ).hexdigest()
+        ):
+            return False
+        expected = {
+            "temperature": 0,
+            "top_p": 1,
+            "max_new_tokens": args.gsm8k_max_tokens,
+            "stop": ["Question", "Assistant:", "<|separator|>"],
+        }
+        return (
+            gsm.get("generation") == expected
+            and not args.gsm8k_replay
+            and not args.gsm8k_shots_data
+        )
+    speed = attempt.get("speed", {})
+    metrics = speed.get("metrics") or {}
+    if attempt.get("comparison_config", {}).get("ais_environment") != getattr(
+        args, "ais_preflight_record", None
+    ):
+        return False
+    return (
+        speed.get("status") == "ok"
+        and int(metrics.get("total_req", 0)) == args.requests
+        and int(metrics.get("max_cc", 0)) == args.requests
+        and abs(float(metrics.get("input_len", 0)) - args.length) < 1024
+        and float(metrics.get("TTFT avg", 99999)) not in (0, 99999)
+    )
+
+
+def try_reuse_phase(args, record, phase, worktree, case_dir, deadline, log):
+    if not args.reuse_results or phase not in ("accuracy", "speed"):
+        return False
+    sources = [
+        (Path(path), json.loads(Path(path).read_text())) for path in args.reuse_results
+    ]
+    candidates = [
+        (path, row)
+        for path, rows in sources
+        for row in rows
+        if row.get("case") == record["case"]
+        and row.get("commit") == record.get("commit")
+    ]
+    if not candidates:
+        return False
+    runtime = probe_runtime(args, worktree, record["case_env"], deadline)
+    graph = args.decode_graph == "on"
+    argv = server_argv(
+        args, args.memfrac, graph, record.get("case_server_args", ()), phase=phase
+    )
+    for source, candidate in candidates:
+        if reusable_phase(candidate, record, phase, args, runtime, argv):
+            # JSON round-trip keeps imported evidence independent of later report mutations.
+            imported = json.loads(json.dumps(candidate["phases"][phase]))
+            imported["reused_from"] = {
+                "path": str(source),
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "case": candidate["case"],
+            }
+            target = case_dir / phase
+            target.mkdir()
+            save(target / "reused-evidence.json", imported)
+            record["phases"][phase] = imported
+            log(f"{record['case']} {phase}: reused matching validated evidence")
+            return True
+    log(f"{record['case']} {phase}: existing evidence does not match; running fresh")
+    return False
 
 
 def main(argv=None):
@@ -3068,6 +3218,20 @@ def run(args, cases):
                         }
                         checkpoint()
                         continue
+                    phase_deadline = phase_budget_deadline(
+                        effective, phase, case_deadline
+                    )
+                    if try_reuse_phase(
+                        effective,
+                        record,
+                        phase,
+                        worktree,
+                        case_dir,
+                        phase_deadline,
+                        log,
+                    ):
+                        checkpoint()
+                        continue
                     run_phase(
                         effective,
                         record,
@@ -3075,7 +3239,7 @@ def run(args, cases):
                         worktree,
                         case_dir,
                         registry,
-                        case_deadline,
+                        phase_deadline,
                         log,
                         checkpoint,
                     )

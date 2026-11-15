@@ -12,7 +12,7 @@
     "source_sha256": "ea6e3e5daa9434f6fce62e01a1ac43866e0c351b6dccb05dfbb8bab7a1526a9f",
     "extracted_constant": "PROFILE0_SCRIPT",
     "file": "prtest_profile0.sh",
-    "sha256": "16c0b210b823419d8cf7be0df3a2cae36164c762e04c9fa37bccedeac8306bd9",
-    "modifications": "none; launcher and server arguments are not imported"
+    "sha256": "182ba249d859fb84c58b995c24a84971759a74e9b2da11ca5004430dbadc7d7e",
+    "modifications": "Explicit ALLOW_SERVER_QUEUEING opt-in for historical server-width-1 recipe; measured AISBench workload unchanged"
   }
 ]

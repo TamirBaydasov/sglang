@@ -1481,3 +1481,90 @@ def test_combined_ratio_uses_matching_prefill_control(tmp_path):
     assert "2.000x" in row
     assert "vs 18-baseline-prefill1" in row
     assert "configuration mismatch" not in row
+
+
+def test_phase_deadlines_reserve_speed_time(monkeypatch):
+    args = args_for(
+        "--round", "all", "--accuracy-minutes", "60", "--speed-minutes", "20"
+    )
+    monkeypatch.setattr(h.time, "monotonic", lambda: 1000)
+    assert h.phase_budget_deadline(args, "accuracy", 5800) == 4600
+    monkeypatch.setattr(h.time, "monotonic", lambda: 4700)
+    assert h.phase_budget_deadline(args, "speed", 5800) == 5800
+
+
+def test_reuse_rejects_source_runtime_and_quality_changes():
+    import copy
+    import hashlib
+
+    args = args_for("--gsm8k-min-accuracy", "0.90")
+    args.dataset_sha256 = "dataset"
+    runtime = {
+        "versions": {"torch-npu": "2.10.post7"},
+        "model_files_sha256": {"config": "hash"},
+        "operator_schemas": {"op": "schema"},
+        "environment": {"CANN_HOME": "/cann"},
+    }
+    gsm = {
+        "dataset_sha256": "dataset",
+        "requested": 64,
+        "completed": 64,
+        "details": [{"correct": True} for _ in range(64)],
+        "parallel": 16,
+        "manifest": {
+            "script_sha256": hashlib.sha256(
+                (ROOT / "prtest_gsm8k.py").read_bytes()
+            ).hexdigest()
+        },
+        "generation": {
+            "temperature": 0,
+            "top_p": 1,
+            "max_new_tokens": 1024,
+            "stop": ["Question", "Assistant:", "<|separator|>"],
+        },
+    }
+    candidate = {
+        "commit": "a" * 40,
+        "phases": {
+            "accuracy": {
+                "status": "ok",
+                "attempts": [
+                    {
+                        "status": "ok",
+                        "argv": ["server"],
+                        "runtime": runtime,
+                        "gsm8k": gsm,
+                    }
+                ],
+            }
+        },
+    }
+    record = {"commit": "a" * 40}
+    assert h.reusable_phase(candidate, record, "accuracy", args, runtime, ["server"])
+    assert not h.reusable_phase(
+        candidate, {"commit": "b" * 40}, "accuracy", args, runtime, ["server"]
+    )
+    changed = copy.deepcopy(runtime)
+    changed["versions"]["torch-npu"] = "other"
+    assert not h.reusable_phase(
+        candidate, record, "accuracy", args, changed, ["server"]
+    )
+    for flag in ("error", "truncated"):
+        gsm["details"][0][flag] = True
+        assert not h.reusable_phase(
+            candidate, record, "accuracy", args, runtime, ["server"]
+        )
+        del gsm["details"][0][flag]
+
+
+def test_historical_queueing_is_explicit_and_capacity_uses_admission_width():
+    args = args_for("--round", "speed")
+    server = {"max_running_requests": 1, "page_size": 128, "dcp_size": 16}
+    with pytest.raises(RuntimeError, match="below concurrency"):
+        h.speed_capacity(server, "max_total_num_tokens=1015808", args)
+    args.allow_server_queueing = True
+    result = h.speed_capacity(server, "max_total_num_tokens=1015808", args)
+    assert result["status"] == "ok"
+    assert result["queueing_allowed"]
+    assert result["client_concurrency"] == 16
+    assert result["server_running_limit"] == 1
