@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import math
+import re
 import statistics
 import sys
 import time
@@ -259,6 +260,11 @@ def run(argv=None):
     outer = argparse.ArgumentParser(add_help=False)
     outer.add_argument("--only", default="")
     outer.add_argument(
+        "--source-prefix",
+        default="",
+        help="Read offline refs from an isolated refs/remotes/ namespace",
+    )
+    outer.add_argument(
         "--resume", help="prior session directory, copied into a fresh output"
     )
     special, common = outer.parse_known_args(argv)
@@ -277,6 +283,20 @@ def run(argv=None):
         )
         for name, ref, env, note, extra in h.CASES
     ]
+
+    def source_ref(ref):
+        if not special.source_prefix or re.fullmatch(r"[0-9a-f]{40}", ref):
+            return ref
+        return special.source_prefix.rstrip("/") + "/" + ref
+
+    if special.source_prefix:
+        if not re.fullmatch(r"refs/remotes/[A-Za-z0-9_.-]+/?", special.source_prefix):
+            raise ValueError(
+                "--source-prefix must be an isolated refs/remotes/<name>/ namespace"
+            )
+        h.CASES = [
+            (n, source_ref(r), e, note, extra) for n, r, e, note, extra in h.CASES
+        ]
     table = {case[0]: case for case in h.CASES}
     if args.hours > 16:
         raise ValueError("session16 has a 16-hour maximum")
@@ -353,7 +373,7 @@ def run(argv=None):
         (n, pins[r]["commit"], e, note, extra) for n, r, e, note, extra in h.CASES
     ]
     table = {c[0]: c for c in h.CASES}
-    base_ref = args.baseline_ref
+    base_ref = source_ref(args.baseline_ref)
     if base_ref in pins:
         base_ref = pins[base_ref]["commit"]
     reused = list(args.reuse_results)

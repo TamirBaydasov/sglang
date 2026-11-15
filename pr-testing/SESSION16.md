@@ -92,3 +92,13 @@ remain failures; CANN is not upgraded automatically.
 For a targeted breakable run, retain the normal deployment arguments and add:
 `bash run_16h_session.sh --only 29-tp-breakable --gsm8k /path/to/test.jsonl`.
 For offline command validation, add `--dry-run` to either command.
+
+## Offline deployment
+
+The delivery archive includes a Git bundle of the required serving and harness
+commits, excluding the existing base history at `3c94728b7c25`. Verify the bundle
+inside the container, then fetch it into a unique `refs/remotes/<session>/`
+namespace. Run with `--no-fetch --source-prefix refs/remotes/<session>/` so the
+original repository branches are not switched or overwritten. The normal
+baseline-ref name is resolved in the same isolated namespace. Bundle verification
+fails explicitly if the container repository does not contain the prerequisite.
