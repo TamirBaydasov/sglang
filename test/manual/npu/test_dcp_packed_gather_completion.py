@@ -64,6 +64,19 @@ class TestPackedGatherCompletion(unittest.TestCase):
         self.assertTrue(torch.equal(out, expected))
         self.assertEqual(group.waited, 3)
 
+    def test_prefetch_defers_completion_until_consumer(self):
+        group = DelayedGroup()
+        out = torch.full((10, 1), -777)
+        send = torch.arange(5).view(-1, 1)
+        plan = SimpleNamespace(dcp_size=2, send_rows=5, gathered_rows=10, chunks=3)
+        works = gather()(group, out, send, plan, wait=False)
+        self.assertEqual(group.waited, 0)
+        self.assertTrue(torch.all(out == -777))
+        for work in works:
+            work.wait()
+        self.assertEqual(group.waited, 3)
+        self.assertFalse(torch.any(out == -777))
+
     def test_single_chunk_preserves_synchronous_path(self):
         group = DelayedGroup()
         out = torch.empty((10, 1), dtype=torch.int64)

@@ -795,12 +795,7 @@ def _dcp_extend_all_gather(parallel, piece, pairs) -> None:
         )
 
 
-
-
-
-_enable_dcp_gather_prefetch = (
-    envs.SGLANG_NPU_ENABLE_DCP_PACKED_GATHER_PREFETCH.get()
-)
+_enable_dcp_gather_prefetch = envs.SGLANG_NPU_ENABLE_DCP_PACKED_GATHER_PREFETCH.get()
 
 
 if _enable_dcp_gather_prefetch and not envs.SGLANG_NPU_ENABLE_DCP_PACKED_READ.get():
@@ -814,7 +809,6 @@ if _enable_dcp_gather_prefetch and not envs.SGLANG_NPU_ENABLE_DCP_PACKED_READ.ge
         "SGLANG_NPU_ENABLE_DCP_PACKED_READ: there is nothing to prefetch into "
         "until the operator reads the gathered buffer directly."
     )
-
 
 
 class _DcpGatherPrefetcher:
@@ -908,20 +902,12 @@ class _DcpGatherPrefetcher:
                     md.dcp_local_prefix_kv_indices,
                     layer_id=layer_id,
                 )
-                send_nope = _pad_dcp_packed_send(
-                    send_nope, plan, parallel.dcp_rank
-                )
-                send_rope = _pad_dcp_packed_send(
-                    send_rope, plan, parallel.dcp_rank
-                )
+                send_nope = _pad_dcp_packed_send(send_nope, plan, parallel.dcp_rank)
+                send_rope = _pad_dcp_packed_send(send_rope, plan, parallel.dcp_rank)
                 # The helper waits for backend work before this stream's
                 # ready event can release the compute-stream consumer.
-                _dcp_issue_gather_chunks(
-                    parallel.dcp_group, out_nope, send_nope, plan
-                )
-                _dcp_issue_gather_chunks(
-                    parallel.dcp_group, out_rope, send_rope, plan
-                )
+                _dcp_issue_gather_chunks(parallel.dcp_group, out_nope, send_nope, plan)
+                _dcp_issue_gather_chunks(parallel.dcp_group, out_rope, send_rope, plan)
             self.ready[slot] = self.stream.record_event()
         self.filled[slot] = layer_id
 
@@ -1080,9 +1066,7 @@ def _dcp_gather_extend_kv_packed_npu(
     if _enable_dcp_gather_prefetch:
         # The prefetcher is shared with the prepare-side prime, so it is created
         # (on first use) in one place: _dcp_gather_prefetcher_get().
-        return _dcp_gather_prefetcher_get().take(
-            m, md, plan, k_nope, k_pe, m.layer_id
-        )
+        return _dcp_gather_prefetcher_get().take(m, md, plan, k_nope, k_pe, m.layer_id)
 
     pool = get_token_to_kv_pool()
     out_nope = dcp_extend_gather_buffer("packed_latent", k_nope, plan.rows)
