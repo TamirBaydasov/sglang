@@ -39,6 +39,8 @@ from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.dcp.layout import (
     dcp_crop_free_extend,
     dcp_interleave_size,
+    dcp_packed_kv_lens,
+    dcp_packed_read_plan,
     get_dcp_chain_spec_lens,
     get_dcp_lens,
 )
@@ -1727,7 +1729,27 @@ class AscendAttnBackend(AttentionBackend):
                 key_nope, key_rope = gathered
                 block_table = None
                 seq_lengths_kv = dcp_meta.dcp_kv_indptr[1:]
-                if (
+                packed_plan = dcp_packed_read_plan(
+                    forward_batch,
+                    topk_indices.shape[-1] if topk_indices is not None else None,
+                )
+                if packed_plan is not None:
+                    # C1: the buffer is the all-gather's own rank-major output,
+                    # so a row's index no longer says anything about its
+                    # position -- and both conventions below are about position.
+                    # The top-k was remapped to rows by the model, the whole
+                    # buffer is one request, and the operator's causal crop has
+                    # to go: sparse_mode 3 aligns query i to key K - Q + i, which
+                    # is meaningless once the keys are permuted. Causality is not
+                    # lost, it moves upstream to the indexer. DSA-CP's shortened
+                    # key lengths are unnecessary too: they exist only to make
+                    # the mode-3 crop land on the right key, and there is no
+                    # crop now.
+                    seq_lengths_kv = dcp_packed_kv_lens(
+                        forward_batch, packed_plan, q.device
+                    )
+                    sparse_mode = 0
+                elif (
                     dsa_token_shard_plan is not None
                     and dsa_token_shard_multi_request_enabled()
                     and dcp_crop_free_extend(
