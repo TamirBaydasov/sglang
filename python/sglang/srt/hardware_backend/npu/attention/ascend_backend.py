@@ -1750,15 +1750,13 @@ class AscendAttnBackend(AttentionBackend):
                 block_table = self.forward_metadata.block_tables
                 seq_lengths_kv = actual_seq_lengths_kv
                 sparse_mode = 3
+                # BUG 7: under D1v3 (no DCP) the query is local [rows], so
+                # sparse_mode=3's K-Q+i placement is only correct for the last
+                # rank with full seq_lengths_kv. Use the local key lengths
+                # unconditionally (same as the DCP branch above), reusing the
+                # tensor already built once per forward.
                 if dsa_token_shard_plan is not None:
-                    import os
-
-                    if os.environ.get("SGLANG_DEBUG_NPU_DSA_CP_LOCAL_KVLEN"):
-                        # Experiment: this rank's own per-request KV lengths, so
-                        # sparse_mode=3 places each query at its true position.
-                        seq_lengths_kv = torch.tensor(
-                            dsa_token_shard_plan.key_lens, dtype=torch.int32
-                        )
+                    seq_lengths_kv = dsa_token_shard_kvlen
 
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
             if self.kv_cache_dtype == torch.float8_e4m3fn:
