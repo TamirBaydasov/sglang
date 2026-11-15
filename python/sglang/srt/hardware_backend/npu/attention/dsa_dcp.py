@@ -13,6 +13,58 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def dcp_sparse_kv_rows(topk_indices, forward_metadata, forward_batch, page_size):
+    """Translate request-relative DCP positions through the allocator's page table."""
+    is_target_verify = forward_batch.forward_mode.is_target_verify()
+    if is_target_verify:
+        block_tables = forward_metadata.dcp_spec_block_tables
+        local_lens = forward_metadata.dcp_spec_seq_lens
+    else:
+        block_tables = forward_metadata.dcp_block_tables
+        local_lens = forward_metadata.dcp_seq_lens
+
+    assert block_tables is not None, (
+        "NPU DSA+DCP sparse attention requires rank-local paged-KV metadata"
+    )
+    assert block_tables.shape[0] == topk_indices.shape[0], (
+        "NPU DSA+DCP block-table rows must match query rows"
+    )
+    assert local_lens.shape[0] == topk_indices.shape[0], (
+        "NPU DSA+DCP KV-length rows must match query rows"
+    )
+    indices = topk_indices.reshape(topk_indices.shape[0], -1).long()
+    valid = (indices >= 0) & (indices < local_lens[:, None])
+    safe_indices = torch.where(valid, indices, 0)
+    pages = block_tables.long().gather(1, safe_indices // page_size)
+    rows = pages * page_size + safe_indices % page_size
+    return torch.where(valid, rows, 0), valid
+
+
+def forward_dcp_packed_sparse_attention(
+    *,
+    q_nope,
+    q_rope,
+    topk_indices,
+    forward_metadata,
+    forward_batch,
+    page_size,
+    read_rows,
+    scaling,
+):
+    rows, valid = dcp_sparse_kv_rows(
+        topk_indices, forward_metadata, forward_batch, page_size
+    )
+    key, rope = read_rows(rows.reshape(-1))
+    return forward_tnd_sparse_attention(
+        q_nope=q_nope,
+        q_rope=q_rope,
+        k_nope=key,
+        k_rope=rope,
+        valid=valid,
+        scaling=scaling,
+    )
+
+
 def forward_dcp_sparse_attention(
     *,
     q_nope: torch.Tensor,
@@ -28,29 +80,11 @@ def forward_dcp_sparse_attention(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute one rank's sparse partial attention and natural-log LSE."""
 
-    is_target_verify = forward_batch.forward_mode.is_target_verify()
-    if is_target_verify:
-        block_tables = forward_metadata.dcp_spec_block_tables
-        local_lens = forward_metadata.dcp_spec_seq_lens
-    else:
-        block_tables = forward_metadata.dcp_block_tables
-        local_lens = forward_metadata.dcp_seq_lens
-
-    assert block_tables is not None, (
-        "NPU DSA+DCP sparse attention requires rank-local paged-KV metadata"
-    )
-    assert block_tables.shape[0] == q_nope.shape[0], (
-        "NPU DSA+DCP block-table rows must match query rows"
-    )
-    assert local_lens.shape[0] == q_nope.shape[0], (
-        "NPU DSA+DCP KV-length rows must match query rows"
-    )
-    indices = topk_indices.reshape(q_nope.shape[0], -1).long()
-    valid = (indices >= 0) & (indices < local_lens[:, None])
-    safe_indices = torch.where(valid, indices, 0)
     page_size = k_nope.shape[1]
-    pages = block_tables.long().gather(1, safe_indices // page_size)
-    offsets = safe_indices % page_size
+    rows, valid = dcp_sparse_kv_rows(
+        topk_indices, forward_metadata, forward_batch, page_size
+    )
+    pages, offsets = rows // page_size, rows % page_size
 
     def gather(cache):
         if is_fia_nz():

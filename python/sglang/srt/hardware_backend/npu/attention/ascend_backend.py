@@ -18,7 +18,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend impor
 )
 from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
-    forward_tnd_sparse_attention,
+    forward_dcp_packed_sparse_attention,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
@@ -1874,28 +1874,18 @@ class AscendAttnBackend(AttentionBackend):
                 # #37787's decode reads its own rank-local metadata, so it
                 # returns before the branches below.
                 if self._sfa_packed_kv():
-                    # F1's temporary packed read: the LSE decode op is bf16-only
-                    # on A2/A3, so the packed 8-bit rows must be gathered and
-                    # dequanted (pool.get_mla_kv_buffer) into a TND buffer
-                    # instead of the paged read. The top-k indices are already
-                    # rank-local (remapped in the prepare phase); non-owned
-                    # entries are -1.
-                    gather_rows = torch.where(
-                        topk_indices >= 0,
-                        topk_indices,
-                        topk_indices.new_zeros(()),
-                    ).reshape(-1)
-                    key_nope, key_rope = self.token_to_kv_pool.get_mla_kv_buffer(
-                        layer, gather_rows
-                    )
                     if not self.has_sparse_fa_lse:
                         raise RuntimeError(_MISSING_SPARSE_FA_LSE)
-                    return forward_tnd_sparse_attention(
+                    return forward_dcp_packed_sparse_attention(
                         q_nope=q_nope,
                         q_rope=q_pe,
-                        k_nope=key_nope,
-                        k_rope=key_rope,
-                        valid=topk_indices >= 0,
+                        topk_indices=topk_indices,
+                        forward_metadata=self.forward_metadata,
+                        forward_batch=forward_batch,
+                        page_size=k_nope.shape[1],
+                        read_rows=lambda rows: self.token_to_kv_pool.get_mla_kv_buffer(
+                            layer, rows
+                        ),
                         scaling=layer.scaling,
                     )
                 if self.kv_cache_dtype == torch.float8_e4m3fn:

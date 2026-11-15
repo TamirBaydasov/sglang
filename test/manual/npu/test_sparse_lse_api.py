@@ -120,6 +120,47 @@ class TestSparseLSEAPI(unittest.TestCase):
         self.assertTrue(torch.isneginf(lse).all())
         self.assertFalse(out.any())
 
+    def test_packed_decode_uses_physical_pages_and_verify_frontier(self):
+        torch.manual_seed(7)
+        q, qr = torch.randn(2, 2, 4), torch.randn(2, 2, 2)
+        keys, ropes = torch.randn(160, 1, 4), torch.randn(160, 1, 2)
+        indices = torch.tensor([[17, 1, -1], [2, 18, -1]], dtype=torch.int32)
+        md = SimpleNamespace(
+            dcp_block_tables=torch.tensor([[5, 9], [3, 7]]),
+            dcp_seq_lens=torch.tensor([20, 20]),
+            dcp_spec_block_tables=torch.tensor([[1, 4], [6, 2]]),
+            dcp_spec_seq_lens=torch.tensor([18, 3]),
+        )
+        for verify in (False, True):
+            batch = SimpleNamespace(
+                forward_mode=SimpleNamespace(is_target_verify=lambda: verify)
+            )
+            captured = []
+
+            def read(rows):
+                captured.append(rows.tolist())
+                return keys[rows], ropes[rows]
+
+            out, lse = self.namespace["forward_dcp_packed_sparse_attention"](
+                q_nope=q,
+                q_rope=qr,
+                topk_indices=indices,
+                forward_metadata=md,
+                forward_batch=batch,
+                page_size=16,
+                read_rows=read,
+                scaling=0.2,
+            )
+            expected = [[65, 17], [98]] if verify else [[145, 81], [50, 114]]
+            for i, rows in enumerate(expected):
+                logits = (q[i] @ keys[rows, 0].T + qr[i] @ ropes[rows, 0].T) * 0.2
+                torch.testing.assert_close(out[i], logits.softmax(-1) @ keys[rows, 0])
+                torch.testing.assert_close(lse[i], logits.logsumexp(-1))
+            self.assertEqual(
+                captured[0],
+                [65, 17, 0, 98, 0, 0] if verify else [145, 81, 0, 50, 114, 0],
+            )
+
     def test_graph_rejected_before_operator(self):
         self.capturing = True
         with self.assertRaisesRegex(RuntimeError, "eager"):
