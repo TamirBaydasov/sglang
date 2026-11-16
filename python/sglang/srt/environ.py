@@ -1266,6 +1266,8 @@ class Envs:
     # supported with the MLA preprocess direct-write path. OFF keeps the plain
     # bf16 pool bitwise.
     SGLANG_NPU_SFA_KV_8BIT = EnvBool(False)
+    # Historical F1 buffers; retain allocating reads for the control.
+    SGLANG_NPU_SFA_F1_PREALLOC = EnvBool(False)
     # F2 (under SGLANG_NPU_SFA_KV_8BIT): fuse the dequant into the quant
     # sparse-attention operator instead of the F1 dequant-on-read. The DCP
     # extend gather then moves the raw 656 B int8 rows (one uint8 key) and the

@@ -914,7 +914,51 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 f"GiB); {self.layer_num} KV layers, {size} rows, index-K "
                 f"{self.index_k_store_dtype}"
             )
+        self._prepare_dcp_packed_read_buffers()
         self._finalize_allocation_log(size)
+
+    def _prepare_dcp_packed_read_buffers(self):
+        self._dcp_packed_read_buffers = None
+        self._dcp_packed_read_owners = [None, None]
+        if not (
+            self.sfa_kv_store_8bit
+            and envs.SGLANG_NPU_SFA_F1_PREALLOC.get()
+            and not envs.SGLANG_NPU_SFA_KV_QUANT_READ.get()
+            and self.dcp_size > 1
+            and self.k_buffer is not None
+        ):
+            return
+        from sglang.srt.runtime_context import get_schedule
+
+        requests = max(1, get_schedule().prefill_max_requests or 1)
+        if requests != 1:
+            return
+        rows = self.k_buffer[0].numel() // self.kv_cache_dim * requests
+        self._dcp_packed_read_buffers = [
+            (
+                torch.empty(
+                    (rows, self.kv_cache_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                ),
+                torch.empty(rows, dtype=torch.int64, device=self.device),
+                torch.empty(
+                    (rows, self.kv_lora_rank), dtype=torch.float32, device=self.device
+                ),
+                torch.empty(
+                    (rows, self.kv_lora_rank), dtype=self.dtype, device=self.device
+                ),
+                torch.empty(
+                    (rows, self.qk_rope_head_dim), dtype=self.dtype, device=self.device
+                ),
+            )
+            for _ in range(2)
+        ]
+
+        print_info_once(
+            f"SFA F1 prepared buffers: slots=2 capacity={rows} rows; "
+            f"bytes={sum(t.numel() * t.element_size() for slot in self._dcp_packed_read_buffers for t in slot)}"
+        )
 
     def _mla_buffer_info(self):
         from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
@@ -1073,8 +1117,55 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         storage = self.k_buffer[read_layer_id - self.start_layer].view(
             -1, self.kv_cache_dim
         )
-        rows = storage.index_select(0, loc.to(torch.int64))
         out_dtype = dst_dtype if dst_dtype is not None else self.dtype
+        buffers = getattr(self, "_dcp_packed_read_buffers", None)
+        slot = read_layer_id % 2
+        stream = (
+            torch.npu.current_stream()
+            if torch.device(self.device).type == "npu"
+            else "cpu"
+        )
+        owner = self._dcp_packed_read_owners[slot] if buffers is not None else None
+        if (
+            buffers is not None
+            and out_dtype == self.dtype
+            and loc.ndim == 1
+            and loc.numel() <= buffers[slot][0].shape[0]
+            and (owner is None or owner == stream)
+        ):
+            # Cross-stream callers use fresh storage rather than overwrite live sends.
+            self._dcp_packed_read_owners[slot] = stream
+            raw, index, fp32, nope_out, rope_out = buffers[slot]
+            count = loc.numel()
+            index = index[:count]
+            index.copy_(loc)
+            rows = raw[:count]
+            torch.index_select(storage, 0, index, out=rows)
+            tiles = self.kv_lora_rank // 128
+            rope_end = self.kv_lora_rank + self.qk_rope_head_dim * 2
+            scale = (
+                rows[:, rope_end:]
+                .view(torch.uint8)
+                .view(torch.float32)
+                .reshape(count, tiles, 1)
+            )
+            fp32 = fp32[:count]
+            fp32.copy_(rows[:, : self.kv_lora_rank])
+            fp32.view(count, tiles, 128).mul_(scale)
+            nope, rope = nope_out[:count], rope_out[:count]
+            nope.copy_(fp32)
+            rope.copy_(
+                rows[:, self.kv_lora_rank : rope_end]
+                .view(torch.uint8)
+                .view(torch.bfloat16)
+            )
+            if not getattr(self, "_dcp_packed_read_active", False):
+                print_info_once(
+                    f"SFA F1 prepared read ACTIVE: slots=2 capacity={raw.shape[0]} rows"
+                )
+                self._dcp_packed_read_active = True
+            return nope.unsqueeze(1), rope.unsqueeze(1)
+        rows = storage.index_select(0, loc.to(torch.int64))
         rope_bytes = self.qk_rope_head_dim * 2
         tiles = self.kv_lora_rank // 128
         # Dequantise in FP32 (the scale is exact there; a bf16 scale would add
@@ -1086,9 +1177,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             .reshape(-1, tiles, 1)
         )
         nope = (
-            rows[:, : self.kv_lora_rank]
-            .to(torch.float32)
-            .reshape(-1, tiles, 128)
+            rows[:, : self.kv_lora_rank].to(torch.float32).reshape(-1, tiles, 128)
             * scale
         ).reshape(-1, self.kv_lora_rank)
         rope = (

@@ -43,7 +43,17 @@ def runtime_gather_reserve_bytes(
             )
             latent, rope = layer.kv_lora_rank, layer.qk_rope_head_dim
             decode_row_bytes = max(
-                decode_row_bytes, latent + rope * 2 + latent // 128 * 4 + latent * 4 + 8
+                decode_row_bytes,
+                latent
+                + rope * 2
+                + latent // 128 * 4
+                + latent * 4
+                + 8
+                + (
+                    (latent + rope) * projection.element_size()
+                    if _flag("SGLANG_NPU_SFA_F1_PREALLOC")
+                    else 0
+                ),
             )
             prefix_row_bytes = max(
                 prefix_row_bytes,
