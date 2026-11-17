@@ -1276,6 +1276,7 @@ def run_aisbench(
     remote_log=None,
     log=print,
     commit="",
+    profile=None,
 ):
     if server is None or not state_path or not remote_log:
         raise RuntimeError(
@@ -1309,12 +1310,19 @@ def run_aisbench(
         SERVER_LOG=str((case_dir / "server.log").resolve()),
         SGLANG_REV=commit,
     )
+    if profile:
+        env.update(profile)
     save(
         case_dir / "ais-environment.json",
         {
-            key: env[key]
+            key: env.get(key)
             for key in (
                 "PROFILE",
+                "PROFILE_PHASE",
+                "PROFILE_STEPS",
+                "PROFILE_TRACE_DIR",
+                "WITH_STACK",
+                "RECORD_SHAPES",
                 "FLUSH",
                 "HOST",
                 "PORT",
@@ -1336,7 +1344,7 @@ def run_aisbench(
         base_monitor()
         capture_server_log(args, remote_log, case_dir, deadline)
         log(
-            "AISBench running (prefix preparation and measurement use the reference PROFILE=0 script)"
+            f"AISBench running (reference script, PROFILE={env['PROFILE']})"
         )
 
     path = case_dir / "ais.log"

@@ -1,0 +1,62 @@
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+index 65e2200e6c..fd2e0d07a8 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+@@ -1695,7 +1695,7 @@ class AscendAttnBackend(AttentionBackend):
+         key_rope = rope.unsqueeze(1).contiguous()
+         key_scale = scale.contiguous()
+         try:
+-            return torch_npu.npu_kv_quant_sparse_flash_attention(
++            output = torch_npu.npu_kv_quant_sparse_flash_attention(
+                 query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
+                 key=key,
+                 value=key,
+@@ -1730,6 +1730,8 @@ class AscendAttnBackend(AttentionBackend):
+                 tile_size=128,
+                 rope_head_dim=self.qk_rope_head_dim,
+             )
++            print_info_once("SFA F2 quant sparse attention ACTIVE")
++            return output
+         except Exception as e:
+             print_info_once(
+                 "F2 KV_QUANT_SFA read failed on this box's CANN "
+@@ -1740,6 +1742,7 @@ class AscendAttnBackend(AttentionBackend):
+ 
+     def _f2_dequant_rows(self, rows: torch.Tensor):
+         """The F1 (nope, rope) halves of the F2 rows (see _dcp_packed_quant_sfa)."""
++        print_info_once("SFA F2 FALLBACK to F1")
+         dequant = getattr(self.token_to_kv_pool, "dequant_packed_sfa_rows", None)
+         if dequant is None:
+             raise RuntimeError(
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/dcp_memory.py b/python/sglang/srt/hardware_backend/npu/attention/dcp_memory.py
+index 0f455a3496..8fd9140408 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/dcp_memory.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/dcp_memory.py
+@@ -18,6 +18,27 @@ def runtime_gather_reserve_bytes(
+     capture_tokens=(),
+     page_size=128,
+ ):
++    # F1 buffers also exist without the optional packed/token-sharded paths.
++    if (
++        _flag("SGLANG_NPU_SFA_KV_8BIT")
++        and _flag("SGLANG_NPU_SFA_F1_PREALLOC")
++        and not _flag("SGLANG_NPU_SFA_KV_QUANT_READ")
++        and not _flag("SGLANG_NPU_DSA_CP_TOKEN_SHARDED")
++        and not _flag("SGLANG_NPU_ENABLE_DCP_PACKED_READ")
++        and prefill_requests == 1
++        and get_parallel().attn_tp_size > 1
++    ):
++        rank = get_parallel().attn_tp_size
++        rows = (context_tokens + tokens + rank - 1) // rank + 2 * page_size
++        reserve = 0
++        for layer in model.modules():
++            if getattr(layer, "use_dsa", False) and hasattr(layer, "kv_lora_rank"):
++                latent, rope = layer.kv_lora_rank, layer.qk_rope_head_dim
++                raw = latent + 2 * rope + (latent // 128) * 4
++                reserve = max(
++                    reserve, 2 * rows * (raw + 8 + 4 * latent + 2 * (latent + rope))
++                )
++        return reserve
+     if not (
+         _flag("SGLANG_NPU_DSA_CP_TOKEN_SHARDED")
+         or _flag("SGLANG_NPU_ENABLE_DCP_PACKED_READ")

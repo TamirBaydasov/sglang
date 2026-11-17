@@ -12,8 +12,8 @@
     "source_sha256": "ea6e3e5daa9434f6fce62e01a1ac43866e0c351b6dccb05dfbb8bab7a1526a9f",
     "extracted_constant": "PROFILE0_SCRIPT",
     "file": "prtest_profile0.sh",
-    "sha256": "182ba249d859fb84c58b995c24a84971759a74e9b2da11ca5004430dbadc7d7e",
-    "modifications": "Explicit ALLOW_SERVER_QUEUEING opt-in for historical server-width-1 recipe; measured AISBench workload unchanged"
+    "sha256": "24230708f39648d85c3e9f34187cb00a703fa955d659a20cac48efd94f735c0b",
+    "modifications": "Explicit ALLOW_SERVER_QUEUEING opt-in for historical server-width-1 recipe; measured AISBench workload unchanged; optional explicit container trace output path for short multi-rank profiling"
   },
   {
     "source": "TTFT10 local experiment on ba9c4f5bfb5b473e54fe8d43008d7b0c233cc967",
@@ -38,5 +38,35 @@
     "file": "launch_ttft_10h.sh",
     "sha256": "1b170c213e32af66103aa11cb0529b7d37567ea755571b755a325ab9750a3818",
     "modifications": "Pinned ten-hour round; see SESSION10.md and source manifests"
+  },
+  {
+    "source": "Local isolated two-hour speed/profile matrix on c22f520646",
+    "file": "sfa2h.py",
+    "sha256": "719f9cf2621361b2ebfb2c58257837468813f93863984613b65f079b87d52ed0",
+    "modifications": "See SFA2H.md; no accuracy runs"
+  },
+  {
+    "source": "Local isolated two-hour speed/profile matrix on c22f520646",
+    "file": "summarize_sfa_profile.py",
+    "sha256": "3e28475ea5e3511dbd0894c54284003c4598aa9502acd4ffaeebcfa83d16aa78",
+    "modifications": "See SFA2H.md; no accuracy runs"
+  },
+  {
+    "source": "Local isolated two-hour speed/profile matrix on c22f520646",
+    "file": "run_sfa_2h.sh",
+    "sha256": "0bc1d1bbcc6ad02ca4126f911f97af94aa396ea7ba41cc68c9e33891c72d8c78",
+    "modifications": "See SFA2H.md; no accuracy runs"
+  },
+  {
+    "source": "Local isolated two-hour speed/profile matrix on c22f520646",
+    "file": "sfa2h-serving.diff",
+    "sha256": "8020c69a99d9448249fae069f8fae4700cae4cc9763bc5a4b7e9013bf88e87aa",
+    "modifications": "See SFA2H.md; no accuracy runs"
+  },
+  {
+    "source": "Local isolated two-hour speed/profile matrix on c22f520646",
+    "file": "SFA2H.md",
+    "sha256": "a44513ffc3c31d1dc8acd72acd7784aebcaf2b3133f3425f4aff0adfa7d927b7",
+    "modifications": "See SFA2H.md; no accuracy runs"
   }
 ]

@@ -268,7 +268,7 @@ BENCH_PID=""
 
 profile_start() {
   local body code
-  body=$(OUT="${RUN}/trace" STEPS="${PROFILE_STEPS}" STACK="${WITH_STACK}" \
+  body=$(OUT="${PROFILE_TRACE_DIR:-${RUN}/trace}" STEPS="${PROFILE_STEPS}" STACK="${WITH_STACK}" \
          SHAPES="${RECORD_SHAPES}" LABEL="${LABEL}" python3 -c 'import json, os
 req = {
     "output_dir": os.environ["OUT"],
