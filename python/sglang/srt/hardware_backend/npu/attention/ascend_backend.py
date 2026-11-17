@@ -1695,7 +1695,7 @@ class AscendAttnBackend(AttentionBackend):
         key_rope = rope.unsqueeze(1).contiguous()
         key_scale = scale.contiguous()
         try:
-            return torch_npu.npu_kv_quant_sparse_flash_attention(
+            output = torch_npu.npu_kv_quant_sparse_flash_attention(
                 query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
                 key=key,
                 value=key,
@@ -1730,6 +1730,8 @@ class AscendAttnBackend(AttentionBackend):
                 tile_size=128,
                 rope_head_dim=self.qk_rope_head_dim,
             )
+            print_info_once("SFA F2 quant sparse attention ACTIVE")
+            return output
         except Exception as e:
             print_info_once(
                 "F2 KV_QUANT_SFA read failed on this box's CANN "
@@ -1740,6 +1742,7 @@ class AscendAttnBackend(AttentionBackend):
 
     def _f2_dequant_rows(self, rows: torch.Tensor):
         """The F1 (nope, rope) halves of the F2 rows (see _dcp_packed_quant_sfa)."""
+        print_info_once("SFA F2 FALLBACK to F1")
         dequant = getattr(self.token_to_kv_pool, "dequant_packed_sfa_rows", None)
         if dequant is None:
             raise RuntimeError(

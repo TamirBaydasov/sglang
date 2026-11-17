@@ -18,6 +18,27 @@ def runtime_gather_reserve_bytes(
     capture_tokens=(),
     page_size=128,
 ):
+    # F1 buffers also exist without the optional packed/token-sharded paths.
+    if (
+        _flag("SGLANG_NPU_SFA_KV_8BIT")
+        and _flag("SGLANG_NPU_SFA_F1_PREALLOC")
+        and not _flag("SGLANG_NPU_SFA_KV_QUANT_READ")
+        and not _flag("SGLANG_NPU_DSA_CP_TOKEN_SHARDED")
+        and not _flag("SGLANG_NPU_ENABLE_DCP_PACKED_READ")
+        and prefill_requests == 1
+        and get_parallel().attn_tp_size > 1
+    ):
+        rank = get_parallel().attn_tp_size
+        rows = (context_tokens + tokens + rank - 1) // rank + 2 * page_size
+        reserve = 0
+        for layer in model.modules():
+            if getattr(layer, "use_dsa", False) and hasattr(layer, "kv_lora_rank"):
+                latent, rope = layer.kv_lora_rank, layer.qk_rope_head_dim
+                raw = latent + 2 * rope + (latent // 128) * 4
+                reserve = max(
+                    reserve, 2 * rows * (raw + 8 + 4 * latent + 2 * (latent + rope))
+                )
+        return reserve
     if not (
         _flag("SGLANG_NPU_DSA_CP_TOKEN_SHARDED")
         or _flag("SGLANG_NPU_ENABLE_DCP_PACKED_READ")
