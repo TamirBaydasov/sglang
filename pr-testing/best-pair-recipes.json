@@ -1,0 +1,75 @@
+{
+  "33-best-ttft": {
+    "source": "4eb600357bf7f8ae98406c0fca6d206ae715408c",
+    "env": {
+      "SGLANG_ENABLE_CHAT_ENCODE_POOL": "False",
+      "SGLANG_CHAT_ENCODE_MEMO": "False",
+      "SGLANG_CHAT_ENCODE_RAW": "False",
+      "SGLANG_NPU_INDEXER_INT8": "True",
+      "SGLANG_NPU_ENABLE_DCP_PACKED_READ": "True",
+      "SGLANG_NPU_ENABLE_DCP_PACKED_GATHER_PREFETCH": "True",
+      "SGLANG_NPU_ENABLE_PG_PRIORITY": "True",
+      "SGLANG_NPU_SFA_KV_8BIT": "False",
+      "SGLANG_NPU_SFA_KV_QUANT_READ": "False",
+      "SGLANG_NPU_DSA_CP_TOKEN_SHARDED": "True",
+      "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH": "False",
+      "SGLANG_NPU_DSA_CP_LOCAL_TOPK": "True",
+      "SGLANG_NPU_DCP_DECODE_Q_PREISSUE": "True",
+      "SGLANG_NPU_STREAM_O_PROJ": "True",
+      "SGLANG_NPU_STREAM_Q_B": "False",
+      "SGLANG_NPU_STREAM_W_KC": "False",
+      "SGLANG_NPU_STREAM_W_VC": "False",
+      "HCCL_BUFFSIZE": "256",
+      "SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY": "False"
+    },
+    "server_args": [
+      "--max-running-requests",
+      "1",
+      "--prefill-max-requests",
+      "1",
+      "--max-total-tokens",
+      "63488"
+    ],
+    "provenance": "20261115-222859: TP 22.906s, 60/64 clean"
+  },
+  "28-combined-megamoe": {
+    "source": "8e219cba5f16ef00c1cc67beab3a1ef309315fc5",
+    "env": {
+      "SGLANG_ENABLE_CHAT_ENCODE_POOL": "False",
+      "SGLANG_CHAT_ENCODE_MEMO": "False",
+      "SGLANG_CHAT_ENCODE_RAW": "False",
+      "SGLANG_NPU_INDEXER_INT8": "True",
+      "SGLANG_NPU_ENABLE_DCP_PACKED_READ": "True",
+      "SGLANG_NPU_ENABLE_DCP_PACKED_GATHER_PREFETCH": "True",
+      "SGLANG_NPU_ENABLE_PG_PRIORITY": "True",
+      "SGLANG_NPU_SFA_KV_8BIT": "False",
+      "SGLANG_NPU_SFA_KV_QUANT_READ": "False",
+      "SGLANG_NPU_DSA_CP_TOKEN_SHARDED": "False",
+      "SGLANG_NPU_DSA_CP_Q_FULL_WIDTH": "False",
+      "SGLANG_NPU_DSA_CP_LOCAL_TOPK": "True",
+      "SGLANG_NPU_DCP_DECODE_Q_PREISSUE": "True",
+      "SGLANG_NPU_STREAM_O_PROJ": "False",
+      "SGLANG_NPU_STREAM_Q_B": "False",
+      "SGLANG_NPU_STREAM_W_KC": "False",
+      "SGLANG_NPU_STREAM_W_VC": "False",
+      "HCCL_BUFFSIZE": "256",
+      "SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY": "False",
+      "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "2048"
+    },
+    "server_args": [
+      "--max-running-requests",
+      "1",
+      "--prefill-max-requests",
+      "1",
+      "--max-total-tokens",
+      "63488",
+      "--ep-size",
+      "16",
+      "--moe-a2a-backend",
+      "ascend_fuseep",
+      "--fuseep-mode",
+      "3"
+    ],
+    "provenance": "20261116-212150-56935a: MegaMoE EP16 22.187s mean /36.624s P90; 57 correct/61 completed/64 requested; full quality pending"
+  }
+}
