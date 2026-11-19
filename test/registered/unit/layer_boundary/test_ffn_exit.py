@@ -1,7 +1,7 @@
 import types
 import unittest
 from functools import partial
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -187,6 +187,36 @@ class TestFfnExit(CustomTestCase):
                 )
                 torch.testing.assert_close(hidden_states, self.hidden_states * 2 + 1)
                 self.assertIs(residual, self.residual)
+
+    def test_token_sharded_exit_completes_before_the_local_residual_update(self):
+        batch = types.SimpleNamespace(npu_dsa_cp_token_sharded=True)
+        full = torch.arange(24, dtype=torch.float32).reshape(12, 2)
+        residual = torch.ones(3, 2)
+        group = types.SimpleNamespace(
+            reduce_scatter_tensor=lambda out, value: out.copy_((value * 4).chunk(4)[1])
+        )
+        parallel = types.SimpleNamespace(attn_tp_size=4, attn_tp_group=group)
+        for fusions in (
+            None,
+            types.SimpleNamespace(can_defer_finalize=MagicMock(return_value=True)),
+        ):
+            with self.subTest(fusions=fusions is not None):
+                communicator = make_communicator(
+                    fuse=True, reduce_scatter=False, fusions=fusions
+                )
+                del communicator.output._complete_now
+                steps = communicator.paths[BatchVariant.ORDINARY]
+                decision = communicator.output._decide(batch, steps)
+                with patch(
+                    "sglang.srt.layers.attention.dsa.dsa_token_shard.get_parallel",
+                    return_value=parallel,
+                ):
+                    hidden, remaining = decision.complete(full, residual)
+                self.assertFalse(decision.defer_moe_finalize)
+                torch.testing.assert_close(
+                    hidden + remaining, (full * 4).chunk(4)[1] + residual
+                )
+                communicator.output._defers_sum.assert_not_called()
 
     def test_a_layer_that_declares_no_deferral_runs_postprocess(self):
         communicator = make_communicator(
