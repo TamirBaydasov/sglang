@@ -44,6 +44,44 @@ class TestMLPParallelGroups(CustomTestCase):
         )
         self.x = torch.arange(16, dtype=torch.float32).reshape(2, 8) / 16
 
+    def test_deepseek_token_shards_match_a_dense_ffn(self):
+        from sglang.srt.models import deepseek_v2
+
+        torch.manual_seed(42)
+        full = F.pad(torch.randn(10, 4), (0, 0, 0, 2))
+        gate, up, down = torch.randn(8, 4), torch.randn(8, 4), torch.randn(4, 8)
+        expected = F.linear(F.silu(F.linear(full, gate)) * F.linear(full, up), down)
+        gather = Mock(side_effect=lambda out, local: out.copy_(full))
+        parallel = SimpleNamespace(
+            attn_tp_group=SimpleNamespace(world_size=4, all_gather_into_tensor=gather)
+        )
+        partials = []
+        for rank in range(4):
+            gate_up = torch.cat([gate.chunk(4)[rank], up.chunk(4)[rank]])
+            down_local = down.chunk(4, dim=1)[rank]
+            layer = SimpleNamespace(
+                is_replicated=False,
+                swiglu_limit=None,
+                allow_fused_down=False,
+                use_fused_clamp_act_mul=False,
+                gate_up_proj=lambda value: (F.linear(value, gate_up), None),
+                act_fn=lambda value: (
+                    F.silu(value.chunk(2, dim=-1)[0]) * value.chunk(2, dim=-1)[1]
+                ),
+                down_proj=lambda value: (F.linear(value, down_local), None),
+            )
+            local = full.chunk(4)[rank]
+            with patch.object(deepseek_v2, "get_parallel", return_value=parallel):
+                partials.append(
+                    deepseek_v2.DeepseekV2MLP.forward(
+                        layer, local, SimpleNamespace(npu_dsa_cp_token_sharded=True)
+                    )
+                )
+            torch.testing.assert_close(gather.call_args.args[1], local)
+        summed = torch.stack(partials).sum(0)
+        for actual, reference in zip(summed.chunk(4), expected.chunk(4)):
+            torch.testing.assert_close(actual, reference)
+
     def test_model_layout_math_reload_and_row_policy(self):
         tp = Mock()
         tp.all_reduce.side_effect = lambda x: x * 2
